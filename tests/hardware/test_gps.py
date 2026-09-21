@@ -5,8 +5,8 @@ import time
 
 def main() -> int:
     try:
-        from robotx.navigation.gps import GPSConfig, GPSReader
-        from robotx.utils.config import SETTINGS
+        from robotx.hardware.gps import GPSConfig, GPSReader
+        from robotx.config.settings import SETTINGS
     except Exception as e:
         print(f"ERROR: Could not import GPS modules: {e}")
         return 2

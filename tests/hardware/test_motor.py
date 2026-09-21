@@ -6,7 +6,7 @@ import time
 def main() -> int:
     try:
         from robotx.hardware.motors import MotorDriver, MotorPins
-        from robotx.utils.config import SETTINGS
+        from robotx.config.settings import SETTINGS
     except Exception as e:
         print(f"ERROR: Could not import motor modules: {e}")
         return 2

@@ -14,7 +14,7 @@ def main() -> int:
         return 2
 
     try:
-        from robotx.utils.config import SETTINGS
+        from robotx.config.settings import SETTINGS
     except Exception:
         class _S:
             camera_index = 0
@@ -31,7 +31,7 @@ def main() -> int:
     detector = None
     detector_enabled = False
     try:
-        from robotx.perception.detection import ObjectDetector  # type: ignore
+        from robotx.perception.object_detector import ObjectDetector  # type: ignore
 
         detector = ObjectDetector(
             backend=str(getattr(SETTINGS, "detection_backend", "opencv")),
@@ -43,7 +43,7 @@ def main() -> int:
         print(f"Detector not available (continuing without detection): {e}")
 
     try:
-        from robotx.perception.camera import CameraStream  # type: ignore
+        from robotx.hardware.camera import CameraStream  # type: ignore
     except Exception as e:
         print(f"ERROR: could not import RobotX camera module: {e}")
         return 2

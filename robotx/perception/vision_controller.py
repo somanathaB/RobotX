@@ -5,10 +5,10 @@ import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
-from robotx.perception.camera import CameraStream
-from robotx.perception.detection import ObjectDetector
-from robotx.perception.filter import TemporalFilter, TemporalFilterConfig
-from robotx.perception.tracking import ObjectTracker, PrimaryObjectTracker, PrimaryTrack, Track
+from robotx.hardware.camera import CameraStream
+from robotx.perception.object_detector import ObjectDetector
+from robotx.perception.temporal_filter import TemporalFilter, TemporalFilterConfig
+from robotx.perception.object_tracker import ObjectTracker, PrimaryObjectTracker, PrimaryTrack, Track
 
 
 # --- Fixed production thresholds / rules (per requirements) ---

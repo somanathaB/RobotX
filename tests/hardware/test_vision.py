@@ -181,10 +181,10 @@ def main() -> int:
         return 2
 
     try:
-        from robotx.control.vision_controller import VisionController, VisionControllerConfig
-        from robotx.control.decision_engine import DecisionEngine
-        from robotx.perception.filter import ActionSmoother
-        from robotx.perception.tracking import PrimaryObjectTracker
+        from robotx.perception.vision_controller import VisionController, VisionControllerConfig
+        from robotx.perception.decision_engine import DecisionEngine
+        from robotx.perception.temporal_filter import ActionSmoother
+        from robotx.perception.object_tracker import PrimaryObjectTracker
     except Exception as e:
         print(f"ERROR: imports failed: {e}")
         return 2
@@ -436,7 +436,7 @@ def main() -> int:
 
                     # Draw collision zone + blue center dot + zone/action labels.
                     try:
-                        from robotx.control.vision_controller import draw_avoidance_debug
+                        from robotx.perception.vision_controller import draw_avoidance_debug
 
                         draw_avoidance_debug(annotated, primary=primary_det, action=str(action))
                     except Exception:

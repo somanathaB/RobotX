@@ -6,7 +6,7 @@ import time
 def main() -> int:
     try:
         from robotx.hardware.ultrasonic import UltrasonicConfig, UltrasonicSensor
-        from robotx.utils.config import SETTINGS
+        from robotx.config.settings import SETTINGS
     except Exception as e:
         print(f"ERROR: Could not import ultrasonic modules: {e}")
         return 2

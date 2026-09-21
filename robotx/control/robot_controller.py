@@ -11,11 +11,11 @@ from robotx.hardware.encoders import EncoderReader
 from robotx.hardware.ir import IRSensors
 from robotx.hardware.motors import MotorDriver
 from robotx.hardware.ultrasonic import UltrasonicReading, UltrasonicSensor, UltrasonicStatus
-from robotx.navigation.gps import GPSReader
-from robotx.navigation.maps import GoogleMapsDirections
-from robotx.navigation.planner import LatLon, RoutePlanner, haversine_m
-from robotx.perception.camera import CameraStream
-from robotx.perception.detection import ObjectDetector, summarize_detections
+from robotx.hardware.gps import GPSReader
+from robotx.hardware.camera import CameraStream
+from robotx.navigation.directions_client import GoogleMapsDirections
+from robotx.navigation.route_planner import LatLon, RoutePlanner, haversine_m
+from robotx.perception.object_detector import ObjectDetector, summarize_detections
 
 
 logger = logging.getLogger(__name__)

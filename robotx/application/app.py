@@ -5,18 +5,18 @@ from typing import AsyncGenerator, Optional
 from fastapi import FastAPI
 from fastapi.responses import StreamingResponse
 
-from robotx.app.sockets import RobotSocketClient, SocketConfig
-from robotx.control.controller import ControllerConfig, RobotController
+from robotx.communication.socket_client import RobotSocketClient, SocketConfig
+from robotx.control.robot_controller import ControllerConfig, RobotController
 from robotx.hardware.encoders import EncoderConfig, EncoderReader
+from robotx.hardware.gps import GPSConfig, GPSReader
 from robotx.hardware.ir import IRConfig, IRSensors
 from robotx.hardware.motors import MotorDriver, MotorPins
+from robotx.hardware.camera import CameraStream
 from robotx.hardware.ultrasonic import UltrasonicConfig, UltrasonicSensor
-from robotx.navigation.gps import GPSConfig, GPSReader
-from robotx.navigation.maps import GoogleMapsDirections
-from robotx.navigation.planner import PlannerConfig, RoutePlanner
-from robotx.perception.camera import CameraStream
-from robotx.perception.detection import ObjectDetector
-from robotx.utils.config import SETTINGS
+from robotx.navigation.directions_client import GoogleMapsDirections
+from robotx.navigation.route_planner import PlannerConfig, RoutePlanner
+from robotx.perception.object_detector import ObjectDetector
+from robotx.config.settings import SETTINGS
 
 
 def _setup_logging() -> None:

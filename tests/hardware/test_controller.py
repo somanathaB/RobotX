@@ -17,7 +17,7 @@ def main() -> int:
         from robotx.hardware.ultrasonic import UltrasonicConfig, UltrasonicSensor
         from robotx.hardware.ir import IRConfig, IRSensors
         from robotx.hardware.encoders import EncoderConfig, EncoderReader
-        from robotx.utils.config import SETTINGS
+        from robotx.config.settings import SETTINGS
     except Exception as e:
         print(f"ERROR: imports failed: {e}")
         return 2

@@ -4,7 +4,7 @@ from collections import Counter, deque
 from dataclasses import dataclass
 from typing import Deque, Dict, Iterable, List, Sequence, Set, Tuple
 
-from robotx.perception.tracking import Track
+from robotx.perception.object_tracker import Track
 
 
 @dataclass(frozen=True)
