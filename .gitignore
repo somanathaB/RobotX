@@ -4,3 +4,7 @@ __pycache__/
 .env
 *.log
 .DS_Store
+
+# Debug artifacts written by tests/hardware/test_cv.py and test_vision.py
+frame.jpg
+frames/
