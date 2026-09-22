@@ -1,3 +1,21 @@
+"""RETAINED LEGACY PATH -- direct motor drive from the Pi. NOT wired in.
+
+This is the previous production control loop: it reads GPIO sensors and drives
+the L298N motor driver directly from the Raspberry Pi. **The application no
+longer starts it.** In the target architecture motor authority belongs to the
+ESP32, and the Pi's job ends at publishing a `MotionIntent`
+(`robotx.control.decision` -> `robotx.control.motion`).
+
+It is retained, not deleted, because it carries safety behaviour that was
+deliberately built and reviewed:
+  - R-01: MANUAL mode obeys the same obstacle gate as AUTO/RETURN.
+  - R-03: any non-VALID ultrasonic status blocks forward motion.
+Those rules are the reference for whatever eventually runs on the ESP32, and
+the loop remains usable for bench-testing the drivetrain from the Pi.
+
+If you run this, you are driving motors from the Pi. Wheels off the ground.
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -16,6 +34,7 @@ from robotx.hardware.camera import CameraStream
 from robotx.navigation.directions_client import GoogleMapsDirections
 from robotx.navigation.route_planner import LatLon, RoutePlanner, haversine_m
 from robotx.perception.object_detector import ObjectDetector, summarize_detections
+from robotx.hardware.battery import battery_status
 
 
 logger = logging.getLogger(__name__)
@@ -122,6 +141,23 @@ class RobotController:
         self._last_telemetry_t = 0.0
         self._telemetry_hook = None
 
+    def _location(self) -> Dict[str, Optional[float]]:
+        """GPS position in this loop's legacy `{lat, lon, fix_age_s}` shape.
+
+        `GPSReader` now reports a status-explicit `GpsReading`; only a current
+        FIX yields coordinates here, so a stale or absent fix still reads as
+        "no position" to the rest of this loop.
+        """
+
+        reading = self.gps.get_reading()
+        if not reading.has_fix or reading.fix is None:
+            return {"lat": None, "lon": None, "fix_age_s": None}
+        return {
+            "lat": reading.fix.latitude,
+            "lon": reading.fix.longitude,
+            "fix_age_s": reading.age_s,
+        }
+
     def set_telemetry_hook(self, hook):
         """hook(telemetry_dict) -> awaitable; called periodically."""
         self._telemetry_hook = hook
@@ -215,7 +251,7 @@ class RobotController:
         if self._destination is None:
             return
 
-        loc = self.gps.get_location()
+        loc = self._location()
         if loc.get("lat") is None or loc.get("lon") is None:
             return
 
@@ -228,14 +264,14 @@ class RobotController:
 
     async def _ensure_return_route(self) -> None:
         if self._home is None:
-            loc = self.gps.get_location()
+            loc = self._location()
             if loc.get("lat") is not None and loc.get("lon") is not None:
                 self._home = (float(loc["lat"]), float(loc["lon"]))
 
         if self._home is None:
             return
 
-        loc = self.gps.get_location()
+        loc = self._location()
         if loc.get("lat") is None or loc.get("lon") is None:
             return
 
@@ -332,7 +368,7 @@ class RobotController:
             t0 = time.monotonic()
             try:
                 # Read sensors
-                loc = self.gps.get_location()
+                loc = self._location()
                 pos = None
                 if loc.get("lat") is not None and loc.get("lon") is not None:
                     pos = (float(loc["lat"]), float(loc["lon"]))
@@ -395,7 +431,7 @@ class RobotController:
                         "status": self._status_msg,
                         "location": loc,
                         "speed": speed,
-                        "battery": {"percent": 76.0},
+                        "battery": battery_status(),
                         "sensors": {
                             "ultrasonic_cm": ultrasonic_reading.distance_cm,
                             "ultrasonic_status": ultrasonic_reading.status.value,

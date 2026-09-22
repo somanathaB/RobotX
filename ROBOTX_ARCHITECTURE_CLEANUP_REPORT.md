@@ -1,5 +1,7 @@
 # RobotX Pi Agent — Architecture Cleanup Report
 
+> **HISTORICAL DOCUMENT.** This records the second restructuring pass (2026-09-22). A later pass turned the Pi into a standalone robot agent: motor authority was removed from the application path, `localization/`, `state/` and `diagnostics/` were added, the perception pipeline was consolidated, and an automated test suite was introduced. See `ROBOTX_PI_FOUNDATION_IMPLEMENTATION_REPORT.md` and `docs/architecture/ROBOTX_PI_ARCHITECTURE.md` for the current, authoritative structure. Paths and statuses below are one step behind the current tree.
+
 **Date:** 2026-09-22
 **Type:** Structural cleanup, single pass. No behavior, safety threshold, GPIO pin assignment, or Socket.IO protocol change.
 **Context:** This is the second of two same-day passes on this repository. The first (`ROBOTX_PI_ARCHITECTURE_REFACTOR_PLAN.md` / `ROBOTX_ARCHITECTURE_REFACTOR_REPORT.md`) moved the codebase from a flat `app/control/hardware/navigation/perception/utils` layout into `application/communication/config/control/hardware/navigation/perception`. This pass re-inspected the resulting source tree from scratch (not trusting the prior docs) and applied the remaining two structural corrections found, then brought all documentation current.

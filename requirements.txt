@@ -1,22 +1,47 @@
+# RobotX Pi agent dependencies.
+#
+# Install into a venv created WITH system packages, so Picamera2 is visible:
+#   python3 -m venv --system-site-packages venv
+#   venv/bin/python -m pip install -r requirements.txt
+
+# --- Required to run the agent -----------------------------------------------
 fastapi==0.115.6
 uvicorn[standard]==0.30.6
-python-socketio[asyncio_client]==5.11.4
-httpx==0.27.2
 opencv-python==4.10.0.84
 pyserial==3.5
 pynmea2==1.19.0
 
-# Picamera2 (libcamera) is required for Raspberry Pi Camera Module 3.
-# Install via apt (recommended on Raspberry Pi OS/Debian):
-#   sudo apt update
-#   sudo apt install -y python3-picamera2
-# NOTE: Picamera2 is typically NOT installed via pip.
+# Picamera2 (libcamera) drives the Raspberry Pi Camera Module 3.
+# Install via apt, NOT pip:
+#   sudo apt update && sudo apt install -y python3-picamera2
 
-# Raspberry Pi GPIO (needed for motor/ultrasonic/encoder/IR tests on real hardware)
+# --- Bench hardware scripts only ---------------------------------------------
+# The agent never drives motors; these are for tests/hardware/* and the
+# retained legacy direct-drive loop.
 RPi.GPIO==0.7.1
 
-# YOLOv8 (vision-only pipeline). This pulls in torch; on Raspberry Pi, use piwheels when available.
-# NOTE: `ultralytics` pulls in `torch`, which may not have wheels for your Pi OS/Python version.
-# Install YOLO only when you have a compatible torch wheel available:
-#   TMPDIR=/home/pi/pip-tmp pip install --no-cache-dir ultralytics
+# --- Optional ----------------------------------------------------------------
+# Google Directions routing. Not required: the agent runs on local waypoints.
+httpx==0.27.2
+
+# Socket.IO client for the FalconAut backend link
+# (robotx/communication/backend_link.py). Imported lazily: with
+# ROBOTX_SOCKET_ENABLED=0 -- the default -- it is never loaded.
+python-socketio[asyncio_client]==5.11.4
+
+# YOLOv8 detection backend. Pulls in torch, which may have no wheel for this
+# Pi's OS/Python version. Install only with a working torch build:
+#   TMPDIR=/home/pi/pip-tmp venv/bin/python -m pip install --no-cache-dir ultralytics
 # ultralytics>=8.0.0
+
+# --- Tests -------------------------------------------------------------------
+# The unit suite has no dependencies beyond the above and uses stdlib
+# `unittest`:
+#   venv/bin/python -m unittest discover -s tests/unit -t .
+#
+# tests/integration/ additionally runs a real Socket.IO server on loopback,
+# which needs the server half of python-socketio plus aiohttp. Both arrive
+# with python-socketio[asyncio_client] above; aiohttp is named here so the
+# dependency is explicit rather than incidental.
+#   venv/bin/python -m unittest discover -s tests/integration -t .
+aiohttp>=3.9

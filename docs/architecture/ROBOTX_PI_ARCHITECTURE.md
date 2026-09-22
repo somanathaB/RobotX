@@ -1,224 +1,306 @@
-# RobotX Pi Agent — Architecture
+# RobotX Raspberry Pi Agent — Architecture
 
-**Status of this document:** describes the structure as of the 2026-09-22 architecture cleanup (`ROBOTX_ARCHITECTURE_CLEANUP_REPORT.md`, building on the earlier `ROBOTX_PI_ARCHITECTURE_REFACTOR_PLAN.md` pass). It documents what exists on disk today, distinguishing IMPLEMENTED / PARTIALLY IMPLEMENTED / EXPERIMENTAL / NOT IMPLEMENTED where relevant. It does not describe a fleet-management platform, a simulation environment, or any backend server — none of those exist in this repository. See `ROBOTX_DEEP_CURRENT_STATE_AUDIT.md` for the full line-by-line audit this structure was originally derived from, and `ROBOTX_PI_REMEDIATION_PLAN.md` for the safety/security remediation history (R-00 through R-10).
+**Scope:** the Raspberry Pi 5 only. The ESP32 motor/safety controller and the
+FalconAut backend are outside this repository; this document marks where each
+will attach, and nothing here implements either.
 
----
-
-## 1. System Overview
-
-RobotX is a single-robot Raspberry Pi control agent. It is **not** a fleet-management backend, has no database, no multi-robot registry, and no frontend. One Python process, started with `uvicorn`, does everything:
-
-- Serves two read-only HTTP endpoints (`/health`, `/camera`) via FastAPI.
-- Runs a 10 Hz control loop (`RobotController`) that reads sensors, applies obstacle-avoidance safety logic, follows GPS routes, and drives motors.
-- Connects outbound as a Socket.IO client to an external server (not part of this repo) to receive commands and emit telemetry.
-
-```
-                    ┌─────────────────────────────────────────────┐
-  HTTP  ───────────►│  robotx.application.main  (FastAPI, uvicorn) │
-  GET /health         /health, /camera                             │
-  GET /camera         on_startup(): builds every subsystem below    │
-                    │  and calls RobotController.start()            │
-                    └──────────────────┬──────────────────────────┘
-                                       │ composes
-              ┌────────────────────────┼────────────────────────────┐
-              ▼                        ▼                            ▼
-   robotx.control            robotx.communication          robotx.hardware /
-   RobotController            RobotSocketClient              navigation / perception
-   (production control loop)  (Socket.IO client,             (sensors, motors, camera,
-                               robot -> external server)      routing, detection)
-                                       │
-                                       ▼
-                         External Socket.IO server
-                         (NOT part of this repository —
-                          only the client-side contract
-                          is implemented here)
-```
+**Status:** describes the code on disk after the standalone-agent restructuring
+(`ROBOTX_PI_FOUNDATION_IMPLEMENTATION_REPORT.md`). For what is and is not
+working, see `ROBOTX_PI_CURRENT_STATE.md`.
 
 ---
 
-## 2. Folder Structure
+## 1. What the Pi is
+
+The Pi is the robot's **high-level brain**. It senses, decides, and publishes
+what it wants to happen. It does not actuate.
+
+```
+    Camera ──────────► Perception ──┐
+                                    │
+    GPS ────► Localization ─────► Navigation ──► Decision ──► Motion Intent
+                    │                   │            │             │
+                    └───────────────────┴────────────┴─────► Robot State
+                                                                  │
+                                                    ┌─────────────┴────────┐
+                                                    ▼                      ▼
+                                               Telemetry              Health
+                                                (local)            (diagnostics)
+```
+
+Everything above runs without an ESP32, without motors, and without a backend.
+That is the point: the Pi's subsystems can be validated on their own.
+
+**Motor authority belongs to the ESP32.** The Pi agent imports no motor driver
+and touches no motor GPIO. It ends at `MotionIntent` — a normalized request
+that something downstream may choose to honour.
+
+---
+
+## 2. Packages
 
 ```
 robotx/
-├── application/     FastAPI app + composition root (entry point)
-├── communication/   Socket.IO client (robot -> external server)
-├── config/          Centralized environment-variable settings
-├── control/         The one production control loop
-├── hardware/        Direct physical I/O (GPIO, camera, serial GPS)
-├── navigation/       Route planning + Google Directions client
-└── perception/      Camera-frame interpretation + experimental vision pipeline
-
-tests/hardware/      Standalone hardware-exercise scripts (motors, ultrasonic, gps, camera) — NOT automated/CI-safe
-tests/control/       Standalone script exercising the STOP/FORWARD decision rule on real hardware — NOT automated/CI-safe
-tests/perception/    Standalone script exercising the experimental vision pipeline on real hardware — NOT automated/CI-safe
-docs/architecture/   This document + DEPENDENCY_MAP.md
+├── config/         Settings + logging setup           (leaf: depends on nothing)
+├── hardware/       Physical I/O: camera, GPS, battery-availability
+│                   (+ motor/encoder/ultrasonic/IR drivers for bench use only)
+├── localization/   GPS fixes -> position + heading
+├── perception/     Frames -> detections -> PerceptionResult
+│   └── experimental/   Older vision pipeline, NOT production (see its README)
+├── navigation/     Route progress -> desired heading and target waypoint
+├── control/        Decision -> MotionIntent   (+ retained legacy direct-drive loop)
+├── diagnostics/    Health monitoring and host metrics
+├── state/          The authoritative robot state + telemetry aggregation
+├── communication/  Socket.IO link to the FalconAut backend (off by default)
+└── application/    Agent lifecycle + local HTTP API (composition root)
 ```
+
+### Dependency direction
+
+```
+config  ◄── hardware ◄── localization ◄── navigation ◄── control ◄── state ◄── application
+            ▲                                  ▲            ▲         ▲
+            └── perception ────────────────────┴────────────┘         │
+            diagnostics ──────────────────────────────────────────────┘
+```
+
+Verified acyclic at both module and package level. `communication` is a leaf
+that nothing imports.
 
 ---
 
-## 3. Package Responsibilities
+## 3. Responsibilities
 
-### `robotx.config` — [IMPLEMENTED]
-`settings.py` defines a single frozen dataclass, `Settings`, instantiated once as `SETTINGS`. Every `ROBOTX_*` environment variable is read here and nowhere else. All other packages import `SETTINGS` rather than calling `os.environ` directly.
+### `config` — configuration and logging
+`settings.py` holds one frozen `Settings` dataclass. Defaults are literals on
+the fields; `Settings.from_env()` overlays `ROBOTX_*` environment variables.
+**No module outside this package reads `os.environ`.** A malformed numeric
+value raises at startup rather than silently falling back — a misconfigured
+robot should fail loudly. Secrets have no defaults and are reported as
+`SET`/`UNSET` by `public_summary()`, never echoed.
 
-### `robotx.hardware` — [IMPLEMENTED]
-Direct physical I/O. Every module here either drives `RPi.GPIO`/`picamera2`/a serial port, or is a no-op/mock stand-in used when that hardware library is unavailable (e.g. developing on a laptop).
+`logging_setup.py` configures logging once and provides `log_event()`, which
+tags lifecycle transitions with stable, greppable names (`camera.connected`,
+`gps.fix_acquired`, `health.changed`, `decision.changed`).
 
-| Module | Class | Device |
+### `hardware` — physical I/O
+| Module | Purpose | In the agent? |
 |---|---|---|
-| `motors.py` | `MotorDriver` | L298N dual H-bridge, differential drive |
-| `encoders.py` | `EncoderReader` | Single-channel wheel encoders (GPIO interrupts) |
-| `ultrasonic.py` | `UltrasonicSensor` | HC-SR04, exposes `UltrasonicStatus` (VALID/TIMEOUT/OUT_OF_RANGE/ERROR/DISCONNECTED/STALE/UNKNOWN) — see R-03 |
-| `ir.py` | `IRSensors` | 3x digital IR (no debounce) |
-| `camera.py` | `CameraStream` | Picamera2 threaded frame capture (moved here from `perception/` in this refactor — it is device I/O, not interpretation) |
-| `gps.py` | `GPSReader` | Serial NMEA-0183 parsing via `pyserial`+`pynmea2` (moved here from `navigation/` in this refactor — it is device I/O, not routing) |
+| `camera.py` | Picamera2 capture, BGR frames, explicit `CameraStatus` | Yes |
+| `gps.py` | Serial NMEA, explicit `GPSStatus`, reconnect | Yes |
+| `battery.py` | Single source of truth: no battery sensing exists | Yes |
+| `motors.py`, `encoders.py`, `ultrasonic.py`, `ir.py` | GPIO drivers | **No** — bench scripts and the legacy loop only |
 
-Hardware modules never import `communication`, `application`, or FastAPI/Socket.IO. Motors fail safe: `MotorDriver.stop()` is called from `RobotController`'s `finally`/`except` blocks on any error or shutdown.
+The camera device is held by one process-wide reference-counted manager, since
+libcamera permits a single open handle. `CameraStream` is a consumer handle.
 
-### `robotx.navigation` — [IMPLEMENTED]
-Pure routing logic plus one external HTTP dependency. No GPIO.
+### `localization` — position and heading
+Turns a `GpsReading` into a `Position`. This is the only place GPS becomes
+geography.
 
-| Module | Class | Responsibility |
+**Heading is a known weak point and is labelled as such.** The robot has no
+compass, no IMU and no magnetometer, so it has *no heading at all while
+stationary*. Every `Position` carries a `heading_source`:
+
+| Source | Meaning |
+|---|---|
+| `NMEA_TRACK` | Course over ground from the receiver's RMC sentence, trusted only above a minimum speed |
+| `GPS_TRACK` | Bearing between two consecutive fixes far enough apart to be movement rather than GPS wander |
+| `NONE` | Stationary or insufficient movement — heading is `None` |
+
+Both sources describe the direction the robot **moved**, not the direction it
+**faces**. They coincide only while driving forward in a straight line.
+Neither can tell that the robot is facing backwards or rotating in place.
+
+### `perception` — what the camera sees
+One production path: `PerceptionPipeline` runs `ObjectDetector` on the latest
+frame, on its own thread at `detection_hz`, so inference never stalls the agent
+loop. The agent reads the most recent `PerceptionResult`.
+
+`PerceptionResult.status` is the important part:
+
+| Status | Meaning |
+|---|---|
+| `OK` | A frame was captured and processed — the detection list is meaningful |
+| `NO_FRAME` | Camera delivered nothing, or its frames went stale |
+| `DETECTOR_ERROR` | Inference raised |
+| `STALE` | The last result has aged past the limit |
+| `DISABLED` | Perception is switched off |
+
+"I saw nothing" (`OK` with no detections) and "I could not see" (anything else)
+are distinct values, and the decision layer treats only the first as clearance.
+
+**No distance, depth, or time-to-collision field exists anywhere in the
+perception output.** The camera is monocular with no depth sensor, no stereo
+pair and no calibrated object-size table; it cannot measure distance. What it
+does support is bounding-box area in pixels and that area's change over time,
+exposed as `area_px` and `largest_area_delta_px` — an uncalibrated "is it
+getting bigger" signal, named so it cannot be mistaken for metres.
+
+`perception/experimental/` holds an older pipeline that is not wired into
+anything. See its README for what it is and why it was not promoted.
+
+### `navigation` — where to aim
+`Navigator` consumes a `Position` and a route and produces a `NavigationState`:
+target waypoint, distance, desired heading, signed heading error, progress, and
+a status (`IDLE` / `NO_POSITION` / `NAVIGATING` / `ARRIVED` / `REROUTE_NEEDED`).
+`RoutePlanner` tracks waypoint advance and off-route/blocked accumulation.
+
+Navigation never touches GPIO, never picks a speed, and never talks to a motor.
+Routes come from a local waypoint list; the Google Directions client remains
+available but is not required — the agent runs fully offline without it.
+
+### `control` — deciding, not driving
+`decision.py` turns navigation + perception into a `MotionIntent`. Its posture:
+**anything not positively known is a reason to stop.**
+
+| Situation | Intent |
+|---|---|
+| No active mission | `HOLD` |
+| Perception not `OK` (stale, errored, no frame, disabled) | `STOP` |
+| Person detected, at any size or position | `STOP` |
+| No GPS position | `STOP` |
+| Obstacle in the drive corridor, large or growing fast | `STOP` |
+| Obstacle in the corridor, smaller | `TURN_LEFT`/`TURN_RIGHT` away from it |
+| Route clear, heading known | `FORWARD` with proportional steering |
+| Route clear, heading unknown | `FORWARD` at creep speed (to establish a GPS track) |
+
+`motion.py` defines `MotionIntent`: `command`, `left`, `right`, `reason`,
+`timestamp`. Velocities are **normalized to [-1, 1], not PWM or duty cycle** —
+the Pi does not know the gear ratio, battery voltage or H-bridge limits, so it
+must not speak in those units. Converting intent to duty is the motor
+controller's job, which means recalibrating the drivetrain needs no Pi change.
+
+`robot_controller.py` is the **retained legacy direct-drive loop**. The
+application no longer starts it. It is kept because it carries reviewed safety
+behaviour (R-01, R-03) that is the reference for whatever runs on the ESP32,
+and because it remains usable for bench-testing the drivetrain.
+
+### `diagnostics` — health
+`HealthMonitor` combines per-subsystem statuses with host metrics read from
+`/proc/stat`, `/proc/meminfo`, `/proc/loadavg`, `/proc/uptime`, `statvfs` and
+`/sys/class/thermal` — no extra dependency, and anything unreadable is reported
+as `null` rather than zero.
+
+States: `HEALTHY` / `DEGRADED` / `FAILED` / `UNKNOWN`. `UNKNOWN` means "not
+measurable on this hardware" (for example, a disabled camera) and degrades the
+overall status rather than failing it; the worst component wins.
+
+### `state` — one authoritative representation
+`RobotState` is the single place holding mode, GPS, position, navigation,
+perception, motion intent, communication and health. Subsystems write once per
+tick; readers call `snapshot()` for a consistent immutable copy. **No module
+keeps a parallel copy of the robot's mode, position or intent.**
+
+`telemetry.py` builds the local telemetry payload from that snapshot — the one
+served on `GET /telemetry`. The backend link builds its own payloads in
+`communication/protocol.py`, shaped to the FalconAut data model rather than to
+the Pi's internals; both read the same snapshot, so they cannot disagree about
+what the robot is doing.
+
+Unknowable values are explicit: battery reports
+`{"status": "UNAVAILABLE", "percent": null, ...}`. It is never a number.
+
+### `application` — lifecycle and local API
+`agent.py` owns the startup order, the loop, and shutdown:
+
+```
+configuration -> logging -> camera -> perception -> GPS -> navigation/state -> running
+```
+
+Startup **degrades rather than refusing**: a missing camera or unopenable
+serial port does not stop the agent, because the rest must remain testable.
+What it never does is treat a missing subsystem as a healthy one — the decision
+layer stops the robot whenever perception is unusable. Shutdown releases in
+reverse: perception thread, GPS serial, camera device.
+
+`main.py` is a thin HTTP window onto the agent:
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /health` | Overall health, per-subsystem status, host metrics |
+| `GET /state` | Full authoritative robot state |
+| `GET /telemetry` | The local telemetry payload |
+| `GET /config` | Effective configuration (secrets shown as SET/UNSET) |
+| `GET /backend` | Backend link state, protocol binding, message counters |
+| `GET /camera` | MJPEG preview |
+| `POST /mission/start` | Load a waypoint route, switch to AUTO |
+| `POST /mission/stop` | Halt and clear the route |
+| `POST /mission/pause` | Suspend the mission, keeping the route |
+| `POST /mission/resume` | Resume a paused mission |
+| `POST /mission/idle` | Return to IDLE |
+
+Endpoints are unauthenticated: local trusted network only.
+
+---
+
+## 4. Where the ESP32 attaches
+
+The seam is `MotionIntent`. A transport would:
+
+1. Read `agent.state.snapshot().motion_intent` (or subscribe at the point in
+   `RobotAgent.tick()` where the intent is published).
+2. Serialize `MotionIntent.to_dict()`, or a compact binary form of the same
+   fields, and send it over UART.
+3. Report the link's state back via `RobotState.update_communication(esp32=...)`
+   — `LinkStatus.NOT_IMPLEMENTED` is the current value.
+
+The ESP32 side owns: converting normalized velocity to PWM, the duty ceiling,
+E-stop, ultrasonic/IR reflexes, encoder feedback, and refusing a stale intent
+(`MotionIntent.timestamp` exists for exactly that check).
+
+**None of this is implemented.** No UART code, no protocol, no framing.
+
+## 5. Where the backend attaches
+
+`communication/backend_link.py` is the one Socket.IO client. It reads an
+immutable `RobotSnapshot` and calls four mission methods
+(`stop_mission`, `pause_mission`, `resume_mission`, `return_to_base`). That is
+the entire coupling — there is no import path from the communication package to
+hardware, GPIO, navigation internals or the decision layer, and a test enforces
+it by walking the AST of every module in the package.
+
+```
+RobotSnapshot ──► BackendLink ──► Socket.IO ──► backend
+                      ▲                            │
+              mission methods ◄── CommandExecutor ◄─┘
+```
+
+`ROBOTX_SOCKET_ENABLED` defaults to off, and the `socketio` import is inside
+`RobotAgent._start_backend_link`, so the standalone agent never loads the
+library at all.
+
+**Status:** the Pi side is implemented and tested against a real Socket.IO
+transport. The FalconAut backend is not present in this repository, so the
+actual event names are unverified and configured through
+`ROBOTX_PROTOCOL_FILE`; until one is supplied the link reports
+`integrated: false`. See `docs/communication/ROBOT_BACKEND_PROTOCOL.md`.
+
+---
+
+## 6. Safety-relevant behaviour
+
+| Behaviour | Where | Status |
 |---|---|---|
-| `route_planner.py` | `RoutePlanner`, `haversine_m()` | Waypoint tracking, off-route/reroute heuristics |
-| `directions_client.py` | `GoogleMapsDirections`, `decode_polyline()` | Google Directions HTTP client, polyline decode, file-based cache + rate limit |
+| Unusable perception stops the robot | `control/decision.py` | Implemented |
+| Person detection stops the robot | `control/decision.py` | Implemented |
+| Missing GPS position stops the robot | `control/decision.py` | Implemented |
+| Agent-loop exception stops the robot and records the error | `application/agent.py` | Implemented |
+| GPS fix staleness is explicit, never silently reused | `hardware/gps.py` | Implemented |
+| Camera stall is distinguishable from an empty scene | `hardware/camera.py`, `perception/pipeline.py` | Implemented |
+| Ultrasonic non-VALID status blocks forward motion (R-03) | `hardware/ultrasonic.py`, legacy loop | Retained, legacy path only |
+| MANUAL obeys the obstacle gate (R-01) | legacy loop | Retained, legacy path only |
+| Hardware E-stop | — | **Not implemented** (ESP32 concern) |
+| Comm-loss watchdog | — | **Not implemented** (needs a link to lose) |
 
-**[MISSING]** No geofencing/zone/campus-boundary concept — any lat/lon can be requested as a destination.
+The Pi cannot itself guarantee the robot stops: it has no motor authority. Its
+guarantee is narrower and worth stating precisely — **it will not publish a
+forward intent unless it positively knows the path is clear.**
 
-### `robotx.perception` — [IMPLEMENTED] (production path) / [EXPERIMENTAL] (vision-decision pipeline)
-Camera-frame interpretation.
+### Timing of intent changes
 
-| Module | Class | Status |
-|---|---|---|
-| `object_detector.py` | `ObjectDetector` | [IMPLEMENTED] — OpenCV (MOG2 + Canny) or optional YOLOv8 backend; used by `RobotController` |
-| `object_tracker.py` | `ObjectTracker`, `PrimaryObjectTracker` | [IMPLEMENTED] — IoU multi-object tracking; not used by the production controller today, used by the experimental pipeline |
-| `temporal_filter.py` | `TemporalFilter`, `ActionSmoother` | [IMPLEMENTED] (`TemporalFilter`) / [UNUSED] (`ActionSmoother` has no callers anywhere) |
-| `vision_controller.py` | `VisionController` | **[EXPERIMENTAL — NOT WIRED INTO PRODUCTION]**. Continuous-turning, hysteresis-based obstacle avoidance with motion-depth trend estimation. Imports only other `perception.*` modules — never `hardware` or `control`. Exercised exclusively by `tests/perception/test_vision.py`. Living in `perception/` because its dependencies were always perception-only; this is a structural placement, **not** a promotion — it is still not called by `RobotController` |
-| `decision_engine.py` | `DecisionEngine` | **[EXPERIMENTAL — NOT WIRED INTO PRODUCTION]**. 36-line fixed-threshold rule engine paired with `vision_controller.py`. Same non-production status as above |
-
-Per `ROBOTX_PI_REMEDIATION_PLAN.md` (R-05), the choice to keep `VisionController`/`DecisionEngine` as reference-only rather than promoting them into `RobotController` was a deliberate decision (different safety philosophy, no bench-test evidence for this robot's camera/mounting) — not an oversight, and not revisited by this structural refactor.
-
-### `robotx.control` — [IMPLEMENTED], safety-critical
-`robot_controller.py` — `RobotController` is the **only** production control loop, wired into `robotx.application.main` at startup. Responsibilities:
-- Reads GPS/ultrasonic/IR/encoders every tick (10 Hz default), throttled camera detection (2 Hz default).
-- `_safety_blocked()`: true if ultrasonic status is anything other than a fresh `VALID` in-range reading, OR any IR triggered, OR perception reports a person/obstacle. Conservative-by-design (R-03).
-- Mode dispatch (`IDLE`/`AUTO`/`MANUAL`/`RETURN`/`STOPPED`/`ERROR`): `AUTO`/`RETURN` run `_avoid()` when blocked, else route-follow via `RoutePlanner`; `MANUAL` runs `_apply_manual()`, which **also** consults the same `blocked` signal — forward-class motion is refused while blocked, backward/turning remain available (R-01).
-- Builds the telemetry dict and forwards it to whatever hook `robotx.application.main` registered (decoupled from the transport).
-- Fails safe: motors are stopped in `except Exception` inside the loop and in `stop()`'s `finally`-style cleanup.
-
-This module intentionally does **not** import `robotx.communication` or FastAPI — it only calls back through the injected `telemetry_hook` and receives commands through `handle_command()`, called by whatever transport the application layer wires up.
-
-### `robotx.communication` — [PARTIALLY IMPLEMENTED — client-side only]
-`socket_client.py` — `RobotSocketClient` is the one network transport in the repository: an outbound Socket.IO client.
-- `connect()` sends `auth={"robot_id": ..., "token": SETTINGS.robot_token}` in the Engine.IO/Socket.IO handshake (R-02). If `ROBOTX_ROBOT_TOKEN` is unset, it logs an explicit warning and still connects (there is no server in this repo to authenticate against).
-- Inbound `command`/`manual` events are queued (`asyncio.Queue`, FIFO, no dedup) and dispatched one at a time to whatever handler `robotx.application.main` registered (`RobotController.handle_command`).
-- Outbound `telemetry` is drop-oldest-on-full (`maxsize=5`) — never blocks the control loop.
-- `emit_status()` exists but has zero call sites anywhere in the repo — dead code, not wired to anything.
-
-**Backend integration requirement (out of this repo's scope):** the external Socket.IO server must read the `auth` payload during its own `connect` handler and reject unknown/mismatched tokens — see `ROBOTX_PI_REMEDIATION_PLAN.md` R-02 for the exact contract this client assumes.
-
-### `robotx.application` — [IMPLEMENTED]
-`main.py` is the composition root and sole entry point:
-- Defines the FastAPI `app` instance and its two routes (`/health`, `/camera`, both unauthenticated, both read-only).
-- `on_startup()`: constructs every hardware/navigation/perception object from `SETTINGS`, wires them into one `RobotController`, constructs one `RobotSocketClient`, registers the telemetry hook, connects the socket (non-fatally — a failed connection does not stop the robot's local control loop), and calls `controller.start()`.
-- `on_shutdown()`: stops the controller (which fails-safe-stops all hardware) and closes the socket.
-
-This is the only file allowed to import from every other package — it is the composition root, not a library other modules import from.
-
----
-
-## 4. Dependency Direction
-
-```
-config
-   ^
-   | (every package reads SETTINGS)
-   |
-hardware  navigation  perception  ← no internal deps between these three
-   ^           ^           ^
-   └───────────┴───────────┘
-               |
-            control            (RobotController: the only production consumer of all three)
-               |
-        communication            (independent — talks to control only via injected callbacks)
-               |
-          application            (composition root — the only place all packages are imported together)
-```
-
-Confirmed by import inspection: **no circular imports exist**. `hardware`, `navigation`, and `perception` never import `control`, `communication`, or `application`. `control.robot_controller` never imports `communication` or `application` directly — it receives commands and emits telemetry only through plain callables injected by `application.main`. `perception.vision_controller`/`decision_engine` (experimental) import only other `perception.*` modules.
-
-See `DEPENDENCY_MAP.md` for the complete file-level import graph.
-
----
-
-## 5. Configuration
-
-All configuration is centralized in `robotx.config.settings.SETTINGS` (a frozen dataclass populated once at import time from `ROBOTX_*` environment variables). No module outside `robotx/config/settings.py` calls `os.environ` for application configuration. See the module itself for the full variable list (motor pins, sensor pins, socket URL/namespace/token, detection backend, control-loop tuning, etc.) — reproduced in full in `ROBOTX_DEEP_CURRENT_STATE_AUDIT.md` §33 (paths there are pre-refactor; the settings themselves are unchanged).
-
----
-
-## 6. Test Structure
-
-**[IMPLEMENTED]** Six standalone scripts, laid out to mirror the package they exercise, each directly touching real GPIO/camera/serial hardware. None are automated (no `pytest`, no assertions) and none should ever be run as part of an automated check, CI, or refactor validation, because every one of them can move motors, open the real camera, or requires a human to observe the robot.
-
-| Script | Location | Touches |
-|---|---|---|
-| `test_motors.py` | `tests/hardware/` | Real motors (drives forward/backward) |
-| `test_gps.py` | `tests/hardware/` | Real serial GPS |
-| `test_ultrasonic.py` | `tests/hardware/` | Real HC-SR04 |
-| `test_camera.py` | `tests/hardware/` | Real Picamera2 |
-| `test_controller.py` | `tests/control/` | Real motors + ultrasonic + IR + encoders (independent reimplementation — does **not** exercise `RobotController`; misleadingly named, tracked as R-05, not renamed here) |
-| `test_vision.py` | `tests/perception/` | Real Picamera2 + `VisionController`/`DecisionEngine` (the only exerciser of the experimental pipeline) |
-
-`test_controller.py` and `test_vision.py` live outside `tests/hardware/` because they are organized by *what they test* (control-loop decision logic, the perception/vision pipeline) rather than by *which physical sensor they happen to touch* — both still require real hardware and must never be run automatically.
-
-**[NOT IMPLEMENTED]** No automated, hardware-free test suite exists yet for the pure-logic code (`haversine_m`, `RoutePlanner`, `decode_polyline`, `ObjectTracker`, `DecisionEngine`). This is tracked as R-05/future work in `ROBOTX_PI_REMEDIATION_PLAN.md`. `tests/communication/` and `tests/navigation/` were not created — no test content exists for those packages yet, and empty directories were deliberately not scaffolded.
-
----
-
-## 7. Production Startup
-
-```bash
-cd /home/pi/Desktop/RobotX
-venv/bin/python -m uvicorn robotx.application.main:app --host 0.0.0.0 --port 8000
-```
-
-Import-only sanity check (starts no hardware threads):
-```bash
-venv/bin/python -c "import robotx.application.main; print('ok')"
-```
-
-Always use `venv/bin/python -m <module>` (never the `venv/bin/pip`/`venv/bin/uvicorn` shim scripts directly) — see `ROBOTX_PI_REMEDIATION_PLAN.md` R-00 for why the shims' shebangs are unreliable on this Pi.
-
----
-
-## 8. Hardware Diagnostics
-
-Run manually, one at a time, never automated:
-```bash
-venv/bin/python tests/hardware/test_motors.py      # SAFETY: wheels off the ground
-venv/bin/python tests/hardware/test_ultrasonic.py
-venv/bin/python tests/hardware/test_gps.py
-venv/bin/python tests/hardware/test_camera.py
-venv/bin/python tests/control/test_controller.py   # SAFETY: wheels off the ground
-venv/bin/python tests/perception/test_vision.py
-```
-See `TEST_README.md` for expected output and troubleshooting per script.
-
----
-
-## 9. Safety-Critical Paths
-
-| Path | Where | Status |
-|---|---|---|
-| Ultrasonic non-VALID status blocks forward motion | `hardware/ultrasonic.py` (`UltrasonicStatus`), `control/robot_controller.py` (`_safety_blocked`) | [IMPLEMENTED] — R-03 |
-| MANUAL mode obeys the same safety gate as AUTO/RETURN | `control/robot_controller.py` (`_apply_manual`) | [IMPLEMENTED, scoped] — R-01. Only forward-class motion is refused; backward/turning remain available (no rear sensor exists) |
-| Socket.IO connect handshake carries a bearer token | `communication/socket_client.py` (`connect`) | [PARTIALLY IMPLEMENTED — client only] — R-02. No server in this repo verifies it |
-| Motors stop on unhandled exception / shutdown | `control/robot_controller.py` (`_loop`'s `except Exception`, `stop()`) | [IMPLEMENTED] |
-| Max commanded motor duty ceiling | `hardware/motors.py` (`MotorDriver.max_duty`, default 0.75) | [IMPLEMENTED] |
-| Comm-loss watchdog (stale command persists after disconnect) | — | **[NOT IMPLEMENTED]** — tracked as R-06 |
-| Command payload schema validation | — | **[NOT IMPLEMENTED]** — tracked as R-07 |
-| Dedicated hardware e-stop | — | **[NOT IMPLEMENTED]** |
-| Real battery telemetry | — | **[NOT IMPLEMENTED]** — `battery.percent` is a hardcoded `76.0`, tracked as R-04 |
-
-None of the above statuses changed as a result of this architecture refactor — every safety-relevant method moved verbatim (diff-verified against the pre-refactor checkpoint commit) with only its containing file's import block edited.
+Intent is produced by the agent loop (10 Hz default), so starting a mission
+takes up to one tick to show a driving intent — the robot holds first, which is
+the safe direction. **Stopping does not wait for a tick**: `stop_mission()`
+publishes a STOP intent synchronously, so there is no window in which a stale
+forward intent remains readable after a stop.

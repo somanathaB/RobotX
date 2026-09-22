@@ -1,272 +1,182 @@
-# RobotX subsystem tests (no frontend required)
+# Testing RobotX on the Pi
 
-This document describes standalone test scripts you can run directly on the Raspberry Pi to validate each subsystem independently.
+Two kinds of test live here, and they are not interchangeable.
 
-**Frontend is NOT required** for these tests.
+| | Automated (unit) | Automated (integration) | Manual |
+|---|---|---|---|
+| Location | `tests/unit/` | `tests/integration/` | `tests/hardware/`, `tests/control/`, `tests/perception/` |
+| Touches hardware | No | No | Yes — real camera, serial port, GPIO, motors |
+| Touches the network | No | Loopback only | No |
+| Safe to run any time | Yes | Yes | **No** |
+| Asserts anything | Yes | Yes | No — a human watches the output |
 
 ---
 
-## 1) Setup
+## Automated tests
 
-From the project root:
+Stdlib `unittest`. No pytest, no network, no hardware, no new dependencies.
 
 ```bash
 cd /home/pi/Desktop/RobotX
+venv/bin/python -m unittest discover -s tests/unit -t .
 ```
 
-### Create/activate venv
+Verbose, or a single file:
 
 ```bash
-python3 -m venv venv
-source venv/bin/activate
+venv/bin/python -m unittest discover -s tests/unit -t . -v
+venv/bin/python -m unittest tests.unit.test_motion_and_decision -v
 ```
 
-### Install dependencies
+| File | Covers |
+|---|---|
+| `test_config.py` | Defaults, env overrides, type coercion, malformed values, secret elision |
+| `test_perception.py` | Detection model, detector filtering, pipeline statuses and error paths |
+| `test_gps_and_position.py` | NMEA parsing, invalid-fix rejection, staleness, heading estimation |
+| `test_navigation.py` | Waypoint advance, arrival, rerouting, desired heading, heading error |
+| `test_motion_and_decision.py` | Motion intent construction and clamping, every decision branch |
+| `test_state_telemetry_health.py` | Authoritative state, telemetry schema, no fake battery, health aggregation |
+| `test_agent.py` | Full agent tick with fake subsystems, lifecycle, mission control, failure recovery, mid-run degradation |
+| `test_navigation_synthetic.py` | Full localization → navigation → decision chain on deterministic NMEA fixtures |
+| `test_audit_regressions.py` | One test per defect found in the production-readiness audit |
+| `test_protocol.py` | Backend payloads, refusal to fabricate battery/position, inbound validation, credential redaction |
+| `test_commands.py` | Command execution, refusals, idempotency, the communication/hardware boundary |
+| `test_backend_link.py` | Link lifecycle, backoff, rate limiting, dispatch, honest status reporting |
+| `test_agent_backend_commands.py` | The real agent under STOP/PAUSE/RETURN/RESUME, including safety non-bypass |
 
-```bash
-pip install -r requirements.txt
-```
-
-### (Alternative) Install dependencies with `uv`
-
-If `pip install` is slow or fails on the Pi, you can use `uv`.
-
-Install `uv` (once):
-
-```bash
-pip install -U uv
-```
-
-Then install requirements:
-
-```bash
-uv pip install -r requirements.txt
-```
-
-Notes:
-- Hardware access (GPIO) may require running as `sudo` depending on your OS permissions.
-- If you run as `sudo`, prefer: `sudo -E env "PATH=$PATH" python ...` so your venv is used.
+These deliberately do **not** import any hardware library. Do not add a test
+here that needs a camera, a serial port, or GPIO.
 
 ---
 
-## 2) Run each test
-
-All tests are standalone and can be run from the repo root.
-
-### Test Camera (Picamera2 / libcamera)
+## Integration tests — real Socket.IO transport
 
 ```bash
-python tests/hardware/test_camera.py
+venv/bin/python -m unittest discover -s tests/integration -t .
 ```
 
-Expected:
-- A live camera window opens.
-- Press **q** to quit.
-- If the detection module is available, detections may be printed to the terminal.
+These bind a loopback TCP port and run a real `socketio.AsyncServer` against
+the real `socketio.AsyncClient` the agent uses: genuine Engine.IO handshake,
+genuine JSON, nothing faked on the client side. They cover the handshake and
+credential delivery, a server that refuses the token, telemetry and status,
+the command round-trip, duplicates, disconnect, reconnect, re-registration,
+and a backend that is absent at boot and appears later.
 
-Notes:
-- Raspberry Pi Camera Module 3 uses **libcamera/Picamera2**.
-- Do **NOT** use `cv2.VideoCapture(0)` for the CSI camera.
-- If you are using a Python venv, Picamera2 (apt-installed) may not be visible unless you create the venv with `--system-site-packages`.
+Still hardware-free and safe to run any time; they take ~12 s.
 
----
+**What they do not prove:** anything about the FalconAut backend. The test
+server speaks the Pi's own PROVISIONAL event names, because the real ones are
+not available in this repository. A green run means the transport and the
+state machine are correct, not that the integration is done.
 
-### Test GPS
+### Measurement harness (manual, uses the real camera)
 
 ```bash
-python tests/hardware/test_gps.py
+PYTHONPATH=. venv/bin/python tests/integration/soak_backend_link.py --seconds 120
 ```
 
-Expected:
-- Latitude/longitude printed every ~2 seconds once a fix is available.
-- If no fix/device, you’ll see “No GPS fix yet” plus error info.
-
-Config:
-- `ROBOTX_GPS_PORT` (default `/dev/ttyAMA0`)
-- `ROBOTX_GPS_BAUDRATE` (default `9600`)
+Runs the full agent twice — with and without the backend link — and prints the
+CPU, loop-timing, perception and memory difference. Takes a few minutes. No
+motors are touched; none exist in the process.
 
 ---
 
-### Test Motors
+## Manual hardware verification
+
+None of these are automated, and none should ever be run by a script, CI job,
+or as refactor validation. Each needs a human watching the robot.
+
+Run one at a time:
 
 ```bash
-python tests/hardware/test_motors.py
+venv/bin/python tests/hardware/test_camera.py
+venv/bin/python tests/hardware/test_gps.py
+venv/bin/python tests/hardware/test_ultrasonic.py
+venv/bin/python tests/hardware/test_motors.py        # SAFETY: wheels off the ground
+venv/bin/python tests/control/test_controller.py     # SAFETY: wheels off the ground
+venv/bin/python tests/perception/test_vision.py
 ```
 
-Expected:
-- Robot moves forward for ~2 seconds, stops, then moves backward for ~2 seconds, then stops.
+### Checklist
 
-Safety:
-- Keep wheels off the ground for the first run.
-- Script always attempts to STOP motors on error or Ctrl+C.
+Record the date and the result. An unrun check is not a pass.
 
----
+#### 1. Camera — `tests/hardware/test_camera.py`
 
-### Test Ultrasonic
+- [ ] Camera opens without error
+- [ ] Frames arrive within ~5 s (shape printed, e.g. `(480, 640, 3)`)
+- [ ] `frame.jpg` is written and shows the expected scene (headless), or the
+      preview window opens (with a display)
+- [ ] Detections print when something moves in view
+- [ ] Ctrl+C exits cleanly and releases the camera
+
+If it fails: `rpicam-hello --list-cameras`, check the ribbon cable and CSI
+connector, confirm `python3-picamera2` is installed and the venv was created
+with `--system-site-packages`.
+
+#### 2. GPS — `tests/hardware/test_gps.py`
+
+- [ ] Serial port opens (`gps.connected` is logged)
+- [ ] NMEA sentences are received (`sentences` climbs above 0)
+- [ ] Status reaches `FIX` outdoors with a clear sky view
+- [ ] Latitude/longitude are plausible for your location
+- [ ] Satellite count and altitude are reported
+- [ ] Unplugging the receiver produces a status change, not a silent hang
+
+A cold start outdoors can take several minutes. `sentences` staying at 0 means
+the receiver is not transmitting on that port — check power, TX/RX wiring, baud
+rate, and whether the module is on `/dev/serial0` instead of `/dev/ttyAMA0`.
+
+#### 3. Perception on live camera — `tests/perception/test_vision.py`
+
+Exercises the **experimental** pipeline (`robotx/perception/experimental/`),
+not the production one. The production path is covered by the camera check
+above.
+
+- [ ] Actions change sensibly as an obstacle moves through the frame
+- [ ] Frame rate is usable on this Pi
+
+#### 4. Ultrasonic — `tests/hardware/test_ultrasonic.py`
+
+ESP32-owned in the target architecture; this exercises the Pi-side driver.
+
+- [ ] Distance tracks an object moved toward and away from the sensor
+- [ ] Covering the sensor produces a non-VALID status, not a stale number
+
+#### 5. Motors — `tests/hardware/test_motors.py` — **WHEELS OFF THE GROUND**
+
+- [ ] Both wheels spin forward, then backward
+- [ ] Left and right turn the expected way (invert settings if not)
+- [ ] Motors stop on Ctrl+C and on exit
+
+#### 6. Legacy direct-drive loop — `tests/control/test_controller.py` — **WHEELS OFF THE GROUND**
+
+This does **not** exercise the production agent. It is an independent
+stop/forward rule over real sensors, kept for drivetrain bench work.
+
+- [ ] Blocking the ultrasonic sensor stops the motors
+- [ ] Clearing it resumes forward drive
+- [ ] Motors stop on exit
+
+#### 7. Full agent on real hardware
 
 ```bash
-python tests/hardware/test_ultrasonic.py
+venv/bin/python -m uvicorn robotx.application.main:app --host 0.0.0.0 --port 8000
 ```
 
-Expected:
-- Distance values printed continuously.
-- Moving an object in front of the sensor should change readings.
+- [ ] Startup logs show camera connected, perception started, GPS starting
+- [ ] `curl localhost:8000/health` — camera and perception `HEALTHY`
+- [ ] `curl localhost:8000/state` — perception status `OK`, detections update
+- [ ] `http://<pi-ip>:8000/camera` shows live video in a browser
+- [ ] `curl localhost:8000/telemetry` — battery is `UNAVAILABLE`/`null`
+- [ ] With no GPS fix, starting a mission yields intent `STOP — no GPS position`
+- [ ] Ctrl+C shuts down cleanly: perception stopped, GPS stopped, camera released
+- [ ] No wheel moves at any point (the agent has no motor authority)
 
 ---
 
-### Test Controller (simplified)
+## What has actually been verified
 
-```bash
-python tests/control/test_controller.py
-```
-
-Expected:
-- Prints sensor readings and a decision (`FORWARD` / `STOP`).
-- Logic is intentionally simple:
-  - If ultrasonic distance < threshold OR any IR sensor is triggered => STOP
-  - Else => FORWARD
-
-This test does NOT require:
-- Socket.IO server
-- Google Maps API
-- Full navigation routing
-
----
-
-### Test Vision Decision System (camera + YOLOv8)
-
-```bash
-python tests/perception/test_vision.py
-```
-
-Expected:
-- Runs headless (no GUI window required)
-- Prints in real-time:
-  - `Objects: [...]`
-  - `Stable: [...]`
-  - `Action: STOP/SLOW/MOVE_FORWARD`
-  - plus backend and approximate detection FPS
-- By default, writes a debug frame to `./frame.jpg` every ~2 seconds
-  - Disable: `ROBOTX_SAVE_DEBUG=0 python tests/perception/test_vision.py`
-  - Change path: `ROBOTX_DEBUG_PATH=/tmp/frame.jpg python tests/perception/test_vision.py`
-
-Notes:
-- The vision pipeline uses detector backend `auto`:
-  - If `ultralytics` + `torch` are installed, it will use YOLOv8.
-  - Otherwise it will fall back to a lightweight OpenCV detector (still produces STOP/SLOW/MOVE_FORWARD).
-- Installing `ultralytics` typically pulls in `torch` and can be very large.
-- If install is slow or fails, see the Troubleshooting section below.
-
----
-
-## 3) Troubleshooting
-
-### Camera not detected
-
-Symptoms:
-- `ERROR: Could not start Picamera2 camera` or `No cameras available!`
-
-Fixes:
-
-- Install Picamera2 (libcamera):
-
-  ```bash
-  sudo apt update
-  sudo apt install -y python3-picamera2
-  ```
-
-- Test camera at OS level:
-
-  ```bash
-  rpicam-hello --list-cameras
-  rpicam-hello -t 0
-  ```
-
-  On some images/versions the command is `libcamera-hello`:
-
-  ```bash
-  libcamera-hello --list-cameras
-  libcamera-hello -t 0
-  ```
-
-- If you are using a venv, create it with system packages so it can import Picamera2:
-
-  ```bash
-  python3 -m venv --system-site-packages venv_cam
-  source venv_cam/bin/activate
-  pip install -r requirements.txt
-  python tests/hardware/test_camera.py
-  ```
-
-- If running headless (no GUI): `cv2.imshow` may fail. Use an attached display or X forwarding.
-
-## Raspberry Pi Camera Module 3 fix
-
-- Raspberry Pi Camera Module 3 uses libcamera. The RobotX camera module uses Picamera2 under the hood.
-- `cv2.VideoCapture()` is not used and `/dev/video0` is not required.
-
-### YOLOv8 / ultralytics install issues
-
-Symptoms:
-- `RuntimeError: ultralytics is not installed`
-- `pip install ultralytics` fails due to missing `torch` wheels
-
-Fixes:
-- First try: `pip install -r requirements.txt`
-- If you try installing YOLO, avoid using `/tmp` (often a small tmpfs on Raspberry Pi):
-
-  ```bash
-  mkdir -p /home/pi/pip-tmp
-  TMPDIR=/home/pi/pip-tmp pip install --no-cache-dir ultralytics
-  ```
-
-- Ensure you’re using piwheels when available: `pip config get global.index-url` and `pip -v install ultralytics`
-- If `torch` wheels are not available for your OS/Python, consider:
-  - Using Raspberry Pi OS 64-bit with a Python version that has torch wheels available
-  - Installing torch via a known wheel source for Pi (varies by distro/version)
-
-### Headless display (no HDMI)
-
-Symptoms:
-- `cv2.imshow failed` or no window appears
-
-Fixes:
-- Connect a display to the Pi
-- Or use X forwarding / VNC
-- If you only need console output, you can still run the controller logic without `imshow` by adapting `tests/perception/test_vision.py` (ask if you want a headless mode)
-
-### Permission issues (GPIO)
-
-Symptoms:
-- Motor/sensors do nothing or you see permission errors.
-
-Fixes:
-- Run as root: `sudo -E env "PATH=$PATH" python tests/hardware/test_motors.py`
-- Ensure `RPi.GPIO` is installed: `pip show RPi.GPIO`
-- Confirm pin numbering is BCM (these scripts use BCM pins).
-
-### GPS not locking
-
-Symptoms:
-- “No GPS fix yet” forever.
-
-Fixes:
-- Confirm serial port: `/dev/ttyAMA0` vs `/dev/ttyS0`
-- Ensure serial is enabled and serial console disabled (`raspi-config`)
-- Check wiring (TX/RX swapped is common)
-- Verify module has sky view; initial lock can take time
-
-### Motors not responding
-
-Fixes:
-- Verify L298N ENA/ENB jumpers and wiring to PWM pins
-- Check battery voltage / motor power supply
-- Confirm pin mapping matches your wiring (override with env vars; see `robotx/config/settings.py`)
-
----
-
-## 4) Notes
-
-- These tests are designed to debug the robot **without any frontend/dashboard**.
-- If/when you run the full FastAPI app later, Swagger UI is available at:
-  - `http://<pi-ip>:8000/docs`
+`ROBOTX_PI_CURRENT_STATE.md` records which of these were run and what happened.
+Checks that were not performed are listed there as not performed. Do not
+record a check as passing unless you watched it pass.

@@ -1,3 +1,13 @@
+"""EXPERIMENTAL -- NOT WIRED INTO PRODUCTION.
+
+Paired with `vision_controller.py`. The production decision layer is
+`robotx.control.decision`. See this package's README.md.
+
+The pixel thresholds below (213/426/30000/10000) are literals tied to a 640 px
+frame and one camera mounting; they are not derived from configuration.
+"""
+
+
 class DecisionEngine:
     def __init__(self):
         self.state = "MOVE_FORWARD"

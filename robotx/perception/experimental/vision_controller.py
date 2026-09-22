@@ -1,3 +1,14 @@
+"""EXPERIMENTAL -- NOT WIRED INTO PRODUCTION.
+
+Exercised only by `tests/perception/test_vision.py` (manual, needs the real
+camera). The production perception path is `robotx.perception.pipeline`; the
+production decision layer is `robotx.control.decision`. See this package's
+README.md for why this module is retained but not promoted.
+
+It prints to stdout on every cycle by design: it is a bench tool meant to be
+watched in a terminal, not a service. Do not import it from the agent.
+"""
+
 from __future__ import annotations
 
 import os
@@ -6,7 +17,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 from robotx.hardware.camera import CameraStream
-from robotx.perception.object_detector import ObjectDetector
+from robotx.perception.object_detector import DetectorConfig, ObjectDetector
 from robotx.perception.temporal_filter import TemporalFilter, TemporalFilterConfig
 from robotx.perception.object_tracker import ObjectTracker, PrimaryObjectTracker, PrimaryTrack, Track
 
@@ -279,7 +290,7 @@ class VisionController:
         fps: int = 20,
     ) -> None:
         self.cfg = cfg
-        self.camera = CameraStream(index=camera_index, width=width, height=height, fps=fps)
+        self.camera = CameraStream(width=width, height=height, fps=fps)
         self.camera.start()
 
         self.detector = self._create_detector(cfg)
@@ -332,8 +343,13 @@ class VisionController:
 
     @staticmethod
     def _create_detector(cfg: VisionControllerConfig) -> ObjectDetector:
-        backend = cfg.backend.strip().lower()
-        return ObjectDetector(backend=backend, min_conf=cfg.min_conf, yolo_model_path=cfg.yolo_model_path)
+        return ObjectDetector(
+            DetectorConfig(
+                backend=cfg.backend.strip().lower(),
+                min_conf=cfg.min_conf,
+                yolo_model_path=cfg.yolo_model_path,
+            )
+        )
 
     def step(self) -> Dict[str, Any]:
         frame = self.camera.get_frame()

@@ -1,7 +1,16 @@
 # RobotX Pi Agent — Remediation Plan
 
 **Date:** 2026-09-22
-**Status:** R-00, R-01, R-02, R-03 implemented and verified (see "Implementation status" below). R-04 through R-10 not yet started — awaiting approval to proceed.
+**Status (updated 2026-09-22, after the standalone-agent restructuring):**
+- **R-00, R-01, R-02, R-03** — implemented and verified (see "Implementation status" below). R-01 and R-03 now live in the *retained legacy* direct-drive loop, which the application no longer starts; their rules are the reference for the ESP32.
+- **R-04 (fabricated battery telemetry)** — **FIXED.** `robotx/hardware/battery.py` is now the single source of truth and reports `UNAVAILABLE`/`null`. The hardcoded `76.0` is gone. Covered by tests.
+- **R-05 (disconnected vision pipeline / no controller test coverage)** — **ADDRESSED.** The experimental pipeline moved to `robotx/perception/experimental/` with a README stating why it is not promoted; a 162-test automated suite now covers the production decision path.
+- **R-09 (print() in hot paths)** — **FIXED.** Zero `print()` calls remain in production code; the detector logs instead. The experimental pipeline still prints by design (it is a bench tool).
+- **R-10 (no `.env.example`)** — **FIXED.** `.env.example` documents every `ROBOTX_*` variable with no secret values.
+- **R-06 (comm-loss watchdog), R-07 (command schema)** — superseded in their original form: the agent has no command transport to lose. The local HTTP API validates its payloads via Pydantic. These return as requirements when the ESP32 and backend links are built.
+- **R-08 (process supervision)** — still open.
+
+> Sections below are the original analysis, preserved as written. See `ROBOTX_PI_FOUNDATION_IMPLEMENTATION_REPORT.md` for what changed since.
 **Method:** Every finding below was re-derived directly from the current files on disk (not copied from the prior audit without verification). File:line references point at the code as it exists right now. Findings are classified CRITICAL / HIGH / MEDIUM / LOW.
 
 ## Implementation status (2026-09-22)

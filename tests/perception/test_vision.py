@@ -181,8 +181,8 @@ def main() -> int:
         return 2
 
     try:
-        from robotx.perception.vision_controller import VisionController, VisionControllerConfig
-        from robotx.perception.decision_engine import DecisionEngine
+        from robotx.perception.experimental.vision_controller import VisionController, VisionControllerConfig
+        from robotx.perception.experimental.decision_engine import DecisionEngine
         from robotx.perception.temporal_filter import ActionSmoother
         from robotx.perception.object_tracker import PrimaryObjectTracker
     except Exception as e:
@@ -436,7 +436,7 @@ def main() -> int:
 
                     # Draw collision zone + blue center dot + zone/action labels.
                     try:
-                        from robotx.perception.vision_controller import draw_avoidance_debug
+                        from robotx.perception.experimental.vision_controller import draw_avoidance_debug
 
                         draw_avoidance_debug(annotated, primary=primary_det, action=str(action))
                     except Exception:
