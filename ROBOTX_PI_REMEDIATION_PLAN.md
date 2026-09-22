@@ -18,7 +18,7 @@
 This repo can only implement the **client** half of authentication. For the channel to actually be secured, the external Socket.IO server (not present in this repository) must:
 1. Accept the `auth` object delivered in the Engine.IO/Socket.IO connect handshake (this is a standard `python-socketio`/`socket.io` server-side feature — reading `environ["asgi.scope"]["auth"]` or the framework's equivalent `auth` argument in its `connect` handler).
 2. Look up `auth["robot_id"]` and verify `auth["token"]` against a stored credential for that robot.
-3. Reject the connection (raise `ConnectionRefusedError` in the server's `connect` handler, or return `False`) if the token is missing, unknown, or mismatched — python-socketio propagates this back to the client as a `ConnectionError` from `sio.connect()`, which this repo's `socket_boot()` in `app.py` already handles non-fatally (the robot keeps running its local control loop even if the socket rejects).
+3. Reject the connection (raise `ConnectionRefusedError` in the server's `connect` handler, or return `False`) if the token is missing, unknown, or mismatched — python-socketio propagates this back to the client as a `ConnectionError` from `sio.connect()`, which this repo's `socket_boot()` in `main.py` already handles non-fatally (the robot keeps running its local control loop even if the socket rejects).
 4. Reject any `command`/`manual` event arriving on a socket that never completed step 2-3 successfully (should not be reachable if step 3 is enforced at connect time, but defense-in-depth is recommended server-side).
 
 No token issuance/rotation mechanism is implemented or assumed — `ROBOTX_ROBOT_TOKEN` is treated as an opaque bearer string the operator provisions out-of-band (e.g. set once via the systemd `EnvironmentFile`, not yet created — see R-08, deferred). This is intentionally not a JWT/HMAC/cert scheme — inventing one without a backend to match it against would create exactly the "incompatible invented protocol" the task instructions warned against.
@@ -43,12 +43,12 @@ All findings from `ROBOTX_DEEP_CURRENT_STATE_AUDIT.md` were re-checked against s
 
 **Proposed fix:**
 1. `chmod +x venv/bin/python` (restores the one binary that's actually needed).
-2. Do **not** patch every shebang by hand (fragile, easy to miss one, and pip-generated shims regenerate their own paths on reinstall anyway). Instead, standardize the documented run/install commands to always invoke `venv/bin/python -m <module>` (`venv/bin/python -m pip install -r requirements.txt`, `venv/bin/python -m uvicorn robotx.application.app:app ...`), which only depends on `venv/bin/python` being executable, not on any shebang line.
+2. Do **not** patch every shebang by hand (fragile, easy to miss one, and pip-generated shims regenerate their own paths on reinstall anyway). Instead, standardize the documented run/install commands to always invoke `venv/bin/python -m <module>` (`venv/bin/python -m pip install -r requirements.txt`, `venv/bin/python -m uvicorn robotx.application.main:app ...`), which only depends on `venv/bin/python` being executable, not on any shebang line.
 3. Update `README.md` and `deployment/robotx-agent.service` (new, Phase 17) to use the `-m` invocation form exclusively.
 
 **Safety impact:** None — this is a pure tooling/deployment fix, no runtime behavior changes.
 **Compatibility impact:** None — `-m` invocation is standard and behaves identically to the console-script shims.
-**Testing required:** `venv/bin/python -c "import robotx.application.app; print('ok')"` must succeed; `venv/bin/python -m uvicorn --version` must succeed.
+**Testing required:** `venv/bin/python -c "import robotx.application.main; print('ok')"` must succeed; `venv/bin/python -m uvicorn --version` must succeed.
 **Documentation required:** `README.md` run instructions, `ROBOTX_PI_SETUP_AND_RUN.md` (new).
 
 ---
@@ -129,7 +129,7 @@ class UltrasonicStatus(Enum):
 **Proposed fix:** No battery-sensing hardware exists on this robot today (not verified present — no I2C fuel-gauge IC, no ADC HAT referenced anywhere in config/wiring docs). Per the task's explicit instruction not to invent hardware that doesn't exist, the fix is **representational, not a fake sensor**:
 - Telemetry's `battery` field becomes `{"state": "UNAVAILABLE", "percent": null}` where `state` is one of `REAL | ESTIMATED | SIMULATED | UNAVAILABLE`.
 - Add a `BatteryReader` interface (`robotx/hardware/battery.py`, new) with a single implementation today: `UnavailableBatteryReader` that always returns `state=UNAVAILABLE, percent=None`. This defines the seam for a future real reader (e.g. INA219-backed) without fabricating one now.
-- `app.py` instantiates `UnavailableBatteryReader` by default; a future `ROBOTX_BATTERY_BACKEND=ina219` config switch (not implemented now, documented as FUTURE INTEGRATION) would swap it.
+- `main.py` instantiates `UnavailableBatteryReader` by default; a future `ROBOTX_BATTERY_BACKEND=ina219` config switch (not implemented now, documented as FUTURE INTEGRATION) would swap it.
 
 **Safety impact:** None directly (no low-battery auto-behavior exists to feed today), but prevents a downstream consumer (dashboard, auto-return-on-low-battery logic if ever built) from silently trusting fabricated data.
 **Compatibility impact:** Any existing consumer of `telemetry.battery.percent` as a bare float will need to handle the new `{state, percent}` shape and a possible `null` percent — this is a breaking schema change, called out explicitly in the protocol doc.
@@ -141,9 +141,9 @@ class UltrasonicStatus(Enum):
 ## R-05 — VisionController/DecisionEngine disconnected from production; RobotController has zero test coverage
 
 **Severity:** HIGH
-**Affected files:** `robotx/perception/vision_controller.py`, `robotx/perception/decision_engine.py`, `robotx/control/robot_controller.py`, `tests/hardware/test_vision.py`, `tests/hardware/test_controller.py`
+**Affected files:** `robotx/perception/vision_controller.py`, `robotx/perception/decision_engine.py`, `robotx/control/robot_controller.py`, `tests/perception/test_vision.py`, `tests/control/test_controller.py`
 
-**Root cause:** Confirmed by grep — `VisionController`/`DecisionEngine` are imported only by `tests/hardware/test_vision.py`; `RobotController` never imports either. `tests/hardware/test_controller.py` does not import `robotx.control.robot_controller` at all (misleading filename, independent reimplementation).
+**Root cause:** Confirmed by grep — `VisionController`/`DecisionEngine` are imported only by `tests/perception/test_vision.py`; `RobotController` never imports either. `tests/control/test_controller.py` does not import `robotx.control.robot_controller` at all (misleading filename, independent reimplementation).
 
 **Decision (per task Phase 10, evaluated against actual code/hardware requirements):** **OPTION B** — retain `RobotController`'s simpler `_safety_blocked`/`_avoid` as the live safety-relevant obstacle logic (now centralized into `SafetyController` per R-01/R-03), and formally document `VisionController`/`DecisionEngine` as **experimental/reference-only**, not production. Rationale:
 - Promoting `VisionController` (Option A) would change live robot motion behavior (hysteresis, hold timers, hard-coded pixel-zone thresholds at `213`/`426`/`30000`/`10000` not derived from actual frame width) without any bench-test evidence it's tuned for this robot's actual camera/mounting — the task explicitly says not to change behavior without ability to verify against hardware, and no such verification exists.
@@ -151,13 +151,13 @@ class UltrasonicStatus(Enum):
 - `VisionController`/`DecisionEngine` are not deleted (798 + 36 lines of real, working logic) — they are relabeled via module docstrings and `TEST_README.md` as explicitly experimental, so a future maintainer doesn't assume they're live.
 
 **Proposed fix:**
-1. Add a top-of-file docstring to `vision_controller.py` and `decision_engine.py`: `"""EXPERIMENTAL / NOT WIRED INTO PRODUCTION. Exercised only by tests/hardware/test_vision.py. See ROBOTX_PI_ARCHITECTURE.md §Vision Pipelines for the promotion decision and rationale."""`
-2. Rename `tests/hardware/test_controller.py`'s misleading self-description — add a header comment clarifying it does **not** exercise `RobotController`.
+1. Add a top-of-file docstring to `vision_controller.py` and `decision_engine.py`: `"""EXPERIMENTAL / NOT WIRED INTO PRODUCTION. Exercised only by tests/perception/test_vision.py. See ROBOTX_PI_ARCHITECTURE.md §Vision Pipelines for the promotion decision and rationale."""`
+2. Rename `tests/control/test_controller.py`'s misleading self-description — add a header comment clarifying it does **not** exercise `RobotController`.
 3. Add a real `pytest` suite (Phase 18) that imports and exercises `RobotController`'s pure-logic pieces (`_safety_blocked`, `_route_follow_command`, `handle_command`) with mocked hardware — closing the "zero coverage" gap the audit identified, without touching real GPIO.
 
 **Safety impact:** None (documentation + test-only change; no live behavior changes).
 **Compatibility impact:** None.
-**Testing required:** New `tests/unit/test_robot_controller.py` (mocked hardware, not the existing `tests/hardware/test_controller.py` standalone script) — see Phase 18 plan below.
+**Testing required:** New `tests/unit/test_robot_controller.py` (mocked hardware, not the existing `tests/control/test_controller.py` standalone script) — see Phase 18 plan below.
 **Documentation required:** `ROBOTX_PI_ROBOT_AGENT_ARCHITECTURE.md` (new) must state this decision and rationale explicitly.
 
 ---
@@ -204,7 +204,7 @@ class UltrasonicStatus(Enum):
 
 **Root cause:** Confirmed — no systemd unit in `/etc/systemd/system/`, no Docker/PM2 config anywhere. A crash or reboot requires manual restart.
 
-**Proposed fix:** Add `deployment/robotx-agent.service` (not installed/enabled automatically — a template for the operator to review and install). Runs as user `pi` (not root — GPIO access on recent Raspberry Pi OS is available to the `gpio`/`dialout` group without root), `WorkingDirectory=/home/pi/Desktop/RobotX`, `ExecStart=.../venv/bin/python -m uvicorn robotx.application.app:app --host ... --port ...`, `Restart=on-failure`, `RestartSec=2`, reads `EnvironmentFile=/home/pi/Desktop/RobotX/.env` for configuration (never inline secrets in the unit file).
+**Proposed fix:** Add `deployment/robotx-agent.service` (not installed/enabled automatically — a template for the operator to review and install). Runs as user `pi` (not root — GPIO access on recent Raspberry Pi OS is available to the `gpio`/`dialout` group without root), `WorkingDirectory=/home/pi/Desktop/RobotX`, `ExecStart=.../venv/bin/python -m uvicorn robotx.application.main:app --host ... --port ...`, `Restart=on-failure`, `RestartSec=2`, reads `EnvironmentFile=/home/pi/Desktop/RobotX/.env` for configuration (never inline secrets in the unit file).
 
 **Safety impact:** Indirect — ensures the safety-relevant control loop restarts after a crash rather than leaving the robot in an unsupervised state (though motors already fail-safe-stop on exception per the existing `except Exception` handler in `_loop()`).
 **Compatibility impact:** None until explicitly installed by the operator (`systemctl enable`) — this plan only adds the file, per the task's instruction not to enable/install services blindly.

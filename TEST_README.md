@@ -56,7 +56,7 @@ All tests are standalone and can be run from the repo root.
 ### Test Camera (Picamera2 / libcamera)
 
 ```bash
-python tests/hardware/test_cv.py
+python tests/hardware/test_camera.py
 ```
 
 Expected:
@@ -90,7 +90,7 @@ Config:
 ### Test Motors
 
 ```bash
-python tests/hardware/test_motor.py
+python tests/hardware/test_motors.py
 ```
 
 Expected:
@@ -117,7 +117,7 @@ Expected:
 ### Test Controller (simplified)
 
 ```bash
-python tests/hardware/test_controller.py
+python tests/control/test_controller.py
 ```
 
 Expected:
@@ -136,7 +136,7 @@ This test does NOT require:
 ### Test Vision Decision System (camera + YOLOv8)
 
 ```bash
-python tests/hardware/test_vision.py
+python tests/perception/test_vision.py
 ```
 
 Expected:
@@ -147,8 +147,8 @@ Expected:
   - `Action: STOP/SLOW/MOVE_FORWARD`
   - plus backend and approximate detection FPS
 - By default, writes a debug frame to `./frame.jpg` every ~2 seconds
-  - Disable: `ROBOTX_SAVE_DEBUG=0 python tests/hardware/test_vision.py`
-  - Change path: `ROBOTX_DEBUG_PATH=/tmp/frame.jpg python tests/hardware/test_vision.py`
+  - Disable: `ROBOTX_SAVE_DEBUG=0 python tests/perception/test_vision.py`
+  - Change path: `ROBOTX_DEBUG_PATH=/tmp/frame.jpg python tests/perception/test_vision.py`
 
 Notes:
 - The vision pipeline uses detector backend `auto`:
@@ -195,7 +195,7 @@ Fixes:
   python3 -m venv --system-site-packages venv_cam
   source venv_cam/bin/activate
   pip install -r requirements.txt
-  python tests/hardware/test_cv.py
+  python tests/hardware/test_camera.py
   ```
 
 - If running headless (no GUI): `cv2.imshow` may fail. Use an attached display or X forwarding.
@@ -233,7 +233,7 @@ Symptoms:
 Fixes:
 - Connect a display to the Pi
 - Or use X forwarding / VNC
-- If you only need console output, you can still run the controller logic without `imshow` by adapting `tests/hardware/test_vision.py` (ask if you want a headless mode)
+- If you only need console output, you can still run the controller logic without `imshow` by adapting `tests/perception/test_vision.py` (ask if you want a headless mode)
 
 ### Permission issues (GPIO)
 
@@ -241,7 +241,7 @@ Symptoms:
 - Motor/sensors do nothing or you see permission errors.
 
 Fixes:
-- Run as root: `sudo -E env "PATH=$PATH" python tests/hardware/test_motor.py`
+- Run as root: `sudo -E env "PATH=$PATH" python tests/hardware/test_motors.py`
 - Ensure `RPi.GPIO` is installed: `pip show RPi.GPIO`
 - Confirm pin numbering is BCM (these scripts use BCM pins).
 

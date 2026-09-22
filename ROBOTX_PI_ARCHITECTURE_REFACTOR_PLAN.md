@@ -1,5 +1,7 @@
 # RobotX Pi Agent — Architecture Refactor Plan
 
+> **HISTORICAL DOCUMENT.** This was the plan for the first restructuring pass. A second cleanup pass followed the same day (`application/app.py`→`main.py`, test scripts split by package under `tests/`) — see `ROBOTX_ARCHITECTURE_CLEANUP_REPORT.md` and `docs/architecture/ROBOTX_PI_ARCHITECTURE.md` for the current, authoritative structure.
+
 **Date:** 2026-09-22
 **Scope:** Pure architectural reorganization (folder/file/module structure, naming, import wiring).
 **Explicitly out of scope:** R-04 through R-10 (battery telemetry, VisionController promotion decision, comm-loss watchdog, command schema validation, systemd, logging cleanup, `.env.example`) from `ROBOTX_PI_REMEDIATION_PLAN.md`. None of that feature/safety work is touched here. R-00 through R-03 (already implemented and verified) must remain functionally intact after this refactor — this plan only relocates the code that implements them, never rewrites its logic.

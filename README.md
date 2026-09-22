@@ -15,7 +15,7 @@ This repo contains a complete, modular robot stack that runs **on the Raspberry 
 ```
 robotx/
 	application/
-		app.py               # FastAPI entry point + composition root
+		main.py               # FastAPI entry point + composition root
 	communication/
 		socket_client.py     # Socket.IO client
 	hardware/
@@ -39,7 +39,9 @@ robotx/
 	config/
 		settings.py
 tests/
-	hardware/                # standalone hardware-exercise scripts (real GPIO/camera/serial)
+	hardware/                # standalone scripts: real GPIO/camera/serial (motors, ultrasonic, gps, camera)
+	control/                 # standalone script: real hardware, tests the STOP/FORWARD decision rule
+	perception/              # standalone script: real camera, exercises the experimental vision pipeline
 requirements.txt
 ```
 
@@ -104,7 +106,7 @@ Start the robot stack (FastAPI + controller + Socket.IO client):
 
 ```bash
 cd /home/pi/Desktop/RobotX
-venv/bin/python -m uvicorn robotx.application.app:app --host 0.0.0.0 --port 8000
+venv/bin/python -m uvicorn robotx.application.main:app --host 0.0.0.0 --port 8000
 ```
 
 Endpoints:
@@ -146,7 +148,7 @@ Examples:
 
 ```bash
 cd /home/pi/Desktop/RobotX
-venv/bin/python -c "import robotx.application.app; print('ok')"
+venv/bin/python -c "import robotx.application.main; print('ok')"
 ```
 
 2) Health check (after running uvicorn)
@@ -158,6 +160,16 @@ curl -s http://localhost:8000/health | jq
 3) Camera stream
 
 Open: `http://<pi-ip>:8000/camera` in a browser.
+
+## Tests
+
+There is no automated test suite (no `pytest`, no assertions) — see `TEST_README.md` for the six standalone hardware-exercise scripts under `tests/`. None of them are safe to run automatically; each one touches real GPIO, the real camera, or a real serial port. See `docs/architecture/ROBOTX_PI_ARCHITECTURE.md` §6 for which script lives where and why.
+
+## Architecture docs
+
+- `docs/architecture/ROBOTX_PI_ARCHITECTURE.md` — package responsibilities, data/control flow, production-vs-experimental status
+- `docs/architecture/DEPENDENCY_MAP.md` — full file-level import graph and dependency direction
+- `ROBOTX_PI_REMEDIATION_PLAN.md` — safety/security findings and fix status (R-00 through R-10)
 
 ## Safety notes
 

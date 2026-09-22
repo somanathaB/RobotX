@@ -1,5 +1,7 @@
 # RobotX Pi Agent — Architecture Refactor Report
 
+> **HISTORICAL DOCUMENT.** This records the first restructuring pass (2026-09-22, `app/`→`application/`, `utils/`→`config/`, etc.). A second cleanup pass followed the same day, renaming `application/app.py`→`main.py` and splitting `tests/hardware/` into `tests/hardware/`+`tests/control/`+`tests/perception/` — see `ROBOTX_ARCHITECTURE_CLEANUP_REPORT.md` for that pass and the current, authoritative file layout. Paths cited below (e.g. `application/app.py`, `tests/hardware/test_motor.py`) reflect this document's own pass and are one step behind the current tree.
+
 **Date:** 2026-09-22
 **Type:** Structural reorganization only (folder/file/module names, import wiring). No behavior, wiring logic, safety thresholds, GPIO pin assignments, or Socket.IO protocol were changed.
 **Reference plan:** `ROBOTX_PI_ARCHITECTURE_REFACTOR_PLAN.md`
