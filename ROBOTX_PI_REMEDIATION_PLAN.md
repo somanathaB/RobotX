@@ -18,7 +18,7 @@
 This repo can only implement the **client** half of authentication. For the channel to actually be secured, the external Socket.IO server (not present in this repository) must:
 1. Accept the `auth` object delivered in the Engine.IO/Socket.IO connect handshake (this is a standard `python-socketio`/`socket.io` server-side feature — reading `environ["asgi.scope"]["auth"]` or the framework's equivalent `auth` argument in its `connect` handler).
 2. Look up `auth["robot_id"]` and verify `auth["token"]` against a stored credential for that robot.
-3. Reject the connection (raise `ConnectionRefusedError` in the server's `connect` handler, or return `False`) if the token is missing, unknown, or mismatched — python-socketio propagates this back to the client as a `ConnectionError` from `sio.connect()`, which this repo's `socket_boot()` in `main.py` already handles non-fatally (the robot keeps running its local control loop even if the socket rejects).
+3. Reject the connection (raise `ConnectionRefusedError` in the server's `connect` handler, or return `False`) if the token is missing, unknown, or mismatched — python-socketio propagates this back to the client as a `ConnectionError` from `sio.connect()`, which this repo's `socket_boot()` in `app.py` already handles non-fatally (the robot keeps running its local control loop even if the socket rejects).
 4. Reject any `command`/`manual` event arriving on a socket that never completed step 2-3 successfully (should not be reachable if step 3 is enforced at connect time, but defense-in-depth is recommended server-side).
 
 No token issuance/rotation mechanism is implemented or assumed — `ROBOTX_ROBOT_TOKEN` is treated as an opaque bearer string the operator provisions out-of-band (e.g. set once via the systemd `EnvironmentFile`, not yet created — see R-08, deferred). This is intentionally not a JWT/HMAC/cert scheme — inventing one without a backend to match it against would create exactly the "incompatible invented protocol" the task instructions warned against.
@@ -43,12 +43,12 @@ All findings from `ROBOTX_DEEP_CURRENT_STATE_AUDIT.md` were re-checked against s
 
 **Proposed fix:**
 1. `chmod +x venv/bin/python` (restores the one binary that's actually needed).
-2. Do **not** patch every shebang by hand (fragile, easy to miss one, and pip-generated shims regenerate their own paths on reinstall anyway). Instead, standardize the documented run/install commands to always invoke `venv/bin/python -m <module>` (`venv/bin/python -m pip install -r requirements.txt`, `venv/bin/python -m uvicorn robotx.app.main:app ...`), which only depends on `venv/bin/python` being executable, not on any shebang line.
+2. Do **not** patch every shebang by hand (fragile, easy to miss one, and pip-generated shims regenerate their own paths on reinstall anyway). Instead, standardize the documented run/install commands to always invoke `venv/bin/python -m <module>` (`venv/bin/python -m pip install -r requirements.txt`, `venv/bin/python -m uvicorn robotx.application.app:app ...`), which only depends on `venv/bin/python` being executable, not on any shebang line.
 3. Update `README.md` and `deployment/robotx-agent.service` (new, Phase 17) to use the `-m` invocation form exclusively.
 
 **Safety impact:** None — this is a pure tooling/deployment fix, no runtime behavior changes.
 **Compatibility impact:** None — `-m` invocation is standard and behaves identically to the console-script shims.
-**Testing required:** `venv/bin/python -c "import robotx.app.main; print('ok')"` must succeed; `venv/bin/python -m uvicorn --version` must succeed.
+**Testing required:** `venv/bin/python -c "import robotx.application.app; print('ok')"` must succeed; `venv/bin/python -m uvicorn --version` must succeed.
 **Documentation required:** `README.md` run instructions, `ROBOTX_PI_SETUP_AND_RUN.md` (new).
 
 ---
@@ -56,9 +56,9 @@ All findings from `ROBOTX_DEEP_CURRENT_STATE_AUDIT.md` were re-checked against s
 ## R-01 — MANUAL mode bypasses all obstacle/person-detection safety checks
 
 **Severity:** CRITICAL
-**Affected files:** `robotx/control/controller.py:351-352`, `robotx/control/controller.py:417-440` (`_apply_manual`)
+**Affected files:** `robotx/control/robot_controller.py:351-352`, `robotx/control/robot_controller.py:417-440` (`_apply_manual`)
 
-**Root cause:** In `RobotController._loop()`, `_safety_blocked()` is computed every tick from ultrasonic + IR + vision (`controller.py:346`), but it is only *consulted* in the `AUTO`/`RETURN` branch (`controller.py:354-373`). The `MANUAL` branch (`controller.py:351-352`) calls `self._apply_manual()` unconditionally — `blocked` is never read. A `{"type":"MANUAL","payload":{"action":"forward","speed":1.0}}` command drives the robot at commanded speed regardless of what the sensors see.
+**Root cause:** In `RobotController._loop()`, `_safety_blocked()` is computed every tick from ultrasonic + IR + vision (`robot_controller.py:346`), but it is only *consulted* in the `AUTO`/`RETURN` branch (`robot_controller.py:354-373`). The `MANUAL` branch (`robot_controller.py:351-352`) calls `self._apply_manual()` unconditionally — `blocked` is never read. A `{"type":"MANUAL","payload":{"action":"forward","speed":1.0}}` command drives the robot at commanded speed regardless of what the sensors see.
 
 **Proposed fix:** Introduce one centralized safety gate that every mode's motor command passes through before reaching `MotorDriver`, rather than patching the `MANUAL` branch in isolation (patching in isolation would just create a fourth duplicate safety check alongside the existing `_safety_blocked`/`_avoid`/`DecisionEngine`/`VisionController` implementations the audit already flagged as duplicated in §34). Concretely:
 - Add a `SafetyController` (new module, `robotx/control/safety.py`) that takes the current sensor snapshot and a *requested* `(left, right)` motor command from any mode, and returns an *approved* `(left, right)` command — zeroing or clamping it if blocked, regardless of which mode requested it.
@@ -75,9 +75,9 @@ All findings from `ROBOTX_DEEP_CURRENT_STATE_AUDIT.md` were re-checked against s
 ## R-02 — No authentication on the Socket.IO command channel
 
 **Severity:** CRITICAL
-**Affected files:** `robotx/app/sockets.py:26-67`, `robotx/utils/config.py`
+**Affected files:** `robotx/communication/socket_client.py:26-67`, `robotx/config/settings.py`
 
-**Root cause:** `RobotSocketClient.connect()` (`sockets.py:66-67`) calls `self.sio.connect(url, namespaces=[...])` with no `auth=` parameter. `robot_hello` (`sockets.py:44`) sends a self-reported `robot_id` string with no proof of identity. Any party that can reach the configured namespace can emit `command`/`manual` events (`sockets.py:51-64`), which are queued and executed unconditionally by `controller.handle_command()`.
+**Root cause:** `RobotSocketClient.connect()` (`socket_client.py:66-67`) calls `self.sio.connect(url, namespaces=[...])` with no `auth=` parameter. `robot_hello` (`socket_client.py:44`) sends a self-reported `robot_id` string with no proof of identity. Any party that can reach the configured namespace can emit `command`/`manual` events (`socket_client.py:51-64`), which are queued and executed unconditionally by `controller.handle_command()`.
 
 **Proposed fix:** `python-socketio`'s `AsyncClient.connect()` natively supports an `auth=` dict, delivered to the server during the Engine.IO handshake before any event is processed. Add:
 - `ROBOTX_ROBOT_TOKEN` (new required-for-remote-operation env var, read only from environment, never hardcoded) — a bearer credential for this specific robot.
@@ -95,9 +95,9 @@ All findings from `ROBOTX_DEEP_CURRENT_STATE_AUDIT.md` were re-checked against s
 ## R-03 — Ultrasonic sensor failure/timeout is treated as "no obstacle"
 
 **Severity:** CRITICAL (safety-adjacent — silent failure mode)
-**Affected files:** `robotx/hardware/ultrasonic.py:69-98`, `robotx/control/controller.py:258-265`
+**Affected files:** `robotx/hardware/ultrasonic.py:69-98`, `robotx/control/robot_controller.py:258-265`
 
-**Root cause:** `_measure_distance_cm()` returns `None` on GPIO unavailable, 30ms echo timeout, or an out-of-range reading (`ultrasonic.py:83-85`, `88-90`, `96-97`) — all three distinct failure modes collapse to the same `None`. `_safety_blocked()` (`controller.py:258-259`) only trips when `distance_cm is not None and distance_cm < threshold` — a `None` reading (sensor unplugged, timed out, or GPIO absent) is treated as "not blocked," identical to a genuine clear reading.
+**Root cause:** `_measure_distance_cm()` returns `None` on GPIO unavailable, 30ms echo timeout, or an out-of-range reading (`ultrasonic.py:83-85`, `88-90`, `96-97`) — all three distinct failure modes collapse to the same `None`. `_safety_blocked()` (`robot_controller.py:258-259`) only trips when `distance_cm is not None and distance_cm < threshold` — a `None` reading (sensor unplugged, timed out, or GPIO absent) is treated as "not blocked," identical to a genuine clear reading.
 
 **Proposed fix:** Replace the `Optional[float]` return with an explicit status model:
 ```python
@@ -122,14 +122,14 @@ class UltrasonicStatus(Enum):
 ## R-04 — Battery telemetry is a hardcoded constant reported as real
 
 **Severity:** HIGH
-**Affected files:** `robotx/control/controller.py:386`
+**Affected files:** `robotx/control/robot_controller.py:386`
 
 **Root cause:** `"battery": {"percent": 76.0}` is a literal constant in the telemetry dict. Confirmed via grep: no ADC, INA219, voltage-divider, or any battery-sensing code exists anywhere in the repository.
 
 **Proposed fix:** No battery-sensing hardware exists on this robot today (not verified present — no I2C fuel-gauge IC, no ADC HAT referenced anywhere in config/wiring docs). Per the task's explicit instruction not to invent hardware that doesn't exist, the fix is **representational, not a fake sensor**:
 - Telemetry's `battery` field becomes `{"state": "UNAVAILABLE", "percent": null}` where `state` is one of `REAL | ESTIMATED | SIMULATED | UNAVAILABLE`.
 - Add a `BatteryReader` interface (`robotx/hardware/battery.py`, new) with a single implementation today: `UnavailableBatteryReader` that always returns `state=UNAVAILABLE, percent=None`. This defines the seam for a future real reader (e.g. INA219-backed) without fabricating one now.
-- `main.py` instantiates `UnavailableBatteryReader` by default; a future `ROBOTX_BATTERY_BACKEND=ina219` config switch (not implemented now, documented as FUTURE INTEGRATION) would swap it.
+- `app.py` instantiates `UnavailableBatteryReader` by default; a future `ROBOTX_BATTERY_BACKEND=ina219` config switch (not implemented now, documented as FUTURE INTEGRATION) would swap it.
 
 **Safety impact:** None directly (no low-battery auto-behavior exists to feed today), but prevents a downstream consumer (dashboard, auto-return-on-low-battery logic if ever built) from silently trusting fabricated data.
 **Compatibility impact:** Any existing consumer of `telemetry.battery.percent` as a bare float will need to handle the new `{state, percent}` shape and a possible `null` percent — this is a breaking schema change, called out explicitly in the protocol doc.
@@ -141,9 +141,9 @@ class UltrasonicStatus(Enum):
 ## R-05 — VisionController/DecisionEngine disconnected from production; RobotController has zero test coverage
 
 **Severity:** HIGH
-**Affected files:** `robotx/control/vision_controller.py`, `robotx/control/decision_engine.py`, `robotx/control/controller.py`, `test_vision.py`, `test_controller.py`
+**Affected files:** `robotx/perception/vision_controller.py`, `robotx/perception/decision_engine.py`, `robotx/control/robot_controller.py`, `tests/hardware/test_vision.py`, `tests/hardware/test_controller.py`
 
-**Root cause:** Confirmed by grep — `VisionController`/`DecisionEngine` are imported only by `test_vision.py`; `RobotController` never imports either. `test_controller.py` does not import `robotx.control.controller` at all (misleading filename, independent reimplementation).
+**Root cause:** Confirmed by grep — `VisionController`/`DecisionEngine` are imported only by `tests/hardware/test_vision.py`; `RobotController` never imports either. `tests/hardware/test_controller.py` does not import `robotx.control.robot_controller` at all (misleading filename, independent reimplementation).
 
 **Decision (per task Phase 10, evaluated against actual code/hardware requirements):** **OPTION B** — retain `RobotController`'s simpler `_safety_blocked`/`_avoid` as the live safety-relevant obstacle logic (now centralized into `SafetyController` per R-01/R-03), and formally document `VisionController`/`DecisionEngine` as **experimental/reference-only**, not production. Rationale:
 - Promoting `VisionController` (Option A) would change live robot motion behavior (hysteresis, hold timers, hard-coded pixel-zone thresholds at `213`/`426`/`30000`/`10000` not derived from actual frame width) without any bench-test evidence it's tuned for this robot's actual camera/mounting — the task explicitly says not to change behavior without ability to verify against hardware, and no such verification exists.
@@ -151,13 +151,13 @@ class UltrasonicStatus(Enum):
 - `VisionController`/`DecisionEngine` are not deleted (798 + 36 lines of real, working logic) — they are relabeled via module docstrings and `TEST_README.md` as explicitly experimental, so a future maintainer doesn't assume they're live.
 
 **Proposed fix:**
-1. Add a top-of-file docstring to `vision_controller.py` and `decision_engine.py`: `"""EXPERIMENTAL / NOT WIRED INTO PRODUCTION. Exercised only by test_vision.py. See ROBOTX_PI_ARCHITECTURE.md §Vision Pipelines for the promotion decision and rationale."""`
-2. Rename `test_controller.py`'s misleading self-description — add a header comment clarifying it does **not** exercise `RobotController`.
+1. Add a top-of-file docstring to `vision_controller.py` and `decision_engine.py`: `"""EXPERIMENTAL / NOT WIRED INTO PRODUCTION. Exercised only by tests/hardware/test_vision.py. See ROBOTX_PI_ARCHITECTURE.md §Vision Pipelines for the promotion decision and rationale."""`
+2. Rename `tests/hardware/test_controller.py`'s misleading self-description — add a header comment clarifying it does **not** exercise `RobotController`.
 3. Add a real `pytest` suite (Phase 18) that imports and exercises `RobotController`'s pure-logic pieces (`_safety_blocked`, `_route_follow_command`, `handle_command`) with mocked hardware — closing the "zero coverage" gap the audit identified, without touching real GPIO.
 
 **Safety impact:** None (documentation + test-only change; no live behavior changes).
 **Compatibility impact:** None.
-**Testing required:** New `tests/test_controller.py` (mocked hardware) — see Phase 18 plan below.
+**Testing required:** New `tests/unit/test_robot_controller.py` (mocked hardware, not the existing `tests/hardware/test_controller.py` standalone script) — see Phase 18 plan below.
 **Documentation required:** `ROBOTX_PI_ROBOT_AGENT_ARCHITECTURE.md` (new) must state this decision and rationale explicitly.
 
 ---
@@ -165,12 +165,12 @@ class UltrasonicStatus(Enum):
 ## R-06 — No communication-loss watchdog; stale commands can persist indefinitely
 
 **Severity:** HIGH
-**Affected files:** `robotx/app/sockets.py`, `robotx/control/controller.py`
+**Affected files:** `robotx/communication/socket_client.py`, `robotx/control/robot_controller.py`
 
-**Root cause:** Confirmed — there is no timestamp on inbound `command`/`manual` events, no staleness check, and no watchdog tied to socket disconnect. If the socket disconnects while `_mode == "MANUAL"` mid-forward-command, `_apply_manual()` continues driving that same `_manual_cmd` every tick forever (`controller.py:351-352`) — the mode/command state is never revisited on disconnect.
+**Root cause:** Confirmed — there is no timestamp on inbound `command`/`manual` events, no staleness check, and no watchdog tied to socket disconnect. If the socket disconnects while `_mode == "MANUAL"` mid-forward-command, `_apply_manual()` continues driving that same `_manual_cmd` every tick forever (`robot_controller.py:351-352`) — the mode/command state is never revisited on disconnect.
 
 **Proposed fix:**
-- `RobotSocketClient` already clears an `asyncio.Event` on `disconnect` (`sockets.py:46-49`). Wire a callback from that disconnect handler into `RobotController`: on socket disconnect, if `_mode == "MANUAL"`, force `_mode = "STOPPED"` and `motors.stop()` immediately (do not wait for the next control tick's normal path, since that path doesn't currently re-check connection state at all).
+- `RobotSocketClient` already clears an `asyncio.Event` on `disconnect` (`socket_client.py:46-49`). Wire a callback from that disconnect handler into `RobotController`: on socket disconnect, if `_mode == "MANUAL"`, force `_mode = "STOPPED"` and `motors.stop()` immediately (do not wait for the next control tick's normal path, since that path doesn't currently re-check connection state at all).
 - Add a `ROBOTX_COMM_WATCHDOG_TIMEOUT_S` (default e.g. 3.0s) — if no telemetry hook has successfully emitted (i.e., no confirmed live connection) for longer than this, independent of an explicit `disconnect` event firing, force the same safe-stop. This covers a "half-open" TCP connection that never fires `disconnect` cleanly.
 - AUTO/RETURN mode is unaffected by disconnect alone (per task: "communication loss" safe-state) — also force-stop, since continuing to autonomously drive without a way to receive a remote STOP is not a state this task's safety posture should default to; document this as the chosen conservative default rather than assumed.
 
@@ -184,11 +184,11 @@ class UltrasonicStatus(Enum):
 ## R-07 — No command validation / schema on inbound Socket.IO commands
 
 **Severity:** MEDIUM
-**Affected files:** `robotx/app/sockets.py:51-64`, `robotx/control/controller.py:172-212`
+**Affected files:** `robotx/communication/socket_client.py:51-64`, `robotx/control/robot_controller.py:172-212`
 
-**Root cause:** `on_command`/`on_manual` only check `isinstance(data, dict)` (`sockets.py:54`, `60`). `handle_command()` then does ad-hoc, per-field `.get()`/type coercion with no schema, no command ID, no timestamp/freshness check (confirmed — `controller.py:172-212`). A malformed `START` with a non-numeric `destination.lat` will raise inside `float(dest["lat"])` uncaught inside `handle_command`, which is itself called from `RobotSocketClient.command_loop()`'s `try/except Exception` (`sockets.py:113-116`) — so it's logged and doesn't crash the process, but the command is silently dropped with no ack/nack to the sender.
+**Root cause:** `on_command`/`on_manual` only check `isinstance(data, dict)` (`socket_client.py:54`, `60`). `handle_command()` then does ad-hoc, per-field `.get()`/type coercion with no schema, no command ID, no timestamp/freshness check (confirmed — `robot_controller.py:172-212`). A malformed `START` with a non-numeric `destination.lat` will raise inside `float(dest["lat"])` uncaught inside `handle_command`, which is itself called from `RobotSocketClient.command_loop()`'s `try/except Exception` (`socket_client.py:113-116`) — so it's logged and doesn't crash the process, but the command is silently dropped with no ack/nack to the sender.
 
-**Proposed fix:** Add a small Pydantic-based command schema (`robotx/app/commands.py`, new) — `STOP`, `START{destination:{lat,lon}}`, `RETURN{home?:{lat,lon}}`, `MANUAL{action, speed, left?, right?}` — validated once at the socket boundary before being queued. Invalid commands are rejected with a logged reason and (once R-02's auth exists) an optional `command_rejected` ack event back to the server. No new command types are added beyond the four already in the protocol, per the task's "only implement commands that are actually needed" instruction.
+**Proposed fix:** Add a small Pydantic-based command schema (`robotx/communication/commands.py`, new) — `STOP`, `START{destination:{lat,lon}}`, `RETURN{home?:{lat,lon}}`, `MANUAL{action, speed, left?, right?}` — validated once at the socket boundary before being queued. Invalid commands are rejected with a logged reason and (once R-02's auth exists) an optional `command_rejected` ack event back to the server. No new command types are added beyond the four already in the protocol, per the task's "only implement commands that are actually needed" instruction.
 
 **Safety impact:** Prevents a malformed command from reaching `handle_command()` in a partially-applied state (e.g., `_mode` set before the destination parse fails).
 **Compatibility impact:** Low — existing well-formed commands are unaffected; malformed ones (already effectively no-ops today, just less visibly) are now explicitly rejected.
@@ -204,7 +204,7 @@ class UltrasonicStatus(Enum):
 
 **Root cause:** Confirmed — no systemd unit in `/etc/systemd/system/`, no Docker/PM2 config anywhere. A crash or reboot requires manual restart.
 
-**Proposed fix:** Add `deployment/robotx-agent.service` (not installed/enabled automatically — a template for the operator to review and install). Runs as user `pi` (not root — GPIO access on recent Raspberry Pi OS is available to the `gpio`/`dialout` group without root), `WorkingDirectory=/home/pi/Desktop/RobotX`, `ExecStart=.../venv/bin/python -m uvicorn robotx.app.main:app --host ... --port ...`, `Restart=on-failure`, `RestartSec=2`, reads `EnvironmentFile=/home/pi/Desktop/RobotX/.env` for configuration (never inline secrets in the unit file).
+**Proposed fix:** Add `deployment/robotx-agent.service` (not installed/enabled automatically — a template for the operator to review and install). Runs as user `pi` (not root — GPIO access on recent Raspberry Pi OS is available to the `gpio`/`dialout` group without root), `WorkingDirectory=/home/pi/Desktop/RobotX`, `ExecStart=.../venv/bin/python -m uvicorn robotx.application.app:app --host ... --port ...`, `Restart=on-failure`, `RestartSec=2`, reads `EnvironmentFile=/home/pi/Desktop/RobotX/.env` for configuration (never inline secrets in the unit file).
 
 **Safety impact:** Indirect — ensures the safety-relevant control loop restarts after a crash rather than leaving the robot in an unsupervised state (though motors already fail-safe-stop on exception per the existing `except Exception` handler in `_loop()`).
 **Compatibility impact:** None until explicitly installed by the operator (`systemctl enable`) — this plan only adds the file, per the task's instruction not to enable/install services blindly.
@@ -213,14 +213,14 @@ class UltrasonicStatus(Enum):
 
 ---
 
-## R-09 — Verbose `print()` in hot paths (detection.py, vision_controller.py)
+## R-09 — Verbose `print()` in hot paths (object_detector.py, vision_controller.py)
 
 **Severity:** LOW
-**Affected files:** `robotx/perception/detection.py` (13 `print()` call sites), `robotx/control/vision_controller.py` (11 `print()` call sites)
+**Affected files:** `robotx/perception/object_detector.py` (13 `print()` call sites), `robotx/perception/vision_controller.py` (11 `print()` call sites)
 
 **Root cause:** Confirmed via grep. Runs at up to `detection_hz` (2 Hz production, 5 Hz test-path), unbuffered stdout I/O on every detection cycle.
 
-**Proposed fix:** Replace with `logger.debug(...)` calls gated by `ROBOTX_LOG_LEVEL`. Since `vision_controller.py` is being relabeled experimental (R-05) rather than actively maintained, only `detection.py`'s print calls (the ones in the live production path) are in scope for this pass; `vision_controller.py`'s are noted but deferred.
+**Proposed fix:** Replace with `logger.debug(...)` calls gated by `ROBOTX_LOG_LEVEL`. Since `vision_controller.py` is being relabeled experimental (R-05) rather than actively maintained, only `object_detector.py`'s print calls (the ones in the live production path) are in scope for this pass; `vision_controller.py`'s are noted but deferred.
 
 **Safety impact:** None.
 **Compatibility impact:** None (log output moves from stdout to the logging module; operators relying on grepping raw stdout need `ROBOTX_LOG_LEVEL=DEBUG`).
@@ -232,11 +232,11 @@ class UltrasonicStatus(Enum):
 ## R-10 — No `.env.example`, secrets handling relies entirely on ambient env vars
 
 **Severity:** LOW
-**Affected files:** `robotx/utils/config.py` (fine as-is — already env-var based, no hardcoded secrets found), missing `.env.example`
+**Affected files:** `robotx/config/settings.py` (fine as-is — already env-var based, no hardcoded secrets found), missing `.env.example`
 
 **Root cause:** Confirmed — no secret values are hardcoded anywhere (verified by grep for API-key-shaped strings). `.gitignore` already excludes `.env`. But there is no `.env.example` template documenting which variables an operator needs to set, including the new `ROBOTX_ROBOT_TOKEN` (R-02).
 
-**Proposed fix:** Add `.env.example` listing every `ROBOTX_*` variable from `config.py` with placeholder/default values and comments, with real secrets never filled in — matching the existing `config.py:33-104` variable set plus `ROBOTX_ROBOT_TOKEN`.
+**Proposed fix:** Add `.env.example` listing every `ROBOTX_*` variable from `config.py` with placeholder/default values and comments, with real secrets never filled in — matching the existing `settings.py:33-104` variable set plus `ROBOTX_ROBOT_TOKEN`.
 
 **Safety impact:** None.
 **Compatibility impact:** None, additive.
@@ -250,15 +250,15 @@ class UltrasonicStatus(Enum):
 | ID | Finding | Severity | Primary file(s) |
 |---|---|---|---|
 | R-00 | venv shebangs point at a nonexistent path (beyond just the missing +x bit) | CRITICAL | `venv/bin/*` |
-| R-01 | MANUAL mode bypasses obstacle safety | CRITICAL | `controller.py` |
-| R-02 | No auth on Socket.IO command channel | CRITICAL | `sockets.py` |
-| R-03 | Ultrasonic failure treated as "no obstacle" | CRITICAL | `ultrasonic.py`, `controller.py` |
-| R-04 | Battery telemetry is fabricated | HIGH | `controller.py` |
-| R-05 | VisionController/DecisionEngine disconnected + zero test coverage | HIGH | `vision_controller.py`, `decision_engine.py`, `controller.py` |
-| R-06 | No comm-loss watchdog / stale command handling | HIGH | `sockets.py`, `controller.py` |
-| R-07 | No command validation/schema | MEDIUM | `sockets.py`, `controller.py` |
+| R-01 | MANUAL mode bypasses obstacle safety | CRITICAL | `robot_controller.py` |
+| R-02 | No auth on Socket.IO command channel | CRITICAL | `socket_client.py` |
+| R-03 | Ultrasonic failure treated as "no obstacle" | CRITICAL | `ultrasonic.py`, `robot_controller.py` |
+| R-04 | Battery telemetry is fabricated | HIGH | `robot_controller.py` |
+| R-05 | VisionController/DecisionEngine disconnected + zero test coverage | HIGH | `vision_controller.py`, `decision_engine.py`, `robot_controller.py` |
+| R-06 | No comm-loss watchdog / stale command handling | HIGH | `socket_client.py`, `robot_controller.py` |
+| R-07 | No command validation/schema | MEDIUM | `socket_client.py`, `robot_controller.py` |
 | R-08 | No process supervision | MEDIUM | new `deployment/` |
-| R-09 | print() in hot paths | LOW | `detection.py` |
+| R-09 | print() in hot paths | LOW | `object_detector.py` |
 | R-10 | No `.env.example` | LOW | new |
 
 ---

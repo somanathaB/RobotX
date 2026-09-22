@@ -1,5 +1,7 @@
 # RobotX Deep Current-State Audit
 
+> **HISTORICAL DOCUMENT — paths below are pre-refactor.** This audit was written before the architecture refactor documented in `ROBOTX_PI_ARCHITECTURE_REFACTOR_PLAN.md` (2026-09-22), which moved/renamed files (e.g. `robotx/app/main.py` → `robotx/application/app.py`, `robotx/control/controller.py` → `robotx/control/robot_controller.py`, `robotx/utils/config.py` → `robotx/config/settings.py`; full table in the refactor plan's §5). The findings, line numbers, and safety analysis below are preserved as an accurate historical record of the code's *behavior* at audit time, which did not change during the refactor — but any file path or `robotx.*` import path cited here should be translated through the migration table before being used against the current tree. For current package responsibilities and the up-to-date module map, see `docs/architecture/ROBOTX_PI_ARCHITECTURE.md` and `docs/architecture/DEPENDENCY_MAP.md`.
+
 **Audit date:** 2026-09-22
 **Repository:** `/home/pi/Desktop/RobotX`
 **Method:** Full manual source inspection. Every `.py` file in the repository (26 files, ~5,166 lines, excluding `venv/` and `__pycache__/`) was read in its entirety. No documentation, prior conversation, or filename was taken at face value — conclusions below are traced to specific lines of code.

@@ -14,27 +14,36 @@ This repo contains a complete, modular robot stack that runs **on the Raspberry 
 
 ```
 robotx/
-	app/
-		main.py         # FastAPI entry point
-		sockets.py      # Socket.IO client
+	application/
+		app.py               # FastAPI entry point + composition root
+	communication/
+		socket_client.py     # Socket.IO client
 	hardware/
 		motors.py
 		encoders.py
 		ultrasonic.py
 		ir.py
+		camera.py             # Picamera2 device driver
+		gps.py                # Serial NMEA device driver
 	navigation/
-		gps.py
-		maps.py
-		planner.py
+		route_planner.py
+		directions_client.py
 	perception/
-		camera.py
-		detection.py
+		object_detector.py
+		object_tracker.py
+		temporal_filter.py
+		vision_controller.py  # EXPERIMENTAL -- test-only, not wired into production
+		decision_engine.py    # EXPERIMENTAL -- test-only, not wired into production
 	control/
-		controller.py
-	utils/
-		config.py
+		robot_controller.py   # PRODUCTION control loop
+	config/
+		settings.py
+tests/
+	hardware/                # standalone hardware-exercise scripts (real GPIO/camera/serial)
 requirements.txt
 ```
+
+See `docs/architecture/ROBOTX_PI_ARCHITECTURE.md` for package responsibilities and dependency direction, and `docs/architecture/DEPENDENCY_MAP.md` for the full import graph.
 
 ## Raspberry Pi setup
 
@@ -46,7 +55,7 @@ requirements.txt
 
 2) Wiring (BCM pins)
 
-Defaults are in `robotx/utils/config.py` and can be overridden by env vars.
+Defaults are in `robotx/config/settings.py` and can be overridden by env vars.
 
 - L298N left: `IN1=5`, `IN2=6`, `ENA(PWM)=12`
 - L298N right: `IN3=13`, `IN4=19`, `ENB(PWM)=18`
@@ -95,7 +104,7 @@ Start the robot stack (FastAPI + controller + Socket.IO client):
 
 ```bash
 cd /home/pi/Desktop/RobotX
-venv/bin/python -m uvicorn robotx.app.main:app --host 0.0.0.0 --port 8000
+venv/bin/python -m uvicorn robotx.application.app:app --host 0.0.0.0 --port 8000
 ```
 
 Endpoints:
@@ -137,7 +146,7 @@ Examples:
 
 ```bash
 cd /home/pi/Desktop/RobotX
-venv/bin/python -c "import robotx.app.main; print('ok')"
+venv/bin/python -c "import robotx.application.app; print('ok')"
 ```
 
 2) Health check (after running uvicorn)
