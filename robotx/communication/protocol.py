@@ -1,42 +1,37 @@
 """The robot <-> backend wire contract, in one place.
 
-Scope and honesty
------------------
-This module defines what the Pi puts on the wire and what it will accept off
-it. It is deliberately the *only* place that knows event names and payload
-shapes -- nothing else in the agent may emit or parse a backend message.
+Source of truth
+---------------
+`ROBOTX_PI_P2B1_HANDOFF.md` (Dashboard repository, 2026-09-24), itself derived
+from `docs/contracts/PHYSICAL_ROBOTX_BACKEND_CONTRACT.md`. Every event name and
+field here is taken from it; nothing is added that it does not define.
 
-Two very different classes of fact live here, and they are kept apart:
+This module and `robotx.communication.engine` (the signed Assignment Engine
+envelopes) are the only places that know event names and payload shapes --
+nothing else in the agent may emit or parse a backend message.
 
-1. **Derived from the backend data model.** Field names and enum values
-   (`robotId`, `lat`, `lon`, `speed`, `battery`, `STOP`/`PAUSE`/`RETURN`/
-   `RESUME`, `SENT`/`ACK`/`FAILED`, `INFO`/`WARNING`/`CRITICAL`) come from the
-   FalconAut Prisma models. These are used verbatim, including camelCase.
+Summary of the wire
+-------------------
+- Socket.IO v4, namespace `/`, anonymous connect, then `AUTH {robotId, token |
+  pairingCode}` -> `AUTH_SUCCESS` and `AUTH_OK` (both arrive; one is handled).
+  Refusal is a silent disconnect.
+- `HEARTBEAT {}` every ~2 s, or `{commitmentId, fence}` while carrying out an
+  accepted mission.
+- `TELEMETRY {timestamp, sequence, status, lat?, lon?, speed?}`. Anything not
+  measured is **omitted**, never nulled or zeroed.
+- Operator `COMMAND {commandId, type, timestamp}` -> `COMMAND_ACK {commandId}`
+  once applied. A bare `STOP` (task cancellation) expects no ack.
+- Engine `command` envelopes (OFFER, WITHDRAW, ...) -> `COMMAND_ACK {outboxId,
+  fence, authorityEpoch}`, then exactly one of `OFFER_ACCEPT` / `OFFER_REJECT`
+  / `OFFER_DEFER`; `CUSTODY_EVENT`; `TASK_COMPLETE {taskId, lat, lon}`.
+- `TASK_ASSIGN` is a recovery re-send, never a new assignment.
 
-2. **NOT derivable: the Socket.IO envelope.** Event names, the namespace, the
-   handshake `auth` shape and whether the server uses Socket.IO callback acks
-   are transport decisions that live in backend source. That source is **not
-   present in this repository or on this machine** (verified: no backend tree,
-   no simulator, no `schema.prisma` file, nothing serving Socket.IO locally).
-
-Because of (2), every transport-level name is a `ProtocolBinding` value rather
-than a literal, and the built-in binding is marked `PROVISIONAL`. Its names are
-inherited from the client that already existed in this repository; they were
-never verified against a server. Drop the real contract in with
-`ROBOTX_PROTOCOL_FILE=/path/binding.json` and no Python changes at all.
-
-A `PROVISIONAL` binding is reported as such in state, telemetry and logs, and
-the agent must never describe itself as integrated while one is in use.
-
-Data-model fields the Pi deliberately does NOT send
----------------------------------------------------
-`Robot.id`, `socketId`, `isOnline`, `lastSeenAt`, `simulated`, `locationId`,
-`campusId`, `zoneId`, `currentTaskId`, and every `createdAt`/`issuedAt`. These
-are **backend-owned**: they are assigned by the server from the connection it
-can see and the clock it trusts. A robot asserting its own `isOnline` is a
-robot that can lie about being alive, which is precisely the failure mode this
-integration exists to prevent. The Pi states what it measures; the backend
-decides what that means.
+Fields the Pi deliberately does NOT send
+----------------------------------------
+`robotId` outside AUTH (identity is the authenticated socket), `isOnline`,
+`lastSeenAt`, battery, e-stop and every other quantity this Rover cannot
+measure. A key named like `capability`/`capabilities` would make the backend
+drop the whole telemetry frame, and none is ever put in one.
 """
 
 from __future__ import annotations
@@ -49,6 +44,12 @@ from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Tuple
 
 from robotx.diagnostics.health import HealthStatus
+from robotx.mission.mission import (
+    MAX_PATH_POINTS,
+    Mission,
+    MissionRejected,
+    MissionRejectReason,
+)
 from robotx.state.robot_state import OperatingMode, RobotSnapshot
 
 
@@ -59,6 +60,23 @@ WIRE_SCHEMA_VERSION = 1
 # Refuse to parse anything larger than this. A Socket.IO peer can send an
 # arbitrarily large payload; the agent loop must not be asked to walk it.
 MAX_INBOUND_PAYLOAD_BYTES = 64 * 1024
+
+
+def now_ms(now: Optional[float] = None) -> int:
+    """Epoch milliseconds, as an int.
+
+    FalconAut treats an observation's `timestamp` as load-bearing: it is the
+    instant the *robot* measured something, and the backend orders and ages
+    observations by it. So it must be taken at the observation boundary, not at
+    startup and not on the server.
+
+    Milliseconds, not seconds, and an `int` rather than a float -- a fractional
+    millisecond would be a different type on the wire than the backend
+    declares, and JSON gives no way for the receiver to tell the difference
+    between "1.5 ms of precision" and "someone sent seconds by mistake".
+    """
+
+    return int(round((time.time() if now is None else now) * 1000.0))
 
 
 # --- enums taken from the backend data model ----------------------------------
@@ -106,64 +124,151 @@ class EventLevel(str, Enum):
 class BindingSource(str, Enum):
     """Where a binding's event names came from, i.e. how much to trust them."""
 
-    PROVISIONAL = "PROVISIONAL"  # built-in guess; inherited from legacy client
-    FILE = "FILE"                # operator supplied via ROBOTX_PROTOCOL_FILE
-    EXPLICIT = "EXPLICIT"        # constructed in code (tests, harnesses)
+    FALCONAUT = "FALCONAUT"  # the FalconAut robot contract (built-in default)
+    FILE = "FILE"            # operator supplied via ROBOTX_PROTOCOL_FILE
+    EXPLICIT = "EXPLICIT"    # constructed in code (tests, harnesses)
+
+
+# Binding fields whose names are not attested by the backend contract.
+# Everything NOT in this set is. Surfaced by `describe()` and in the startup
+# warning, so nobody has to read this file to learn which names are worth
+# double-checking.
+#
+# `auth_failed` is the only one left: the contract describes an authentication
+# failure as a **silent disconnect**, and never mentions an error event. The
+# binding keeps one anyway, because a backend that does send a reason is
+# strictly easier to debug than one that does not -- but nothing depends on it
+# existing, and the silent-disconnect path is what is actually relied upon.
+#
+# Note this set is about *names*. The `TELEMETRY` and `HEARTBEAT` payload
+# **field lists** are still unverified; see `build_heartbeat_payload`.
+UNCONFIRMED_NAMES = ("auth_failed",)
 
 
 @dataclass(frozen=True)
 class ProtocolBinding:
-    """Event names and namespace: the part that is backend source, not ours.
+    """FalconAut event names and namespace.
 
-    Every field is a name on the wire. None of them can be checked from this
-    repository, which is why they are data rather than literals scattered
-    through the client.
+    Names are data rather than literals scattered through the client so that a
+    single JSON file can correct any of them without a code change.
     """
 
-    source: BindingSource = BindingSource.PROVISIONAL
-    namespace: str = "/robot"
+    source: BindingSource = BindingSource.FALCONAUT
+    # FalconAut's robot handler is on the default namespace. The previous
+    # `/robot` namespace in this repository was never attested by anything.
+    namespace: str = "/"
 
-    # Pi -> backend
-    register: str = "robot_hello"
-    telemetry: str = "telemetry"
-    status: str = "status"
-    event: str = "event"
-    command_result: str = "command_ack"
+    # Pi -> backend (ROBOTX_PI_P2B1_HANDOFF.md)
+    auth: str = "AUTH"
+    telemetry: str = "TELEMETRY"
+    task_complete: str = "TASK_COMPLETE"
+    # Liveness, ~every 2 s, independent of whether the robot has a position.
+    heartbeat: str = "HEARTBEAT"
+    # A separate emitted event, never a Socket.IO callback acknowledgement.
+    # Serves both the operator path ({commandId}) and the engine path
+    # ({outboxId, fence, authorityEpoch}).
+    command_ack: str = "COMMAND_ACK"
+    offer_accept: str = "OFFER_ACCEPT"
+    offer_reject: str = "OFFER_REJECT"
+    offer_defer: str = "OFFER_DEFER"
+    custody_event: str = "CUSTODY_EVENT"
+
+    # Not part of the robot contract. Empty means "never emitted"; an operator
+    # may bind them if the backend turns out to accept them.
+    register: str = ""
+    status: str = ""
+    event: str = ""
 
     # backend -> Pi
-    command: str = "command"
-    registered: str = "registered"  # optional server confirmation of register
+    auth_success: str = "AUTH_SUCCESS"
+    # The contract names two success events. Both are bound, because binding
+    # only one means that if the backend picks the other the robot never
+    # authenticates at all -- it waits out the auth timeout and reports a
+    # failure that looks exactly like a refused credential.
+    auth_ok: str = "AUTH_OK"
+    auth_failed: str = "AUTH_FAILED"
+    # Operator commands: {commandId, type, timestamp}.
+    command: str = "COMMAND"
+    # Signed Assignment Engine envelopes (OFFER, WITHDRAW, ...). Lower-case,
+    # and a different event from the operator `COMMAND` above.
+    engine_command: str = "command"
+    # A bare STOP, distinct from COMMAND{type:STOP}: task cancellation. It
+    # expects no acknowledgement.
+    stop: str = "STOP"
+    # Sent only by the backend's post-restart recovery sweep. Never starts a
+    # mission on this Pi: see `BackendLink._on_task_assign`.
+    task_assign: str = "TASK_ASSIGN"
+    # The backend's verdict on a TASK_COMPLETE claim.
+    task_complete_ack: str = "TASK_COMPLETE_ACK"
 
     @property
-    def is_provisional(self) -> bool:
-        """True when the event names were never sourced from the backend.
+    def unconfirmed(self) -> Tuple[str, ...]:
+        """Which of this binding's names are not literally attested.
 
-        Anything that reports integration status must consult this. A link that
-        connects over a provisional binding has proved that a Socket.IO server
-        accepted a TCP connection -- nothing more.
+        A `FILE` binding is an operator asserting the real names, so nothing in
+        it is reported as unconfirmed.
         """
 
-        return self.source is BindingSource.PROVISIONAL
+        if self.source is not BindingSource.FALCONAUT:
+            return ()
+        return UNCONFIRMED_NAMES
 
     def outbound_events(self) -> Tuple[str, ...]:
-        return (self.register, self.telemetry, self.status, self.event, self.command_result)
+        names = (self.auth, self.telemetry, self.heartbeat, self.command_ack,
+                 self.offer_accept, self.offer_reject, self.offer_defer,
+                 self.custody_event, self.task_complete, self.register,
+                 self.status, self.event)
+        return tuple(name for name in names if name)
 
     def inbound_events(self) -> Tuple[str, ...]:
-        return (self.command, self.registered)
+        names = (self.auth_success, self.auth_ok, self.auth_failed,
+                 self.command, self.engine_command, self.stop, self.task_assign,
+                 self.task_complete_ack)
+        return tuple(name for name in names if name)
+
+    def auth_success_events(self) -> Tuple[str, ...]:
+        """Every event that means "you are authenticated", deduplicated.
+
+        Deduplicated because binding both names to the same string -- which an
+        operator correcting one of them could easily do -- would otherwise
+        register two handlers for one event.
+        """
+
+        seen = []
+        for name in (self.auth_success, self.auth_ok):
+            if name and name not in seen:
+                seen.append(name)
+        return tuple(seen)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "source": self.source.value,
-            "provisional": self.is_provisional,
             "namespace": self.namespace,
+            "unconfirmed": list(self.unconfirmed),
             "outbound": {
-                "register": self.register,
+                "auth": self.auth,
                 "telemetry": self.telemetry,
+                "heartbeat": self.heartbeat,
+                "command_ack": self.command_ack,
+                "offer_accept": self.offer_accept,
+                "offer_reject": self.offer_reject,
+                "offer_defer": self.offer_defer,
+                "custody_event": self.custody_event,
+                "task_complete": self.task_complete,
+                "register": self.register,
                 "status": self.status,
                 "event": self.event,
-                "command_result": self.command_result,
             },
-            "inbound": {"command": self.command, "registered": self.registered},
+            "inbound": {
+                "auth_success": self.auth_success,
+                "auth_ok": self.auth_ok,
+                "auth_failed": self.auth_failed,
+                "command": self.command,
+                "engine_command": self.engine_command,
+                "stop": self.stop,
+                "task_assign": self.task_assign,
+                "task_complete_ack": self.task_complete_ack,
+            },
         }
 
     @classmethod
@@ -181,19 +286,22 @@ class ProtocolBinding:
             else:
                 flat[key] = value
 
-        known = {"namespace", "register", "telemetry", "status", "event",
-                 "command_result", "command", "registered"}
+        known = {"namespace", "auth", "telemetry", "heartbeat", "command_ack",
+                 "offer_accept", "offer_reject", "offer_defer", "custody_event",
+                 "task_complete", "register", "status", "event", "auth_success",
+                 "auth_ok", "auth_failed", "command", "engine_command", "stop",
+                 "task_assign", "task_complete_ack"}
         kwargs = {k: str(v) for k, v in flat.items() if k in known and v is not None}
         return replace(cls(source=source), source=source, **kwargs)
 
     @classmethod
     def load(cls, path: Optional[str]) -> "ProtocolBinding":
-        """Load an operator-supplied binding, or return the provisional one.
+        """Load an operator-supplied binding, or return the FalconAut default.
 
-        A malformed or missing file is a configuration error worth failing on:
-        silently falling back to guessed event names would be the worst of both
-        worlds -- the operator believes the real contract is in force while the
-        Pi talks to nobody.
+        A malformed or missing file raises rather than falling back: an
+        operator who pointed at a binding file believes it is in force, and
+        silently reverting to defaults would hide exactly the mismatch the file
+        was written to fix.
         """
 
         if not path:
@@ -209,22 +317,34 @@ class ProtocolBinding:
 # --- outbound payloads --------------------------------------------------------
 
 
+# `status` values the backend accepts (telemetry.handler.js:251). `OFFLINE` is
+# the server's to assign and is never sent.
+BACKEND_STATUS_FOR_MODE = {
+    OperatingMode.IDLE: "IDLE",
+    OperatingMode.AUTO: "ACTIVE",
+    OperatingMode.PAUSED: "PAUSED",
+    # An operator STOP ends the run and clears the route: the Rover is idle.
+    OperatingMode.STOPPED: "IDLE",
+    OperatingMode.ERROR: "ERROR",
+}
+
+
 @dataclass(frozen=True)
 class TelemetryFrame:
-    """A telemetry payload, or an explicit refusal to produce one.
+    """One `TELEMETRY` payload, and whether it carries a position fix.
 
-    Refusing is a first-class outcome. When the robot has no trustworthy
-    position there is no honest `lat`/`lon` to send, and the correct behaviour
-    is to send nothing and say why -- not to resend the last fix, which would
-    tell a dashboard the robot is parked where it was ten minutes ago.
+    A frame is always produced: status is worth reporting with or without a
+    fix. What changes is which fields are present. `position_omitted` says why
+    `lat`/`lon` are absent, for logs and tests; it never goes on the wire.
     """
 
-    payload: Optional[Dict[str, Any]]
-    skipped_reason: Optional[str] = None
+    payload: Dict[str, Any]
+    position_timestamp: Optional[float] = None
+    position_omitted: Optional[str] = None
 
     @property
-    def sendable(self) -> bool:
-        return self.payload is not None
+    def has_position(self) -> bool:
+        return "lat" in self.payload
 
 
 def _position_age_s(snapshot: RobotSnapshot, now: float) -> Optional[float]:
@@ -236,53 +356,84 @@ def _position_age_s(snapshot: RobotSnapshot, now: float) -> Optional[float]:
 def build_telemetry_payload(
     snapshot: RobotSnapshot,
     *,
-    robot_id: str,
+    sequence: int,
     max_position_age_s: float,
+    last_position_timestamp: Optional[float] = None,
     now: Optional[float] = None,
 ) -> TelemetryFrame:
-    """Core high-frequency telemetry: `Telemetry` model fields only.
+    """`TELEMETRY` to the handoff (§5, §16): measured fields only, the rest omitted.
 
-    Maps 1:1 onto the backend `Telemetry` row (`robotId`, `lat`, `lon`,
-    `speed`, `battery`) plus the Pi's own capture timestamp. Health,
-    navigation, perception and diagnostics are deliberately absent -- they go
-    on the low-rate status channel, because a row per detection at camera rate
-    is how you fill a database with data nobody reads.
+    Absence is expressed by **omitting** the key. The backend treats any number
+    as a measurement, so there is no `null`, `0`, `-1` or placeholder anywhere:
 
-    `battery` is `null`. This robot has no battery-sensing hardware at all (see
-    `robotx.hardware.battery`), and a plausible-looking number is worse than a
-    null: an operator cannot tell an invented 76% from a measured one. Whether
-    the backend's `battery` column tolerates null is an open question recorded
-    as a blocker; the Pi will not resolve it by making a value up.
+    - `lat`/`lon` (and `speed`) only for a fresh, measured GPS fix, and only
+      once per fix. Every `lat`/`lon` the backend receives is stored as a real,
+      non-dead-reckoned Observation and counts as completion evidence; a
+      dead-reckoned pose is commanded motion around a configured origin, so it
+      is never sent, and there is no switch that could send it.
+    - `battery` is never sent: this Rover has no battery sensing.
+    - no `heading`, `distanceTravelled`, `safety`, `faults`, `localisation` or
+      `energy`: nothing on this Pi measures them (the ESP32 link does not
+      exist), so they are omitted rather than asserted.
+
+    `timestamp` (epoch ms) is the instant of measurement: the fix's own time
+    when the frame carries one, otherwise the instant the status was read. It
+    is never re-stamped: a fix too old to send is omitted, not refreshed, and a
+    fix already sent is not sent again as though it were a new observation.
+
+    `sequence` is supplied by the caller, which owns its strict increase.
     """
 
     now = time.time() if now is None else now
-
-    # `has_fix` rather than a status comparison, so this module needs nothing
-    # from the GPS hardware package -- the reading carries its own verdict.
-    if not snapshot.gps.has_fix or snapshot.position is None:
-        return TelemetryFrame(None, f"no usable GPS fix (status={snapshot.gps.status.value})")
-
-    age = _position_age_s(snapshot, now)
-    if age is not None and age > max_position_age_s:
-        return TelemetryFrame(None, f"position is {age:.1f}s old (limit {max_position_age_s:.1f}s)")
+    payload: Dict[str, Any] = {
+        "sequence": int(sequence),
+        "status": BACKEND_STATUS_FOR_MODE.get(snapshot.mode, "ERROR"),
+    }
 
     position = snapshot.position
-    return TelemetryFrame(
-        {
-            "schemaVersion": WIRE_SCHEMA_VERSION,
-            "robotId": robot_id,
-            "lat": round(position.latitude, 7),
-            "lon": round(position.longitude, 7),
-            # Speed over ground from the receiver. Null rather than 0.0 when the
-            # receiver did not report it: "not measured" is not "stationary".
-            "speed": None if position.speed_mps is None else round(position.speed_mps, 3),
-            "battery": None,
-            # The Pi's capture time. The backend owns `createdAt`; this exists
-            # so it can detect a delayed or replayed frame.
-            "capturedAt": round(position.timestamp, 3),
-            "positionAgeS": None if age is None else round(age, 3),
-        }
-    )
+    omitted: Optional[str] = None
+    # `has_fix` rather than a status comparison, so this module needs nothing
+    # from the GPS hardware package -- the reading carries its own verdict.
+    if position is None or not snapshot.gps.has_fix:
+        omitted = f"no usable GPS fix (status={snapshot.gps.status.value})"
+    elif not position.is_measured:
+        omitted = f"position is {position.source.value}, not measured"
+    else:
+        age = _position_age_s(snapshot, now)
+        if age is not None and age > max_position_age_s:
+            omitted = f"position is {age:.1f}s old (limit {max_position_age_s:.1f}s)"
+        elif last_position_timestamp is not None and position.timestamp <= last_position_timestamp:
+            omitted = "this fix was already sent"
+
+    if omitted is None:
+        payload["timestamp"] = now_ms(position.timestamp)
+        payload["lat"] = round(position.latitude, 7)
+        payload["lon"] = round(position.longitude, 7)
+        # Speed over ground from the receiver, when it reported one.
+        if position.speed_mps is not None:
+            payload["speed"] = round(position.speed_mps, 3)
+        return TelemetryFrame(payload, position_timestamp=position.timestamp)
+
+    payload["timestamp"] = now_ms(now)
+    return TelemetryFrame(payload, position_omitted=omitted)
+
+
+def build_heartbeat_payload(
+    *,
+    commitment_id: Optional[str] = None,
+    fence: Any = None,
+) -> Dict[str, Any]:
+    """`HEARTBEAT` (handoff §4): `{}` when idle, `{commitmentId, fence}` on a mission.
+
+    No `robotId`: identity comes from the authenticated socket. No timestamp:
+    the backend stamps its own time on every beat. The commitment form renews
+    the mission lease, so it is sent only while this Rover is genuinely
+    carrying out that commitment -- the caller decides that.
+    """
+
+    if commitment_id is None:
+        return {}
+    return {"commitmentId": commitment_id, "fence": fence}
 
 
 def build_status_payload(
@@ -340,8 +491,34 @@ def build_status_payload(
             "waypointsTotal": snapshot.navigation.waypoints_total,
             "progress": round(snapshot.navigation.progress, 3),
         },
+        # Progress through the assigned task, if there is one. The route itself
+        # is not echoed back: RobotX generated it and already has it, and
+        # re-sending both waypoint lists on every status frame would spend the
+        # link telling the backend what it just said.
+        "mission": _status_mission_block(snapshot),
         "lastError": snapshot.last_error,
-        "protocol": {"provisional": binding.is_provisional, "source": binding.source.value},
+        "protocol": {"source": binding.source.value, "unconfirmed": list(binding.unconfirmed)},
+    }
+
+
+def _status_mission_block(snapshot: RobotSnapshot) -> Optional[Dict[str, Any]]:
+    """The assigned task and how far through it the Rover is, or None."""
+
+    mission = snapshot.mission
+    if mission is None:
+        return None
+    return {
+        "taskId": mission.task_id,
+        "status": mission.status.value,
+        "segment": mission.segment.value,
+        "waypointIndex": mission.waypoint_index,
+        "waypointsTotal": mission.waypoints_total,
+        "pickupReachedAt": None
+        if mission.pickup_reached_at is None
+        else now_ms(mission.pickup_reached_at),
+        "completedAt": None
+        if mission.completed_at is None
+        else now_ms(mission.completed_at),
     }
 
 
@@ -395,33 +572,16 @@ def build_event_payload(
     return payload
 
 
-def build_command_result_payload(
-    *,
-    robot_id: str,
-    command_id: str,
-    status: CommandStatus,
-    reason: str = "",
-    executed_at: Optional[float] = None,
-) -> Dict[str, Any]:
-    """A `Command` status update: ACK or FAILED, with the instant it happened.
+def build_command_ack_payload(*, command_id: str) -> Dict[str, Any]:
+    """Operator `COMMAND_ACK` (handoff §7, §13): exactly `{commandId}`.
 
-    `executedAt` is set for both outcomes. For `ACK` it is when the intent was
-    applied; for `FAILED` it is when the attempt was concluded. A `FAILED`
-    always carries a `reason` -- a rejection an operator cannot explain is one
-    they will retry blindly.
+    Sent only for a command this Rover **applied**. There is no FAILED on
+    this wire: a command the Rover refuses is simply not acknowledged, and the
+    backend marks it FAILED itself after its 5/10/15 s redeliveries -- which is
+    the truthful outcome. No `robotId` (identity is the socket), no time.
     """
 
-    if status is CommandStatus.SENT:
-        raise ValueError("SENT is assigned by the backend; a robot never reports it")
-
-    return {
-        "schemaVersion": WIRE_SCHEMA_VERSION,
-        "robotId": robot_id,
-        "commandId": command_id,
-        "status": status.value,
-        "executedAt": round(time.time() if executed_at is None else executed_at, 3),
-        "reason": reason,
-    }
+    return {"commandId": command_id}
 
 
 def build_register_payload(
@@ -474,6 +634,92 @@ def agent_capabilities() -> Dict[str, Any]:
     }
 
 
+# --- authentication -----------------------------------------------------------
+
+
+class AuthMethod(str, Enum):
+    """Which credential this robot is presenting."""
+
+    PAIRING_CODE = "PAIRING_CODE"  # first commissioning, 6 digits, 300 s TTL
+    TOKEN = "TOKEN"                # a session token kept from a previous AUTH
+
+
+def build_auth_payload(
+    *,
+    robot_id: str,
+    token: Optional[str] = None,
+    pairing_code: Optional[str] = None,
+) -> Tuple[Dict[str, Any], AuthMethod]:
+    """The `AUTH` payload, and which credential it used.
+
+    A persisted session token is preferred over a pairing code: the code is
+    single-use with a 300 s TTL, so burning one on every reconnect would mean a
+    human re-commissioning the robot every time the Wi-Fi blinked.
+
+    The credential is carried here rather than in the Engine.IO handshake
+    because FalconAut's socket connection is **anonymous** -- the server has no
+    `handshake.auth` to read, and putting one there would authenticate nothing
+    while still putting a secret somewhere it was not expected.
+
+    Raises when neither credential is available: emitting an `AUTH` the backend
+    must refuse just produces a silent disconnect and a confusing log.
+    """
+
+    if token:
+        return {"robotId": robot_id, "token": token}, AuthMethod.TOKEN
+    if pairing_code:
+        return {"robotId": robot_id, "pairingCode": pairing_code}, AuthMethod.PAIRING_CODE
+    raise ValueError(
+        "no credential to authenticate with: set ROBOTX_PAIRING_CODE from "
+        "POST /api/robots/commission, or restore a persisted session token"
+    )
+
+
+@dataclass(frozen=True)
+class AuthResult:
+    """What came back in `AUTH_SUCCESS`."""
+
+    token: Optional[str]
+    raw: Dict[str, Any]
+
+    @property
+    def has_token(self) -> bool:
+        return bool(self.token)
+
+
+def parse_auth_success(data: Any) -> AuthResult:
+    """Pull the session token out of an `AUTH_SUCCESS` payload.
+
+    Several spellings are accepted because this is the one field whose exact
+    name decides whether the robot can ever reconnect without a human issuing a
+    fresh pairing code. Accepting `token`/`sessionToken`/`robotToken` costs
+    nothing and removes the most expensive way to be wrong.
+
+    A payload with no recognizable token is **not** an error: the backend may
+    consider the socket authenticated without issuing one. The robot records
+    that it has no token and will need a pairing code again next time, which is
+    visible in `describe()` rather than discovered at the next reconnect.
+    """
+
+    if not isinstance(data, dict):
+        return AuthResult(None, {"raw": str(data)[:200]})
+
+    for key in ("token", "sessionToken", "robotToken", "accessToken"):
+        value = data.get(key)
+        if isinstance(value, str) and value.strip():
+            return AuthResult(value.strip(), data)
+
+    # Some APIs nest the payload one level down.
+    for container in ("robot", "data", "session"):
+        nested = data.get(container)
+        if isinstance(nested, dict):
+            inner = parse_auth_success(nested)
+            if inner.has_token:
+                return AuthResult(inner.token, data)
+
+    return AuthResult(None, data)
+
+
 # --- inbound parsing ----------------------------------------------------------
 
 
@@ -503,9 +749,14 @@ class CommandRejection:
         Without a `commandId` there is no row to update, so an ack would be
         undeliverable. Those are logged locally instead of emitted into the
         void.
+
+        A command addressed to **another robot** is never acknowledged either,
+        not even as `FAILED`. Its `commandId` belongs to that robot's `Command`
+        row, and a `COMMAND_ACK` from this one would let a misrouted delivery
+        mark someone else's command as failed.
         """
 
-        return bool(self.command_id)
+        return bool(self.command_id) and self.reason is not RejectionReason.WRONG_ROBOT
 
 
 @dataclass(frozen=True)
@@ -618,7 +869,10 @@ def parse_command(
             command_id,
         )
 
-    issued_at = parse_timestamp(data.get("issuedAt") or data.get("createdAt"))
+    # The backend sends `timestamp` (epoch ms); the older spellings are kept.
+    issued_at = parse_timestamp(
+        data.get("timestamp") or data.get("issuedAt") or data.get("createdAt")
+    )
     if max_age_s is not None and issued_at is not None:
         age = now - issued_at
         if age > max_age_s:
@@ -634,6 +888,200 @@ def parse_command(
         issued_at=issued_at,
         received_at=now,
         raw=data,
+    )
+
+
+def _wire_point(value: Any, *, where: str) -> Tuple[Any, Any]:
+    """Pull `(lat, lon)` out of one `{lat, lon}` object from the wire.
+
+    Only `lat` and `lon` are accepted. Tolerating `lng`, `latitude` or a bare
+    `[lat, lon]` array would be inventing a second route format for the Rover
+    to understand, which is exactly what the contract exists to prevent: if
+    RobotX ever sends a different spelling, that is a mismatch to fix once at
+    the boundary, not a variant to silently absorb forever.
+
+    Nothing is validated here beyond the shape. Whether the values are real
+    coordinates is the domain's rule, enforced in `Mission.create`.
+    """
+
+    if not isinstance(value, dict):
+        raise MissionRejected(
+            MissionRejectReason.MALFORMED,
+            f"{where} is {type(value).__name__}, expected an object with lat and lon",
+        )
+    if "lat" not in value or "lon" not in value:
+        raise MissionRejected(
+            MissionRejectReason.MALFORMED,
+            f"{where} has keys {sorted(str(k) for k in value)[:6]}; expected lat and lon",
+        )
+    return (value["lat"], value["lon"])
+
+
+def _wire_path(value: Any, *, where: str) -> list:
+    """One waypoint array from the wire, as `(lat, lon)` pairs."""
+
+    if not isinstance(value, (list, tuple)):
+        raise MissionRejected(
+            MissionRejectReason.MALFORMED,
+            f"{where} is {type(value).__name__}, expected an array of points",
+        )
+    # Length is checked before walking: a hostile or broken payload must not
+    # be able to make the socket callback iterate a million objects.
+    if len(value) > MAX_PATH_POINTS:
+        raise MissionRejected(
+            MissionRejectReason.ROUTE_TOO_LONG,
+            f"{where} has {len(value)} points; the limit is {MAX_PATH_POINTS}",
+        )
+    return [_wire_point(point, where=f"{where}[{i}]") for i, point in enumerate(value)]
+
+
+def parse_task_assign(
+    data: Any,
+    *,
+    expected_robot_id: Optional[str] = None,
+) -> Mission:
+    """Validate one `TASK_ASSIGN` payload into a domain `Mission`.
+
+    The contract, verified against RobotX::
+
+        {
+          taskId,
+          pickup:       {lat, lon},
+          drop:         {lat, lon},
+          pathToPickup: [{lat, lon}, ...],
+          pathToDrop:   [{lat, lon}, ...],
+          timestamp
+        }
+
+    Both paths are WGS84 waypoint arrays that **RobotX** derived from Mapbox
+    Directions. The Pi receives no tiles, no map data and no Mapbox
+    credentials, and nothing downstream of this function computes a route -- it
+    follows the one that arrived or it does not drive.
+
+    Raises `MissionRejected` rather than returning a partial mission. There is
+    no lenient mode and no defaulting: an assignment that cannot be fully
+    accounted for is refused loudly at the boundary, which is the only place
+    the refusal is still cheap.
+    """
+
+    if not isinstance(data, dict):
+        raise MissionRejected(
+            MissionRejectReason.MALFORMED,
+            f"expected an object, got {type(data).__name__}",
+        )
+
+    try:
+        encoded = len(json.dumps(data, default=str))
+    except (TypeError, ValueError):
+        raise MissionRejected(
+            MissionRejectReason.MALFORMED, "payload is not JSON-serializable"
+        ) from None
+    if encoded > MAX_INBOUND_PAYLOAD_BYTES:
+        raise MissionRejected(
+            MissionRejectReason.MALFORMED,
+            f"{encoded} bytes exceeds {MAX_INBOUND_PAYLOAD_BYTES}",
+        )
+
+    task_id = data.get("taskId")
+    identifier = task_id.strip() if isinstance(task_id, str) else None
+
+    # Routing is the server's job, but a Rover that drives any assignment it
+    # happens to receive is one misconfigured room away from delivering
+    # another robot's parcel. Checked only when the payload names a robot:
+    # the verified schema does not carry `robotId`.
+    target = data.get("robotId")
+    if expected_robot_id and target is not None and str(target).strip() != expected_robot_id:
+        raise MissionRejected(
+            MissionRejectReason.WRONG_ROBOT,
+            f"addressed to {str(target)[:40]!r}, this robot is {expected_robot_id!r}",
+            task_id=identifier,
+        )
+
+    if "timestamp" not in data:
+        raise MissionRejected(
+            MissionRejectReason.INVALID_TIMESTAMP,
+            "no `timestamp` field",
+            task_id=identifier,
+        )
+    # Epoch milliseconds on the wire, by the same convention every other
+    # RobotX observation uses; `parse_timestamp` also accepts seconds and
+    # ISO-8601 so a serializer change does not break assignment outright.
+    timestamp = parse_timestamp(data.get("timestamp"))
+    if timestamp is None:
+        raise MissionRejected(
+            MissionRejectReason.INVALID_TIMESTAMP,
+            f"timestamp {str(data.get('timestamp'))[:40]!r} is unreadable",
+            task_id=identifier,
+        )
+
+    return Mission.create(
+        task_id=task_id,
+        pickup=_wire_point(data.get("pickup"), where="pickup"),
+        drop=_wire_point(data.get("drop"), where="drop"),
+        path_to_pickup=_wire_path(data.get("pathToPickup"), where="pathToPickup"),
+        path_to_drop=_wire_path(data.get("pathToDrop"), where="pathToDrop"),
+        timestamp=timestamp,
+    )
+
+
+def build_task_complete_payload(*, task_id: str, lat: float, lon: float) -> Dict[str, Any]:
+    """`TASK_COMPLETE` (handoff §12): `{taskId, lat, lon}`, lat/lon as JSON numbers.
+
+    `lat`/`lon` must be a real measured fix: the backend grades the claim
+    against the measured track, and a claim from a kinematically unreachable
+    position raises a security event. No `robotId` (the socket is the
+    identity) and no `timestamp` (not read by the backend).
+    """
+
+    if isinstance(lat, bool) or isinstance(lon, bool) or not isinstance(lat, (int, float)) \
+            or not isinstance(lon, (int, float)):
+        raise ValueError("TASK_COMPLETE lat/lon must be numbers")
+    return {"taskId": task_id, "lat": round(float(lat), 7), "lon": round(float(lon), 7)}
+
+
+def parse_stop_event(
+    data: Any,
+    *,
+    expected_robot_id: Optional[str] = None,
+    now: Optional[float] = None,
+) -> Optional[InboundCommand]:
+    """The bare `STOP` event, which cancels a task rather than carrying one.
+
+    Deliberately far more permissive than `parse_command`, and it never
+    rejects. A stop is the one instruction where refusing to act because the
+    payload was not shaped as expected is worse than acting: every failure mode
+    of obeying it is "the robot stopped when it need not have".
+
+    It is still routed through the same idempotency cache, keyed on whatever
+    identity the payload offers -- a `commandId`, else a `taskId`. With neither,
+    the id is synthesized per delivery, which is safe precisely because
+    repeating a stop is a no-op.
+
+    The one case it refuses is a payload that **names a different robot**:
+    returns None, and the caller neither executes nor acknowledges it. Nothing
+    addressed to another robot is acted on or answered by this one, a stop
+    included. A payload with no `robotId` is still obeyed.
+    """
+
+    now = time.time() if now is None else now
+    payload: Dict[str, Any] = data if isinstance(data, dict) else {}
+
+    target = payload.get("robotId")
+    if expected_robot_id and target is not None and str(target).strip() != expected_robot_id:
+        return None
+
+    identity = payload.get("commandId") or payload.get("id") or payload.get("taskId")
+    if identity is not None and str(identity).strip():
+        command_id = f"stop:{str(identity).strip()}"
+    else:
+        command_id = f"stop:anonymous:{now_ms(now)}"
+
+    return InboundCommand(
+        command_id=command_id,
+        type=CommandType.STOP,
+        issued_at=parse_timestamp(payload.get("issuedAt") or payload.get("timestamp")),
+        received_at=now,
+        raw=payload,
     )
 
 

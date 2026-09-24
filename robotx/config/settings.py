@@ -80,7 +80,10 @@ class Settings:
     """Immutable configuration snapshot for one process."""
 
     # --- Identity / logging -------------------------------------------------
-    robot_id: str = "robotx-pi"
+    # Must equal the commissioned Robot.robotId exactly (case-sensitive). No
+    # default: required when the backend link is enabled. For local
+    # development set it to whatever the unit was commissioned as.
+    robot_id: str = ""
     log_level: str = "INFO"
 
     # --- Local HTTP API -----------------------------------------------------
@@ -170,6 +173,37 @@ class Settings:
     # Steering: full-scale turn at this heading error (degrees).
     steering_full_scale_deg: float = 45.0
 
+    # --- Local frame / dead reckoning ----------------------------------------
+    # Lets the rover navigate with no GPS, by integrating the motion it
+    # commanded into a local metres frame pinned to an origin. Open loop: the
+    # estimate drifts without bound and is labelled DEAD_RECKONING everywhere
+    # it appears. See robotx.localization.local_frame.
+    deadreckon_enabled: bool = False
+    # Lat/lon the local frame is pinned to. With none set, a synthetic origin
+    # is used and the rover reports itself at (0, 0) -- obviously not a real
+    # place, which is the point.
+    local_origin_lat: Optional[float] = None
+    local_origin_lon: Optional[float] = None
+    # CALIBRATE THESE ON THE REAL ROVER. The defaults are placeholders; used
+    # as-is the pose will be wrong by a large factor.
+    deadreckon_max_speed_mps: float = 0.4
+    deadreckon_turn_rate_dps: float = 90.0
+    deadreckon_max_step_s: float = 0.5
+    # There is deliberately no setting to publish a dead-reckoned position to
+    # the backend: only measured positions leave the Pi. See
+    # `build_telemetry_payload`.
+
+    # --- Safety gate ---------------------------------------------------------
+    # The last check a motion intent passes before it may leave the Pi. These
+    # limits are deliberately separate from the decision-layer ones above: the
+    # gate exists to catch a mis-set or buggy decision layer, which it could not
+    # do if it read the same numbers. See robotx.control.safety.
+    safety_max_speed: float = 0.75
+    safety_max_intent_age_s: float = 1.0
+    safety_stop_distance_cm: float = 30.0
+    # Leave 0 until a forward range sensor is actually wired; see SafetyConfig.
+    safety_require_range_sensor: bool = False
+
     # --- Health -------------------------------------------------------------
     health_cpu_warn_percent: float = 90.0
     health_memory_warn_percent: float = 90.0
@@ -180,22 +214,48 @@ class Settings:
     # reachable from this repository. Enabling it starts a real Socket.IO
     # client; see docs/communication/.
     socket_enabled: bool = False
-    socket_server_url: str = "http://localhost:3000"
+    # No default host: the backend is never on this Pi. Set it to the laptop's
+    # LAN address for local development (http://<LAPTOP-LAN-IP>:<PORT>) or to
+    # the deployed backend (https://<host>). Required when socket_enabled.
+    socket_server_url: str = ""
     socket_namespace: str = "/robot"
     socket_reconnect: bool = True
-    # Credential sent in the Socket.IO connect handshake.
+
+    # --- FalconAut credentials ----------------------------------------------
+    # The 6-digit code from POST /api/robots/commission. One-time, 300 s TTL,
+    # needed only until the first AUTH_SUCCESS returns a session token.
+    pairing_code: Optional[str] = None
+    # An explicit session token, overriding whatever is stored on disk. Rarely
+    # needed: the normal source of a token is AUTH_SUCCESS.
     # Read only from the environment -- never hardcode a real value here.
     robot_token: Optional[str] = None
+    # Where the session token from AUTH_SUCCESS is persisted, so a reconnect
+    # does not need a human to issue a fresh pairing code.
+    backend_token_path: Optional[str] = None
+    # How long to wait for AUTH_SUCCESS before treating the attempt as failed.
+    backend_auth_timeout_s: float = 10.0
+    # The backend's COMMAND_SIGNING_KEY (>= 32 bytes), used to verify signed
+    # Assignment Engine envelopes. SECRET. The backend has no mechanism to
+    # provision it; unset means no OFFER can be admitted (verification is
+    # never skipped).
+    command_signing_key: Optional[str] = None
+    # Commitment fence/sequence high-water marks and tombstones, persisted
+    # across restarts because engine delivery is at-least-once.
+    commitment_state_path: Optional[str] = "~/.robotx/commitments.json"
 
-    # Path to a JSON file giving the REAL backend event names. Without it the
-    # link runs on provisional names that were never verified against a server
-    # and reports itself as not integrated. See ProtocolBinding.
+    # Path to a JSON file overriding the FalconAut event names. The built-in
+    # binding follows the contract; this exists to correct any name the backend
+    # spells differently, with no code change. See ProtocolBinding.
     protocol_file: Optional[str] = None
 
     # Outbound rates. Telemetry is the only high-frequency channel, and at 1 Hz
     # it is already 20x below the camera: the database should not grow at the
     # speed of the image sensor.
     backend_telemetry_interval_s: float = 1.0
+    # Liveness cadence. Sent whenever the link is authenticated, including when
+    # there is no GPS fix and therefore no telemetry at all -- otherwise a
+    # healthy indoor robot is indistinguishable from a crashed one.
+    backend_heartbeat_interval_s: float = 2.0
     backend_status_interval_s: float = 5.0
     # Positions older than this are not published as live telemetry at all.
     backend_max_position_age_s: float = 5.0
@@ -318,6 +378,16 @@ class Settings:
             obstacle_min_area_px=_get_int(e, "ROBOTX_OBSTACLE_MIN_AREA_PX", d.obstacle_min_area_px),
             obstacle_center_zone_ratio=_get_float(e, "ROBOTX_OBSTACLE_CENTER_ZONE_RATIO", d.obstacle_center_zone_ratio),
             steering_full_scale_deg=_get_float(e, "ROBOTX_STEERING_FULL_SCALE_DEG", d.steering_full_scale_deg),
+            deadreckon_enabled=_get_bool(e, "ROBOTX_DEADRECKON_ENABLED", d.deadreckon_enabled),
+            local_origin_lat=_get_opt_float(e, "ROBOTX_LOCAL_ORIGIN_LAT", d.local_origin_lat),
+            local_origin_lon=_get_opt_float(e, "ROBOTX_LOCAL_ORIGIN_LON", d.local_origin_lon),
+            deadreckon_max_speed_mps=_get_float(e, "ROBOTX_DEADRECKON_MAX_SPEED_MPS", d.deadreckon_max_speed_mps),
+            deadreckon_turn_rate_dps=_get_float(e, "ROBOTX_DEADRECKON_TURN_RATE_DPS", d.deadreckon_turn_rate_dps),
+            deadreckon_max_step_s=_get_float(e, "ROBOTX_DEADRECKON_MAX_STEP_S", d.deadreckon_max_step_s),
+            safety_max_speed=_get_float(e, "ROBOTX_SAFETY_MAX_SPEED", d.safety_max_speed),
+            safety_max_intent_age_s=_get_float(e, "ROBOTX_SAFETY_MAX_INTENT_AGE_S", d.safety_max_intent_age_s),
+            safety_stop_distance_cm=_get_float(e, "ROBOTX_SAFETY_STOP_DISTANCE_CM", d.safety_stop_distance_cm),
+            safety_require_range_sensor=_get_bool(e, "ROBOTX_SAFETY_REQUIRE_RANGE_SENSOR", d.safety_require_range_sensor),
             health_cpu_warn_percent=_get_float(e, "ROBOTX_HEALTH_CPU_WARN_PERCENT", d.health_cpu_warn_percent),
             health_memory_warn_percent=_get_float(e, "ROBOTX_HEALTH_MEMORY_WARN_PERCENT", d.health_memory_warn_percent),
             health_temp_warn_c=_get_float(e, "ROBOTX_HEALTH_TEMP_WARN_C", d.health_temp_warn_c),
@@ -325,10 +395,20 @@ class Settings:
             socket_server_url=_get_str(e, "ROBOTX_SOCKET_SERVER_URL", d.socket_server_url),
             socket_namespace=_get_str(e, "ROBOTX_SOCKET_NAMESPACE", d.socket_namespace),
             socket_reconnect=_get_bool(e, "ROBOTX_SOCKET_RECONNECT", d.socket_reconnect),
+            pairing_code=_get(e, "ROBOTX_PAIRING_CODE", d.pairing_code),
             robot_token=_get(e, "ROBOTX_ROBOT_TOKEN", d.robot_token),
+            backend_token_path=_get(e, "ROBOTX_BACKEND_TOKEN_PATH", d.backend_token_path),
+            command_signing_key=_get(e, "ROBOTX_COMMAND_SIGNING_KEY", d.command_signing_key),
+            commitment_state_path=_get(e, "ROBOTX_COMMITMENT_STATE_PATH", d.commitment_state_path),
+            backend_auth_timeout_s=_get_float(
+                e, "ROBOTX_BACKEND_AUTH_TIMEOUT_S", d.backend_auth_timeout_s
+            ),
             protocol_file=_get(e, "ROBOTX_PROTOCOL_FILE", d.protocol_file),
             backend_telemetry_interval_s=_get_float(
                 e, "ROBOTX_BACKEND_TELEMETRY_INTERVAL_S", d.backend_telemetry_interval_s
+            ),
+            backend_heartbeat_interval_s=_get_float(
+                e, "ROBOTX_BACKEND_HEARTBEAT_INTERVAL_S", d.backend_heartbeat_interval_s
             ),
             backend_status_interval_s=_get_float(
                 e, "ROBOTX_BACKEND_STATUS_INTERVAL_S", d.backend_status_interval_s
@@ -379,7 +459,9 @@ class Settings:
     def public_summary(self) -> dict:
         """Configuration snapshot safe to log or expose. Secrets are elided."""
 
-        secret_fields = {"robot_token", "google_maps_api_key"}
+        # The pairing code is a credential too: it is single-use, but for its
+        # 300 second life anyone holding it can enrol as this robot.
+        secret_fields = {"robot_token", "pairing_code", "google_maps_api_key", "command_signing_key"}
         out: dict[str, Any] = {}
         for f in fields(self):
             value = getattr(self, f.name)

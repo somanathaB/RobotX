@@ -19,8 +19,11 @@ from enum import Enum
 from typing import Any, Dict, Optional
 
 from robotx.control.motion import MotionIntent
+from robotx.control.safety import UNEVALUATED, SafetyDecision
+from robotx.hardware.battery import BATTERY_UNAVAILABLE_REASON
 from robotx.diagnostics.health import HealthReport, HealthStatus
 from robotx.hardware.gps import GpsReading, GPSStatus
+from robotx.mission.mission import ActiveMission
 from robotx.navigation.navigator import NavigationState
 from robotx.perception.types import PerceptionResult, PerceptionStatus
 from robotx.localization.position import Position
@@ -64,35 +67,157 @@ class OperatingMode(str, Enum):
         return self in (OperatingMode.AUTO, OperatingMode.PAUSED)
 
 
-class LinkStatus(str, Enum):
-    """State of an outbound link to another system."""
+class BackendLinkStatus(str, Enum):
+    """State of the Pi's link to the RobotX backend.
+
+    Normal progression::
+
+        DISCONNECTED -> CONNECTING -> CONNECTED
+                     -> AUTHENTICATING -> AUTHENTICATED -> STREAMING
+
+    `CONNECTED` and `AUTHENTICATED` are kept apart deliberately. The backend's
+    socket connects anonymously, so a connected socket says nothing about
+    whether this robot is allowed to be on it -- and an authentication failure
+    arrives as a silent server-side disconnect, which is indistinguishable from
+    a network drop unless the link records which of the two it was waiting for.
+
+    This enum is **specific to the backend**. The ESP32 link has its own
+    (`Esp32LinkStatus`) because a UART link does not authenticate, does not
+    stream and cannot be "refused" -- sharing one enum would force an ESP32
+    into states that have no meaning for it.
+    """
 
     DISABLED = "DISABLED"                # switched off by configuration
-    NOT_IMPLEMENTED = "NOT_IMPLEMENTED"  # planned, no code path exists yet
     CONNECTING = "CONNECTING"
-    CONNECTED = "CONNECTED"
+    CONNECTED = "CONNECTED"              # socket open, anonymous, not yet authed
+    AUTHENTICATING = "AUTHENTICATING"    # AUTH emitted, awaiting AUTH_SUCCESS
+    AUTHENTICATED = "AUTHENTICATED"      # AUTH_SUCCESS received
+    STREAMING = "STREAMING"              # authenticated and publishing telemetry
     DISCONNECTED = "DISCONNECTED"
-    REJECTED = "REJECTED"                # server refused the handshake
+    AUTH_FAILED = "AUTH_FAILED"          # backend refused this robot's credential
 
     @property
     def is_up(self) -> bool:
-        return self is LinkStatus.CONNECTED
+        """Whether the link can actually carry robot traffic.
+
+        A merely `CONNECTED` socket cannot: until authentication succeeds the
+        backend will not attribute anything sent on it to this robot.
+        """
+
+        return self in (BackendLinkStatus.AUTHENTICATED, BackendLinkStatus.STREAMING)
+
+    @property
+    def socket_open(self) -> bool:
+        """Whether the transport is up, regardless of authentication."""
+
+        return self in (
+            BackendLinkStatus.CONNECTED,
+            BackendLinkStatus.AUTHENTICATING,
+            BackendLinkStatus.AUTHENTICATED,
+            BackendLinkStatus.STREAMING,
+        )
+
+
+class Esp32LinkStatus(str, Enum):
+    """State of the Pi's link to the ESP32 motor/sensor controller.
+
+    Deliberately limited to what can be established **without knowing the UART
+    protocol**. Opening a serial port, having bytes arrive, and timing how long
+    since the last byte are all observable whatever the framing turns out to
+    be. Anything finer -- whether a frame parsed, whether the ESP32 is healthy,
+    what its failsafe is doing -- requires the firmware contract and is
+    deliberately absent until that contract exists.
+
+    `NOT_IMPLEMENTED` is the value today: no transport code exists at all. It
+    is distinct from `DISABLED` (a link that exists but was switched off) and
+    from `DISCONNECTED` (a link that exists, is wanted, and is not up), because
+    a robot with no ESP32 code is not the same as one whose ESP32 has failed.
+    """
+
+    NOT_IMPLEMENTED = "NOT_IMPLEMENTED"  # planned; no transport code exists yet
+    DISABLED = "DISABLED"                # switched off by configuration
+    DISCONNECTED = "DISCONNECTED"        # port not open
+    CONNECTING = "CONNECTING"            # opening the port
+    UP = "UP"                            # port open, data arriving
+    STALE = "STALE"                      # port open, nothing received recently
+
+    @property
+    def is_up(self) -> bool:
+        return self is Esp32LinkStatus.UP
+
+
+@dataclass(frozen=True)
+class PowerState:
+    """Battery/power, in the shape `robotx.hardware.battery` already defines.
+
+    Present in state so that **no consumer has to call the hardware itself**.
+    Telemetry built from a snapshot that then reached past it for a live
+    battery read would be reporting two different instants in one frame.
+
+    Today the only value this can hold is `UNAVAILABLE`: this robot has no
+    fuel gauge, ADC or divider. When battery sensing arrives it will be on the
+    ESP32, and the parser will write this same field -- every consumer keeps
+    working and can still tell measured from unavailable.
+    """
+
+    status: str = "UNAVAILABLE"
+    percent: Optional[float] = None
+    voltage_v: Optional[float] = None
+    source: str = BATTERY_UNAVAILABLE_REASON
+
+    @property
+    def is_measured(self) -> bool:
+        return self.status != "UNAVAILABLE" and self.percent is not None
+
+    @classmethod
+    def from_status_dict(cls, data: Dict[str, Any]) -> "PowerState":
+        """Build from the mapping `battery_status()` returns."""
+
+        return cls(
+            status=str(data.get("status", "UNAVAILABLE")),
+            percent=data.get("percent"),
+            voltage_v=data.get("voltage_v"),
+            source=str(data.get("source", BATTERY_UNAVAILABLE_REASON)),
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "status": self.status,
+            "percent": self.percent,
+            "voltage_v": self.voltage_v,
+            "source": self.source,
+        }
 
 
 @dataclass(frozen=True)
 class CommunicationState:
-    """Outbound links, as observed rather than as hoped.
+    """The Rover's two outbound links, as observed rather than as hoped.
 
-    `backend` is written only by the transport, from Socket.IO's own connect
-    and disconnect callbacks. Nothing else may set it, so the state cannot
-    drift into claiming a link that is not there -- which is the ground truth a
-    dashboard's "online" indicator ultimately rests on.
+    The two halves are **independent**, and that is the point. The ESP32 is the
+    robot's own hardware; the backend is a remote supervisor. A rover with a
+    dead ESP32 and a healthy backend is in serious trouble, and a rover with a
+    live ESP32 and no backend is merely unsupervised -- collapsing them into
+    one verdict loses exactly the distinction an operator needs.
+
+    Each half is written only by its own transport, so the state cannot drift
+    into claiming a link that is not there.
+
+    No backend *protocol* detail lives here. Which event names are in use and
+    which credential authenticated are facts about a Socket.IO client, not
+    about the robot, and they belong to that client's own `describe()`.
     """
 
-    # Pi -> ESP32 motor/safety controller. Out of scope for this stage.
-    esp32: LinkStatus = LinkStatus.NOT_IMPLEMENTED
-    # Pi -> FalconAut backend.
-    backend: LinkStatus = LinkStatus.DISABLED
+    # --- Pi <-> ESP32 motor/sensor controller --------------------------------
+    esp32: Esp32LinkStatus = Esp32LinkStatus.NOT_IMPLEMENTED
+    esp32_detail: str = ""
+    # When the current ESP32 link state was entered.
+    esp32_since: Optional[float] = None
+    # Last time anything at all arrived from the ESP32. Protocol-agnostic on
+    # purpose: bytes arriving is observable without knowing their framing.
+    esp32_last_rx_at: Optional[float] = None
+
+    # --- Pi -> RobotX backend ------------------------------------------------
+    backend: BackendLinkStatus = BackendLinkStatus.DISABLED
     backend_detail: str = ""
     # When the current backend link state was entered.
     backend_since: Optional[float] = None
@@ -102,18 +227,18 @@ class CommunicationState:
     backend_last_send_at: Optional[float] = None
     # Last message received from the backend, for the same reason.
     backend_last_recv_at: Optional[float] = None
-    # True while event names are guesses rather than the real contract.
-    backend_protocol_provisional: bool = True
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "esp32": self.esp32.value,
+            "esp32_detail": self.esp32_detail,
+            "esp32_since": self.esp32_since,
+            "esp32_last_rx_at": self.esp32_last_rx_at,
             "backend": self.backend.value,
             "backend_detail": self.backend_detail,
             "backend_since": self.backend_since,
             "backend_last_send_at": self.backend_last_send_at,
             "backend_last_recv_at": self.backend_last_recv_at,
-            "backend_protocol_provisional": self.backend_protocol_provisional,
         }
 
 
@@ -131,8 +256,26 @@ class RobotSnapshot:
     navigation: NavigationState
     perception: PerceptionResult
     motion_intent: MotionIntent
+    power: PowerState
     communication: CommunicationState
     health: HealthReport
+    # The safety gate's verdict on `motion_intent`. That field always holds the
+    # *gated* intent -- what may actually be acted on -- and this records what
+    # the gate did to get there. Without it an operator looking at a stopped
+    # rover cannot tell a navigation hold from a safety veto.
+    #
+    # Defaulted so that constructing a snapshot does not require knowing about
+    # every field, and defaulted to UNEVALUATED specifically: a snapshot built
+    # without a verdict reports "not yet cleared to move", never "cleared".
+    safety: SafetyDecision = UNEVALUATED
+    # The RobotX task this Rover is carrying out, and how far through it it is.
+    # None until one is assigned; a finished mission is kept until the next
+    # assignment replaces it, so a consumer can still see how the last one
+    # ended rather than watching it vanish at the moment it completed.
+    #
+    # Defaulted so that a snapshot can be built without knowing about
+    # missions -- a Rover driving a locally supplied route has none.
+    mission: Optional[ActiveMission] = None
     last_error: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
@@ -145,8 +288,11 @@ class RobotSnapshot:
             "gps": self.gps.to_dict(),
             "position": None if self.position is None else self.position.to_dict(),
             "navigation": self.navigation.to_dict(),
+            "mission": None if self.mission is None else self.mission.to_dict(),
             "perception": self.perception.to_dict(),
             "motion_intent": self.motion_intent.to_dict(),
+            "safety": self.safety.to_dict(),
+            "power": self.power.to_dict(),
             "communication": self.communication.to_dict(),
             "health": self.health.to_dict(),
             "last_error": self.last_error,
@@ -170,8 +316,11 @@ class RobotState:
         self._gps = GpsReading(status=GPSStatus.UNAVAILABLE)
         self._position: Optional[Position] = None
         self._navigation = NavigationState()
+        self._mission: Optional[ActiveMission] = None
         self._perception = PerceptionResult.unavailable(PerceptionStatus.DISABLED)
         self._motion_intent = MotionIntent.hold("agent starting")
+        self._safety = UNEVALUATED
+        self._power = PowerState()
         self._communication = CommunicationState()
         self._health = HealthReport(status=HealthStatus.UNKNOWN)
         self._last_error: Optional[str] = None
@@ -229,6 +378,21 @@ class RobotState:
             self._navigation = navigation
             self._updated_at = time.time()
 
+    def update_mission(self, mission: Optional[ActiveMission]) -> None:
+        """Record the active mission and its progress.
+
+        Written by the agent from the mission manager's result, in the same
+        tick as the navigation state it was derived from. This is the only
+        place an assigned route is stored: the manager holds it to drive the
+        navigator, and every *consumer* -- telemetry, the local API, the
+        backend link -- reads it from here, so there is no second answer to
+        "what is this Rover delivering".
+        """
+
+        with self._lock:
+            self._mission = mission
+            self._updated_at = time.time()
+
     def update_perception(self, perception: PerceptionResult) -> None:
         with self._lock:
             self._perception = perception
@@ -237,6 +401,30 @@ class RobotState:
     def update_motion_intent(self, intent: MotionIntent) -> None:
         with self._lock:
             self._motion_intent = intent
+            self._updated_at = time.time()
+
+    def update_safety(self, decision: SafetyDecision) -> None:
+        """Record the gate's verdict alongside the intent it produced.
+
+        Written by the agent in the same tick as `update_motion_intent`, from
+        the same `SafetyDecision`, so the two can never describe different
+        evaluations.
+        """
+
+        with self._lock:
+            self._safety = decision
+            self._updated_at = time.time()
+
+    def update_power(self, power: PowerState) -> None:
+        """Record the battery/power reading.
+
+        Written by whichever producer owns the measurement -- today the Pi's
+        `battery` module, which reports UNAVAILABLE; later the ESP32 parser.
+        Consumers read it from a snapshot and never call the producer.
+        """
+
+        with self._lock:
+            self._power = power
             self._updated_at = time.time()
 
     def update_health(self, health: HealthReport) -> None:
@@ -263,8 +451,11 @@ class RobotState:
                 gps=self._gps,
                 position=self._position,
                 navigation=self._navigation,
+                mission=self._mission,
                 perception=self._perception,
                 motion_intent=self._motion_intent,
+                safety=self._safety,
+                power=self._power,
                 communication=self._communication,
                 health=self._health,
                 last_error=self._last_error,

@@ -19,11 +19,13 @@ from robotx.perception.types import PerceptionResult, PerceptionStatus
 from robotx.localization.position import HeadingSource, Position
 from robotx.state.robot_state import (
     CommunicationState,
-    LinkStatus,
+    BackendLinkStatus,
+    Esp32LinkStatus,
+    PowerState,
     OperatingMode,
     RobotState,
 )
-from robotx.state.telemetry import TELEMETRY_SCHEMA_VERSION, battery_telemetry, build_telemetry
+from robotx.state.telemetry import TELEMETRY_SCHEMA_VERSION, build_telemetry
 
 
 def sample_position():
@@ -90,14 +92,14 @@ class TestRobotState(unittest.TestCase):
 
     def test_communication_defaults_reflect_the_current_stage(self):
         comms = self.state.snapshot().communication
-        self.assertIs(comms.esp32, LinkStatus.NOT_IMPLEMENTED)
-        self.assertIs(comms.backend, LinkStatus.DISABLED)
+        self.assertIs(comms.esp32, Esp32LinkStatus.NOT_IMPLEMENTED)
+        self.assertIs(comms.backend, BackendLinkStatus.DISABLED)
 
     def test_communication_update_is_partial(self):
-        self.state.update_communication(backend=LinkStatus.CONNECTED)
+        self.state.update_communication(backend=BackendLinkStatus.CONNECTED)
         comms = self.state.snapshot().communication
-        self.assertIs(comms.backend, LinkStatus.CONNECTED)
-        self.assertIs(comms.esp32, LinkStatus.NOT_IMPLEMENTED)
+        self.assertIs(comms.backend, BackendLinkStatus.CONNECTED)
+        self.assertIs(comms.esp32, Esp32LinkStatus.NOT_IMPLEMENTED)
 
     def test_snapshot_serializes_fully(self):
         self.state.update_gps(sample_gps_reading(), sample_position())
@@ -123,7 +125,7 @@ class TestTelemetry(unittest.TestCase):
 
     def test_battery_is_unavailable_not_invented(self):
         # This robot has no battery sensing hardware.
-        battery = battery_telemetry()
+        battery = build_telemetry(RobotState('r').snapshot())["battery"]
         self.assertEqual(battery["status"], "UNAVAILABLE")
         self.assertIsNone(battery["percent"])
         self.assertIsNone(battery["voltage_v"])

@@ -75,6 +75,29 @@ class HeadingSource(str, Enum):
     NONE = "NONE"              # no heading available
     NMEA_TRACK = "NMEA_TRACK"  # course over ground from the receiver
     GPS_TRACK = "GPS_TRACK"    # bearing between consecutive fixes
+    # Integrated from commanded motion, not observed. Drifts without bound and
+    # cannot detect that the rover failed to turn; see localization.local_frame.
+    DEAD_RECKONED = "DEAD_RECKONED"
+
+
+class PositionSource(str, Enum):
+    """Where a `Position` came from, and therefore what it is worth.
+
+    Separate from `HeadingSource` because the two genuinely differ: a GPS fix
+    can carry a dead heading (stationary receiver), and a dead-reckoned pose
+    has a heading that is exactly as good as its position. A consumer deciding
+    whether it may act on, or publish, a coordinate needs this field and not
+    the other one.
+    """
+
+    GPS = "GPS"                            # a real fix from a receiver
+    DEAD_RECKONING = "DEAD_RECKONING"      # integrated from commanded motion
+
+    @property
+    def is_measured(self) -> bool:
+        """Whether this position was observed rather than inferred."""
+
+        return self is PositionSource.GPS
 
 
 @dataclass(frozen=True)
@@ -89,10 +112,19 @@ class Position:
     heading_deg: Optional[float] = None
     heading_source: HeadingSource = HeadingSource.NONE
     satellites: Optional[int] = None
+    # Defaults to GPS so that every existing producer keeps its meaning without
+    # being edited. A position that was *not* measured has to say so explicitly,
+    # which is the right way round: inferring a coordinate is the unusual act,
+    # and the unusual act is the one that should require a deliberate statement.
+    source: PositionSource = PositionSource.GPS
 
     @property
     def lat_lon(self) -> LatLon:
         return (self.latitude, self.longitude)
+
+    @property
+    def is_measured(self) -> bool:
+        return self.source.is_measured
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -103,6 +135,7 @@ class Position:
             "heading_deg": None if self.heading_deg is None else round(self.heading_deg, 1),
             "heading_source": self.heading_source.value,
             "satellites": self.satellites,
+            "source": self.source.value,
             "timestamp": self.timestamp,
         }
 

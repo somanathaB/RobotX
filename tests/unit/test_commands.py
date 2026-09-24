@@ -258,7 +258,12 @@ class TestSafetyBoundary(unittest.TestCase):
         # the motors that bypasses perception.
         from robotx.communication.commands import CommandTarget
 
-        allowed = {"mode", "stop_mission", "pause_mission", "resume_mission", "return_to_base"}
+        # `assign_mission` takes an already-validated `Mission` (a route to
+        # follow), never a speed or a steering value.
+        # `assess_offer` answers "can I execute this?" and returns a verdict;
+        # it moves nothing.
+        allowed = {"mode", "stop_mission", "pause_mission", "resume_mission",
+                   "return_to_base", "assign_mission", "assess_offer"}
         public = {name for name in vars(CommandTarget) if not name.startswith("_")}
         self.assertEqual(public, allowed)
 

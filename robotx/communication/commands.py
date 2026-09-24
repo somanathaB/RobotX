@@ -40,6 +40,7 @@ from robotx.communication.protocol import (
     InboundCommand,
 )
 from robotx.config.logging_setup import log_event
+from robotx.mission.mission import Mission
 from robotx.state.robot_state import MissionRefused, OperatingMode
 
 
@@ -55,11 +56,17 @@ DEFAULT_HISTORY_TTL_S = 900.0
 
 
 class CommandTarget(Protocol):
-    """What the executor needs from the agent. Deliberately four methods wide.
+    """What the communication layer needs from the agent, and nothing else.
 
-    Narrow on purpose: the communication layer can request a mission state
-    change and read the current mode, and there is no method here through which
-    it could set a speed, steer, or touch hardware.
+    Narrow on purpose: it can request a mission state change, ask whether an
+    offer is physically executable, hand over an accepted assignment, and read
+    the current mode. There is no method here through
+    which it could set a speed, steer, pick a waypoint or touch hardware.
+
+    `assign_mission` takes an already-validated `Mission`, never a payload.
+    Parsing belongs to `robotx.communication.protocol`; by the time the agent
+    is called the route has been checked, so the agent is never handed a
+    half-understood assignment to make sense of.
     """
 
     @property
@@ -72,6 +79,10 @@ class CommandTarget(Protocol):
     def resume_mission(self, reason: str = ...) -> None: ...
 
     def return_to_base(self, reason: str = ...) -> None: ...
+
+    def assign_mission(self, mission: Mission, *, custody_required: bool = ...) -> Any: ...
+
+    def assess_offer(self, offer: Any) -> Any: ...
 
 
 @dataclass(frozen=True)

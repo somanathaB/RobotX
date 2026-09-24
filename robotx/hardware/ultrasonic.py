@@ -22,9 +22,13 @@ class UltrasonicStatus(str, enum.Enum):
 
     A reading is only trustworthy as "no obstacle" when status is VALID.
     Every other status must be treated as a safety-relevant failure by
-    callers (see RobotController._safety_blocked) rather than silently
-    read as "clear" -- collapsing TIMEOUT/DISCONNECTED/etc. into "no
-    obstacle" was the exact bug this status model replaces.
+    callers rather than silently read as "clear" -- collapsing
+    TIMEOUT/DISCONNECTED/etc. into "no obstacle" was the exact bug this
+    status model replaces.
+
+    This property must survive the move to the ESP32: whatever the UART
+    contract turns out to be, "the sensor did not answer" and "the path is
+    clear" have to stay distinguishable on the wire.
     """
 
     VALID = "VALID"                # fresh, in-range echo measured this cycle

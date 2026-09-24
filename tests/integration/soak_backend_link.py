@@ -165,11 +165,11 @@ def measure_serialization(agent: RobotAgent, iterations: int = 2000) -> dict:
 
     started = time.perf_counter()
     for _ in range(iterations):
-        build_telemetry_payload(snapshot, robot_id="soak", max_position_age_s=5.0)
+        build_telemetry_payload(snapshot, sequence=1, max_position_age_s=5.0)
     build_us = 1e6 * (time.perf_counter() - started) / iterations
 
-    frame = build_telemetry_payload(snapshot, robot_id="soak", max_position_age_s=5.0)
-    payload = frame.payload or {"robotId": "soak"}
+    frame = build_telemetry_payload(snapshot, sequence=1, max_position_age_s=5.0)
+    payload = frame.payload
     status_payload = build_status_payload(
         snapshot, robot_id="soak", binding=ProtocolBinding()
     )
@@ -184,7 +184,7 @@ def measure_serialization(agent: RobotAgent, iterations: int = 2000) -> dict:
         "json_encode_us": round(encode_us, 2),
         "telemetry_bytes": len(json.dumps(payload)),
         "status_bytes": len(json.dumps(status_payload)),
-        "sendable": frame.sendable,
+        "has_position": frame.has_position,
         "used_injected_fix": not agent.state.snapshot().gps.has_fix,
     }
 

@@ -158,7 +158,7 @@ report a robot that is halfway gone as if it were running.
   "protocol": { "source": "PROVISIONAL", "provisional": true, "namespace": "/robot", ... },
   "integrated": false,
   "loss_policy": "pause",
-  "stats": { "connects": 1, "telemetry_sent": 412, "telemetry_skipped": 8,
+  "stats": { "connects": 1, "telemetry_sent": 412, "positions_omitted": 8,
              "commands_received": 3, "acks_sent": 3, "unexpected_events": 0, ... }
 }
 ```

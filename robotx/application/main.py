@@ -121,11 +121,13 @@ async def config() -> Dict[str, Any]:
 
 @app.get("/backend")
 async def backend_link() -> Dict[str, Any]:
-    """Backend link state: connection, protocol binding and message counters.
+    """Backend link state: connection, authentication, binding and counters.
 
-    The place to look when a dashboard shows a robot as offline. `integrated`
-    is the honest summary: it is false whenever the event names in use are
-    provisional, no matter how healthy the socket itself looks.
+    The place to look when a dashboard shows a robot as offline. `streaming`
+    is the honest summary: the socket is open, FalconAut has authenticated this
+    robot, and telemetry is flowing. A socket that is merely connected is not
+    an integration, because FalconAut's connection is anonymous until AUTH
+    succeeds.
     """
 
     agent = get_agent()
@@ -133,7 +135,8 @@ async def backend_link() -> Dict[str, Any]:
         return {
             "enabled": SETTINGS.socket_enabled,
             "status": "DISABLED",
-            "integrated": False,
+            "streaming": False,
+            "authenticated": False,
             "detail": "no backend link is configured (ROBOTX_SOCKET_ENABLED=0)",
         }
     return agent.backend.describe()
@@ -192,6 +195,32 @@ async def resume_mission() -> Dict[str, Any]:
     except MissionRefused as e:
         raise HTTPException(status_code=409, detail=str(e)) from None
     return {"mode": agent.state.mode.value}
+
+
+@app.post("/safety/estop")
+async def emergency_stop() -> Dict[str, Any]:
+    """Latch the safety gate shut. No motion intent leaves the Pi until cleared.
+
+    Unconditional by design: an emergency stop must work from every state,
+    including ERROR, and must never depend on the agent agreeing it was needed.
+    """
+
+    agent = get_agent()
+    agent.emergency_stop("emergency stop via API")
+    return {"mode": agent.state.mode.value, "emergency_stopped": True}
+
+
+@app.post("/safety/clear")
+async def clear_emergency_stop() -> Dict[str, Any]:
+    """Release the emergency stop latch. Does not resume the mission."""
+
+    agent = get_agent()
+    released = agent.clear_emergency_stop("cleared via API")
+    return {
+        "mode": agent.state.mode.value,
+        "emergency_stopped": agent.emergency_stopped,
+        "was_engaged": released,
+    }
 
 
 @app.post("/mission/idle")

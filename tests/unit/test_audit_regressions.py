@@ -120,7 +120,7 @@ class TestHealthEvaluation(unittest.TestCase):
 
     def test_component_health_covers_every_subsystem(self):
         components = self.agent._component_health(self.agent.state.snapshot())
-        for name in ("camera", "perception", "gps", "navigation", "communication"):
+        for name in ("camera", "perception", "gps", "navigation", "esp32", "backend"):
             self.assertIn(name, components)
             self.assertIsInstance(components[name], ComponentHealth)
 

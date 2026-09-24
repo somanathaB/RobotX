@@ -20,7 +20,7 @@ from robotx.perception.types import (
     PerceptionResult,
     PerceptionStatus,
 )
-from robotx.state.robot_state import LinkStatus, OperatingMode
+from robotx.state.robot_state import BackendLinkStatus as LinkStatus, Esp32LinkStatus, OperatingMode
 
 
 HERE = (51.500000, -0.100000)
@@ -261,7 +261,7 @@ class TestTelemetryAndHealth(AgentTestCase):
         agent = self.make_agent()
         asyncio.run(self._start_then_stop(agent))
         comms = agent.state.snapshot().communication
-        self.assertIs(comms.esp32, LinkStatus.NOT_IMPLEMENTED)
+        self.assertIs(comms.esp32, Esp32LinkStatus.NOT_IMPLEMENTED)
         self.assertIs(comms.backend, LinkStatus.DISABLED)
 
     async def _start_then_stop(self, agent):

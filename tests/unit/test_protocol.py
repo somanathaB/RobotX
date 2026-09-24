@@ -23,7 +23,7 @@ from robotx.communication.protocol import (
     ProtocolBinding,
     RejectionReason,
     agent_capabilities,
-    build_command_result_payload,
+    build_command_ack_payload,
     build_event_payload,
     build_register_payload,
     build_status_payload,
@@ -40,6 +40,7 @@ from robotx.localization.position import HeadingSource, Position
 from robotx.navigation.navigator import NavigationState, NavigationStatus
 from robotx.perception.types import PerceptionResult, PerceptionStatus
 from robotx.state.robot_state import (
+    PowerState,
     CommunicationState,
     OperatingMode,
     RobotSnapshot,
@@ -90,18 +91,44 @@ def make_snapshot(
         navigation=NavigationState(status=NavigationStatus.NAVIGATING, waypoints_total=3),
         perception=PerceptionResult.unavailable(PerceptionStatus.OK),
         motion_intent=MotionIntent.forward(0.4, reason="clear"),
+        power=PowerState(),
         communication=CommunicationState(),
         health=health,
     )
 
 
 class TestProtocolBinding(unittest.TestCase):
-    def test_builtin_binding_is_marked_provisional(self):
+    def test_builtin_binding_uses_the_falconaut_event_names(self):
         binding = ProtocolBinding()
-        self.assertIs(binding.source, BindingSource.PROVISIONAL)
-        self.assertTrue(binding.is_provisional)
+        self.assertIs(binding.source, BindingSource.FALCONAUT)
+        self.assertEqual(binding.auth, "AUTH")
+        self.assertEqual(binding.auth_success, "AUTH_SUCCESS")
+        self.assertEqual(binding.command, "COMMAND")
+        self.assertEqual(binding.engine_command, "command")
+        self.assertEqual(binding.stop, "STOP")
+        self.assertEqual(
+            (binding.offer_accept, binding.offer_reject, binding.offer_defer, binding.custody_event),
+            ("OFFER_ACCEPT", "OFFER_REJECT", "OFFER_DEFER", "CUSTODY_EVENT"),
+        )
 
-    def test_binding_loaded_from_file_is_not_provisional(self):
+    def test_undeclared_channels_are_unbound_by_default(self):
+        """Emitting an event the backend never declared invents protocol."""
+
+        binding = ProtocolBinding()
+        self.assertEqual(binding.register, "")
+        self.assertEqual(binding.status, "")
+        self.assertEqual(binding.event, "")
+        self.assertNotIn("", binding.outbound_events())
+
+    def test_unconfirmed_names_are_declared_honestly(self):
+        binding = ProtocolBinding()
+        # Everything the contract attests is absent from this list; only the
+        # error event it never mentions remains.
+        self.assertEqual(binding.unconfirmed, ("auth_failed",))
+        # An operator-supplied binding asserts the real names.
+        self.assertEqual(ProtocolBinding(source=BindingSource.FILE).unconfirmed, ())
+
+    def test_binding_loaded_from_file_overrides_the_defaults(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "binding.json")
             with open(path, "w") as handle:
@@ -115,13 +142,12 @@ class TestProtocolBinding(unittest.TestCase):
                 )
             binding = ProtocolBinding.load(path)
 
-        self.assertFalse(binding.is_provisional)
         self.assertIs(binding.source, BindingSource.FILE)
         self.assertEqual(binding.namespace, "/robots")
         self.assertEqual(binding.telemetry, "robot:telemetry")
         self.assertEqual(binding.command, "robot:command")
         # Unspecified names keep their defaults rather than becoming empty.
-        self.assertEqual(binding.status, "status")
+        self.assertEqual(binding.auth, "AUTH")
 
     def test_nested_binding_file_is_accepted(self):
         binding = ProtocolBinding.from_mapping(
@@ -144,74 +170,74 @@ class TestProtocolBinding(unittest.TestCase):
             with self.assertRaises(ValueError):
                 ProtocolBinding.load(path)
 
-    def test_no_path_returns_provisional_binding(self):
-        self.assertTrue(ProtocolBinding.load(None).is_provisional)
-        self.assertTrue(ProtocolBinding.load("").is_provisional)
+    def test_no_path_returns_the_builtin_falconaut_binding(self):
+        self.assertIs(ProtocolBinding.load(None).source, BindingSource.FALCONAUT)
+        self.assertIs(ProtocolBinding.load("").source, BindingSource.FALCONAUT)
+
+
+def frame_for(snapshot, **kwargs):
+    kwargs.setdefault("sequence", 1)
+    kwargs.setdefault("max_position_age_s", 5.0)
+    return build_telemetry_payload(snapshot, **kwargs)
 
 
 class TestTelemetryPayload(unittest.TestCase):
-    def test_payload_carries_exactly_the_telemetry_model_fields(self):
-        frame = build_telemetry_payload(
-            make_snapshot(), robot_id="robotx-pi", max_position_age_s=5.0
-        )
-        self.assertTrue(frame.sendable)
+    """TELEMETRY to handoff §5/§16: measured fields present, the rest omitted."""
+
+    def test_a_fresh_measured_fix_carries_exactly_these_fields(self):
+        frame = frame_for(make_snapshot())
+        self.assertTrue(frame.has_position)
         payload = frame.payload
-        self.assertEqual(payload["robotId"], "robotx-pi")
+        self.assertEqual(set(payload), {"timestamp", "sequence", "status", "lat", "lon", "speed"})
         self.assertAlmostEqual(payload["lat"], 12.9716)
         self.assertAlmostEqual(payload["lon"], 77.5946)
         self.assertAlmostEqual(payload["speed"], 1.25)
-        self.assertEqual(payload["schemaVersion"], WIRE_SCHEMA_VERSION)
+        # Epoch milliseconds, as an int, from the position's measurement time.
+        self.assertIsInstance(payload["timestamp"], int)
+        self.assertNotIsInstance(payload["timestamp"], bool)
 
-    def test_battery_is_null_never_a_number(self):
-        # There is no battery hardware. A plausible number here would be
-        # indistinguishable from a measurement.
-        frame = build_telemetry_payload(
-            make_snapshot(), robot_id="robotx-pi", max_position_age_s=5.0
-        )
-        self.assertIn("battery", frame.payload)
-        self.assertIsNone(frame.payload["battery"])
+    def test_battery_is_omitted_never_null_or_a_number(self):
+        # No battery hardware: any number would be stored as a measurement.
+        self.assertNotIn("battery", frame_for(make_snapshot()).payload)
 
-    def test_backend_owned_fields_are_never_sent(self):
-        frame = build_telemetry_payload(
-            make_snapshot(), robot_id="robotx-pi", max_position_age_s=5.0
-        )
-        for field in ("isOnline", "socketId", "lastSeenAt", "id", "createdAt", "currentTaskId"):
-            self.assertNotIn(field, frame.payload)
+    def test_identity_and_backend_owned_fields_are_never_sent(self):
+        payload = frame_for(make_snapshot()).payload
+        for field in ("robotId", "isOnline", "socketId", "lastSeenAt", "id", "createdAt",
+                      "currentTaskId"):
+            self.assertNotIn(field, payload)
 
-    def test_no_telemetry_without_a_fix(self):
+    def test_no_position_without_a_fix_but_the_frame_still_goes(self):
         for status in (GPSStatus.NO_FIX, GPSStatus.STALE, GPSStatus.DISCONNECTED,
                        GPSStatus.UNAVAILABLE, GPSStatus.STARTING):
-            frame = build_telemetry_payload(
-                make_snapshot(gps_status=status), robot_id="robotx-pi", max_position_age_s=5.0
-            )
-            self.assertFalse(frame.sendable, status)
-            self.assertIn(status.value, frame.skipped_reason)
+            frame = frame_for(make_snapshot(gps_status=status))
+            self.assertFalse(frame.has_position, status)
+            self.assertEqual(set(frame.payload), {"timestamp", "sequence", "status"}, status)
+            self.assertIn(status.value, frame.position_omitted)
 
-    def test_stale_position_is_refused_not_resent(self):
-        frame = build_telemetry_payload(
-            make_snapshot(position_age_s=30.0), robot_id="robotx-pi", max_position_age_s=5.0
-        )
-        self.assertFalse(frame.sendable)
-        self.assertIn("old", frame.skipped_reason)
+    def test_stale_position_is_omitted_not_restamped(self):
+        frame = frame_for(make_snapshot(position_age_s=30.0))
+        self.assertFalse(frame.has_position)
+        self.assertIn("old", frame.position_omitted)
 
     def test_fresh_position_within_limit_is_sent(self):
-        frame = build_telemetry_payload(
-            make_snapshot(position_age_s=4.0), robot_id="robotx-pi", max_position_age_s=5.0
-        )
-        self.assertTrue(frame.sendable)
+        self.assertTrue(frame_for(make_snapshot(position_age_s=4.0)).has_position)
 
-    def test_unreported_speed_is_null_not_zero(self):
+    def test_a_fix_already_sent_is_not_sent_again(self):
+        snapshot = make_snapshot()
+        frame = frame_for(snapshot, last_position_timestamp=snapshot.position.timestamp)
+        self.assertFalse(frame.has_position)
+
+    def test_unreported_speed_is_omitted_not_zero(self):
         # "Not measured" and "stationary" are different claims.
-        frame = build_telemetry_payload(
-            make_snapshot(speed_mps=None), robot_id="robotx-pi", max_position_age_s=5.0
-        )
-        self.assertIsNone(frame.payload["speed"])
+        self.assertNotIn("speed", frame_for(make_snapshot(speed_mps=None)).payload)
+
+    def test_status_uses_only_backend_values(self):
+        allowed = {"IDLE", "ACTIVE", "PAUSED", "ERROR", "ISSUES", "RETURNING", "CHARGING"}
+        for mode in OperatingMode:
+            self.assertIn(frame_for(make_snapshot(mode=mode)).payload["status"], allowed, mode)
 
     def test_payload_is_json_serializable(self):
-        frame = build_telemetry_payload(
-            make_snapshot(), robot_id="robotx-pi", max_position_age_s=5.0
-        )
-        json.dumps(frame.payload)
+        json.dumps(frame_for(make_snapshot()).payload)
 
 
 class TestStatusPayload(unittest.TestCase):
@@ -242,8 +268,8 @@ class TestStatusPayload(unittest.TestCase):
         self.assertFalse(payload["position"]["isFresh"])
         self.assertGreater(payload["position"]["ageS"], 30.0)
 
-    def test_status_flags_a_provisional_protocol(self):
-        self.assertTrue(self.payload["protocol"]["provisional"])
+    def test_status_names_its_protocol_source(self):
+        self.assertEqual(self.payload["protocol"]["source"], "FALCONAUT")
 
     def test_status_battery_is_null(self):
         self.assertIsNone(self.payload["battery"])
@@ -296,19 +322,8 @@ class TestOtherPayloads(unittest.TestCase):
         payload = build_event_payload(robot_id="r", level=EventLevel.INFO, message="x" * 5000)
         self.assertLessEqual(len(payload["message"]), 500)
 
-    def test_command_result_reports_ack_with_execution_time(self):
-        payload = build_command_result_payload(
-            robot_id="r", command_id="c1", status=CommandStatus.ACK, executed_at=1000.0
-        )
-        self.assertEqual(payload["status"], "ACK")
-        self.assertEqual(payload["commandId"], "c1")
-        self.assertEqual(payload["executedAt"], 1000.0)
-
-    def test_robot_may_not_report_sent(self):
-        # SENT is the backend's own state for "issued". A robot claiming it
-        # would be overwriting the server's record of what it did.
-        with self.assertRaises(ValueError):
-            build_command_result_payload(robot_id="r", command_id="c", status=CommandStatus.SENT)
+    def test_operator_command_ack_is_exactly_the_command_id(self):
+        self.assertEqual(build_command_ack_payload(command_id="c1"), {"commandId": "c1"})
 
 
 class TestCommandParsing(unittest.TestCase):

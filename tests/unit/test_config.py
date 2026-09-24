@@ -8,7 +8,9 @@ from robotx.config.settings import Settings
 class TestSettingsDefaults(unittest.TestCase):
     def test_defaults_do_not_require_environment(self):
         settings = Settings.from_env({})
-        self.assertEqual(settings.robot_id, "robotx-pi")
+        # No default identity: it must equal the commissioned Robot.robotId,
+        # so only configuration can supply it.
+        self.assertEqual(settings.robot_id, "")
         self.assertEqual(settings.gps_port, "/dev/ttyAMA0")
         self.assertEqual(settings.camera_width, 640)
 
@@ -16,6 +18,11 @@ class TestSettingsDefaults(unittest.TestCase):
         settings = Settings.from_env({})
         self.assertIsNone(settings.robot_token)
         self.assertIsNone(settings.google_maps_api_key)
+        self.assertIsNone(settings.command_signing_key)
+
+    def test_signing_key_is_never_exposed(self):
+        settings = Settings.from_env({"ROBOTX_COMMAND_SIGNING_KEY": "k" * 40})
+        self.assertEqual(settings.public_summary()["command_signing_key"], "SET")
 
     def test_backend_link_is_off_by_default(self):
         # The Pi agent must run standalone.

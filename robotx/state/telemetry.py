@@ -1,9 +1,19 @@
 """Telemetry aggregation: one robot snapshot -> one serializable payload.
 
-Telemetry is **local only** at this stage. This module builds the payload and
-nothing more -- it does not know about sockets, HTTP, or any backend. When a
-backend link is added later, it consumes this same payload rather than
-assembling its own, so there is exactly one telemetry schema.
+This is the **Rover's own** telemetry: local, and independent of whether the
+RobotX backend exists or is reachable. It knows nothing about sockets, HTTP or
+any backend, and the backend link deliberately builds its own payload to the
+backend's contract rather than reusing this one -- the Rover's diagnostics and
+a fleet platform's schema are not the same thing and should not be coupled.
+
+Snapshot-only
+-------------
+Every value here comes from the `RobotSnapshot` passed in. This module reads no
+hardware, calls no sensor, and holds no state of its own. That is not a style
+preference: a frame that took most of its fields from a snapshot and then
+reached past it for a live battery read would describe two different instants
+while presenting as one observation. Producers write `RobotState`; consumers
+read a snapshot of it.
 
 Rule: no fabricated values. A quantity this robot cannot measure is reported
 with an explicit `UNAVAILABLE` status and a `null` value. It is never given a
@@ -14,23 +24,10 @@ from __future__ import annotations
 
 from typing import Any, Dict
 
-from robotx.hardware.battery import battery_status
 from robotx.state.robot_state import RobotSnapshot
 
 
 TELEMETRY_SCHEMA_VERSION = 2
-
-
-def battery_telemetry() -> Dict[str, Any]:
-    """Battery block for telemetry.
-
-    Delegates to `robotx.hardware.battery`, which is the single source of
-    truth for what this robot can and cannot measure. There is no battery
-    sensing hardware, so this reports UNAVAILABLE with null values rather
-    than a plausible-looking number.
-    """
-
-    return battery_status()
 
 
 def build_telemetry(snapshot: RobotSnapshot) -> Dict[str, Any]:
@@ -45,9 +42,17 @@ def build_telemetry(snapshot: RobotSnapshot) -> Dict[str, Any]:
         "gps": snapshot.gps.to_dict(),
         "position": None if snapshot.position is None else snapshot.position.to_dict(),
         "navigation": snapshot.navigation.to_dict(),
+        # The assigned task and its progress. Null on a Rover that has never
+        # been given one -- a locally driven route is not a mission, and
+        # inventing a task id for it would make the two indistinguishable.
+        "mission": None if snapshot.mission is None else snapshot.mission.to_dict(),
         "perception": snapshot.perception.summary(),
         "motion_intent": snapshot.motion_intent.to_dict(),
-        "battery": battery_telemetry(),
+        # Why that intent is what it is. A stopped rover looks identical in
+        # `motion_intent` whether navigation had nowhere to go or the safety
+        # gate refused to let it move; this is the field that tells them apart.
+        "safety": snapshot.safety.to_dict(),
+        "battery": snapshot.power.to_dict(),
         "health": snapshot.health.to_dict(),
         "communication": snapshot.communication.to_dict(),
         "last_error": snapshot.last_error,

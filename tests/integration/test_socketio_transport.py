@@ -1,4 +1,4 @@
-"""End-to-end over a REAL Socket.IO transport.
+"""End-to-end over a REAL Socket.IO transport, against the FalconAut contract.
 
 Everything here runs across an actual Engine.IO handshake, an actual WebSocket
 or polling upgrade, and real JSON serialization, against a `socketio.AsyncServer`
@@ -7,16 +7,16 @@ normal `socketio.AsyncClient`.
 
 What this proves, and what it does not
 --------------------------------------
-It proves the Pi's client half works on the wire: the handshake carries the
-credential, a server that refuses it is handled, telemetry arrives as sendable
-JSON, a command round-trips into an acknowledgement, and a dropped connection
-is detected and re-established.
+`ContractServer` below implements the FalconAut robot contract as this
+implementation understands it: an **anonymous** connection, `AUTH` answered
+with `AUTH_SUCCESS`, a silent `disconnect()` when the credential is refused,
+`COMMAND` and a bare `STOP` inbound, `TELEMETRY`, `HEARTBEAT` and
+`COMMAND_ACK` outbound.
 
-It does **not** prove anything about the FalconAut backend. The server here
-speaks the Pi's own PROVISIONAL binding, because the real event names are not
-available in this repository. A passing run means "the transport and the state
-machine are correct", not "the integration is done". Every assertion is
-therefore about the Pi's behaviour, never about a backend contract.
+It proves the Pi's client half satisfies that contract on the wire. It proves
+**nothing about the real FalconAut backend**, which is not reachable from this
+environment and has never been contacted. Every result from this file is
+therefore `PASS-SYNTHETIC`, never `PASS`.
 
 These tests bind a loopback TCP port. They are automated and hardware-free, but
 they are not pure unit tests, which is why they live outside `tests/unit`.
@@ -24,6 +24,8 @@ they are not pure unit tests, which is why they live outside `tests/unit`.
 
 import asyncio
 import logging
+import os
+import tempfile
 import time
 import unittest
 
@@ -31,44 +33,59 @@ import socketio
 from aiohttp import web
 
 from robotx.communication.backend_link import BackendConfig, BackendLink
-from robotx.communication.protocol import BindingSource, ProtocolBinding
+from robotx.communication.protocol import ProtocolBinding
+from robotx.communication.token_store import TokenStore
 from robotx.hardware.gps import GpsFix, GpsReading, GPSStatus
 from robotx.localization.position import Position
-from robotx.state.robot_state import LinkStatus, OperatingMode, RobotState
+from robotx.state.robot_state import BackendLinkStatus as LinkStatus, OperatingMode, RobotState
 
 
-NAMESPACE = "/robot"
-VALID_TOKEN = "integration-test-token"
+# FalconAut's robot handler is on the default namespace.
+NAMESPACE = "/"
+VALID_PAIRING_CODE = "424242"
+ISSUED_TOKEN = "falconaut-session-token"
 ROBOT_ID = "robotx-pi-itest"
 
 
 def setUpModule():
     logging.getLogger("robotx").setLevel(logging.CRITICAL)
-    # The rejection tests make the server refuse a handshake on purpose;
-    # engineio logs that refusal with a full traceback.
     for noisy in ("engineio", "engineio.server", "socketio", "socketio.server", "aiohttp"):
         logging.getLogger(noisy).setLevel(logging.CRITICAL)
 
 
-class RecordingServer:
-    """A Socket.IO server that records what the Pi sent and can issue commands.
+class ContractServer:
+    """A Socket.IO server speaking the FalconAut robot contract.
 
-    It validates the handshake credential so that the rejection path is
-    exercised against a server that genuinely refuses, rather than against a
-    simulated error.
+    Authentication is deliberately modelled the way the contract describes it,
+    including the part that is awkward for a client: a refused credential gets
+    **no error event**, just a server-side disconnect. A test server that
+    politely explained itself would let a bug hide, because the real backend
+    does not.
     """
 
-    def __init__(self, *, require_token=True):
-        self.require_token = require_token
+    def __init__(self, *, accept_pairing_code=VALID_PAIRING_CODE, accept_token=None,
+                 issue_token=ISSUED_TOKEN, refuse_everything=False,
+                 success_event="both"):
+        # The real backend emits BOTH AUTH_SUCCESS and AUTH_OK for one AUTH
+        # (handoff §3); "both" is therefore the default here.
+        self.success_event = success_event
+        self.accept_pairing_code = accept_pairing_code
+        self.accept_token = accept_token
+        self.issue_token = issue_token
+        self.refuse_everything = refuse_everything
+
         self.sio = socketio.AsyncServer(async_mode="aiohttp")
         self.app = web.Application()
         self.sio.attach(self.app)
 
-        self.received = {"robot_hello": [], "telemetry": [], "status": [],
-                         "event": [], "command_ack": []}
-        self.connections = []
-        self.rejections = []
-        self.auths = []
+        self.received = {
+            "TELEMETRY": [], "HEARTBEAT": [], "COMMAND_ACK": [], "OFFER_ACCEPT": [],
+            "OFFER_REJECT": [], "OFFER_DEFER": [], "CUSTODY_EVENT": [], "TASK_COMPLETE": [],
+        }
+        self.auth_payloads = []
+        self.connect_environs = []
+        self.authenticated_sids = []
+        self.refusals = []
         self.sids = []
         self.runner = None
         self.port = None
@@ -78,15 +95,35 @@ class RecordingServer:
     def _install_handlers(self):
         @self.sio.event(namespace=NAMESPACE)
         async def connect(sid, environ, auth=None):
-            self.auths.append(auth)
-            token = (auth or {}).get("token")
-            if self.require_token and token != VALID_TOKEN:
-                self.rejections.append(auth)
-                # The standard server-side refusal: python-socketio turns this
-                # into a client ConnectionError carrying this message.
-                raise ConnectionRefusedError("Unauthorized: invalid token")
-            self.connections.append(sid)
+            # Anonymous: the contract's connection carries no credential, and
+            # this server accepts every socket and waits for AUTH.
+            self.connect_environs.append(environ)
             self.sids.append(sid)
+
+        @self.sio.on("AUTH", namespace=NAMESPACE)
+        async def on_auth(sid, data=None):
+            self.auth_payloads.append(data)
+            payload = data if isinstance(data, dict) else {}
+            code = payload.get("pairingCode")
+            token = payload.get("token")
+
+            ok = not self.refuse_everything and (
+                (code is not None and code == self.accept_pairing_code)
+                or (token is not None and token == self.accept_token)
+            )
+            if not ok:
+                self.refusals.append(payload)
+                # The contract's refusal: disconnect, no reason given.
+                await self.sio.disconnect(sid, namespace=NAMESPACE)
+                return
+
+            self.authenticated_sids.append(sid)
+            body = {"robotId": payload.get("robotId")}
+            if self.issue_token:
+                body["token"] = self.issue_token
+            events = ("AUTH_SUCCESS", "AUTH_OK") if self.success_event == "both" else (self.success_event,)
+            for event in events:
+                await self.sio.emit(event, body, to=sid, namespace=NAMESPACE)
 
         for name in self.received:
             self._record(name)
@@ -113,10 +150,27 @@ class RecordingServer:
         return f"http://127.0.0.1:{self.port}"
 
     async def send_command(self, payload, *, sid=None):
-        await self.sio.emit("command", payload, to=sid or self.sids[-1], namespace=NAMESPACE)
+        await self.sio.emit(
+            "COMMAND", payload, to=sid or self.authenticated_sids[-1], namespace=NAMESPACE
+        )
+
+    async def send_engine(self, envelope, *, sid=None):
+        await self.sio.emit(
+            "command", envelope, to=sid or self.authenticated_sids[-1], namespace=NAMESPACE
+        )
+
+    async def send_task_assign(self, payload, *, sid=None):
+        await self.sio.emit(
+            "TASK_ASSIGN", payload, to=sid or self.authenticated_sids[-1], namespace=NAMESPACE
+        )
+
+    async def send_stop(self, payload=None, *, sid=None):
+        await self.sio.emit(
+            "STOP", payload or {}, to=sid or self.authenticated_sids[-1], namespace=NAMESPACE
+        )
 
     async def kick(self, sid=None):
-        await self.sio.disconnect(sid or self.sids[-1], namespace=NAMESPACE)
+        await self.sio.disconnect(sid or self.authenticated_sids[-1], namespace=NAMESPACE)
 
 
 class FakeAgent:
@@ -143,23 +197,32 @@ class FakeAgent:
     def return_to_base(self, reason=""):
         self.calls.append(("return", reason))
 
+    def assess_offer(self, offer):
+        from robotx.communication.engine import OfferDecision
 
-def state_with_fix():
-    state = RobotState(ROBOT_ID)
+        self.calls.append(("assess", offer.commitment_id))
+        return OfferDecision.reject("NO_MOTOR_LINK")
+
+    def assign_mission(self, mission, custody_required=False):
+        self.calls.append(("assign", mission.task_id))
+
+
+def state_with_fix(robot_id=ROBOT_ID, *, lat=12.9716, lon=77.5946, speed=1.25):
+    state = RobotState(robot_id)
     now = time.time()
     state.update_gps(
         GpsReading(
             status=GPSStatus.FIX,
-            fix=GpsFix(latitude=12.9716, longitude=77.5946, timestamp=now),
+            fix=GpsFix(latitude=lat, longitude=lon, timestamp=now),
             age_s=0.1,
         ),
-        Position(latitude=12.9716, longitude=77.5946, timestamp=now, speed_mps=0.8),
+        Position(latitude=lat, longitude=lon, timestamp=now, speed_mps=speed),
     )
     return state
 
 
-async def wait_for(predicate, timeout=6.0, interval=0.05):
-    """Poll until `predicate()` is true. Returns whether it became true."""
+async def wait_for(predicate, timeout=5.0, interval=0.02):
+    """Poll until `predicate()` is true, or give up. Returns whether it held."""
 
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -169,427 +232,844 @@ async def wait_for(predicate, timeout=6.0, interval=0.05):
     return predicate()
 
 
-class SocketIOTestCase(unittest.TestCase):
-    """Runs one scenario coroutine, guaranteeing server and link teardown."""
+class ContractTestCase(unittest.TestCase):
+    """Runs one coroutine per test with a server and a temp token store."""
 
-    def run_scenario(self, scenario, *, require_token=True, timeout=30.0, **cfg_kwargs):
-        async def runner():
-            server = RecordingServer(require_token=require_token)
+    def run_async(self, coro_factory, **server_kwargs):
+        async def wrapper():
+            server = ContractServer(**server_kwargs)
             await server.start()
-
-            cfg = BackendConfig(
-                enabled=True,
-                server_url=server.url,
-                robot_id=ROBOT_ID,
-                robot_token=cfg_kwargs.pop("robot_token", VALID_TOKEN),
-                binding=cfg_kwargs.pop("binding", ProtocolBinding()),
-                telemetry_interval_s=cfg_kwargs.pop("telemetry_interval_s", 0.2),
-                status_interval_s=cfg_kwargs.pop("status_interval_s", 0.5),
-                backoff_initial_s=cfg_kwargs.pop("backoff_initial_s", 0.1),
-                backoff_max_s=cfg_kwargs.pop("backoff_max_s", 0.4),
-                backoff_rejected_s=cfg_kwargs.pop("backoff_rejected_s", 0.3),
-                **cfg_kwargs,
-            )
-            state = state_with_fix()
-            agent = FakeAgent()
-            link = BackendLink(cfg, state, agent)
-
+            tmp = tempfile.TemporaryDirectory()
             try:
-                return await asyncio.wait_for(
-                    scenario(server, link, agent, state), timeout=timeout
-                )
+                return await coro_factory(server, os.path.join(tmp.name, "session.json"))
             finally:
-                await link.stop()
                 await server.stop()
+                tmp.cleanup()
 
-        return asyncio.run(runner())
+        return asyncio.run(wrapper())
 
-
-class TestHandshakeAndRegistration(SocketIOTestCase):
-    def test_pi_connects_and_registers_over_the_real_wire(self):
-        async def scenario(server, link, agent, state):
-            await link.start()
-            self.assertTrue(await link.wait_connected(8.0), "link never connected")
-            self.assertTrue(await wait_for(lambda: server.received["robot_hello"]))
-            return server.received["robot_hello"][0]
-
-        register = self.run_scenario(scenario)
-        self.assertEqual(register["robotId"], ROBOT_ID)
-        self.assertIs(register["simulated"], False)
-        self.assertIn("capabilities", register)
-
-    def test_credential_reaches_the_server_in_the_handshake(self):
-        async def scenario(server, link, agent, state):
-            await link.start()
-            self.assertTrue(await link.wait_connected(8.0))
-            return server.auths[0]
-
-        auth = self.run_scenario(scenario)
-        self.assertEqual(auth["robotId"], ROBOT_ID)
-        self.assertEqual(auth["token"], VALID_TOKEN)
-
-    def test_state_reports_connected_only_once_it_really_is(self):
-        async def scenario(server, link, agent, state):
-            self.assertIs(state.snapshot().communication.backend, LinkStatus.DISABLED)
-            await link.start()
-            self.assertTrue(await link.wait_connected(8.0))
-            return state.snapshot().communication
-
-        comms = self.run_scenario(scenario)
-        self.assertIs(comms.backend, LinkStatus.CONNECTED)
-        self.assertIsNotNone(comms.backend_last_send_at)
-
-    def test_capabilities_admit_no_battery_and_no_motion(self):
-        async def scenario(server, link, agent, state):
-            await link.start()
-            self.assertTrue(await wait_for(lambda: server.received["robot_hello"], 8.0))
-            return server.received["robot_hello"][0]["capabilities"]
-
-        caps = self.run_scenario(scenario)
-        self.assertFalse(caps["battery"])
-        self.assertFalse(caps["motion"])
-
-
-class TestAuthenticationRejection(SocketIOTestCase):
-    def test_server_refusing_the_token_is_handled_not_crashed(self):
-        async def scenario(server, link, agent, state):
-            await link.start()
-            self.assertFalse(await link.wait_connected(2.0), "should not have connected")
-            # Captured from the poll rather than re-read afterwards: the link
-            # cycles REJECTED -> CONNECTING -> REJECTED as it retries, so a
-            # later read can legitimately catch it mid-attempt.
-            saw_rejected = await wait_for(lambda: link.status is LinkStatus.REJECTED, 5.0)
-            return saw_rejected, link.connected, link._last_connect_error, server.rejections
-
-        saw_rejected, connected, error, rejections = self.run_scenario(
-            scenario, robot_token="wrong-token"
+    def make_link(self, server, token_path, *, state=None, agent=None, **cfg_kwargs):
+        cfg_kwargs.setdefault("pairing_code", VALID_PAIRING_CODE)
+        cfg_kwargs.setdefault("telemetry_interval_s", 0.1)
+        cfg_kwargs.setdefault("auth_timeout_s", 3.0)
+        cfg = BackendConfig(
+            enabled=True,
+            server_url=server.url,
+            robot_id=ROBOT_ID,
+            binding=ProtocolBinding(),
+            **cfg_kwargs,
         )
-        self.assertTrue(saw_rejected, "link never reported REJECTED")
-        self.assertFalse(connected)
-        self.assertGreaterEqual(len(rejections), 1)
-        # The Pi can tell it was refused but NOT why: python-socketio does not
-        # deliver the server's ConnectionRefusedError message to the client,
-        # and the namespace `connect_error` handler is never invoked for a
-        # namespace rejection. The recorded error is the library's generic one.
-        self.assertIn("namespaces failed to connect", error.lower())
+        link = BackendLink(
+            cfg,
+            state if state is not None else state_with_fix(),
+            agent if agent is not None else FakeAgent(),
+            token_store=TokenStore(token_path),
+        )
+        return link
 
-    def test_rejected_link_never_reports_itself_integrated(self):
-        async def scenario(server, link, agent, state):
+
+# --- 1-4: connection and authentication ---------------------------------------
+
+
+class TestConnectionAndAuthentication(ContractTestCase):
+    def test_pi_connects_anonymously_and_authenticates_with_the_pairing_code(self):
+        async def scenario(server, token_path):
+            link = self.make_link(server, token_path)
             await link.start()
-            await wait_for(lambda: link.status is LinkStatus.REJECTED, 5.0)
-            return link.describe()
+            ok = await link.wait_connected(timeout_s=5.0)
+            described = link.describe()
+            await link.stop()
+            return ok, described, server
 
-        described = self.run_scenario(scenario, robot_token="wrong-token")
-        self.assertIs(described["integrated"], False)
-        self.assertNotEqual(described["status"], "CONNECTED")
+        ok, described, server = self.run_async(scenario)
+        self.assertTrue(ok)
+        self.assertEqual(described["auth_method"], "PAIRING_CODE")
+        self.assertEqual(len(server.auth_payloads), 1)
+        self.assertEqual(server.auth_payloads[0]["pairingCode"], VALID_PAIRING_CODE)
+        self.assertEqual(server.auth_payloads[0]["robotId"], ROBOT_ID)
 
-    def test_missing_token_is_refused_by_a_validating_server(self):
-        async def scenario(server, link, agent, state):
+    def test_no_credential_travels_in_the_handshake(self):
+        """The connection is anonymous; the server must see nothing in it."""
+
+        async def scenario(server, token_path):
+            link = self.make_link(server, token_path)
             await link.start()
-            self.assertFalse(await link.wait_connected(2.0))
-            return link.status
+            await link.wait_connected(timeout_s=5.0)
+            await link.stop()
+            return server
 
-        status = self.run_scenario(scenario, robot_token=None)
-        self.assertIsNot(status, LinkStatus.CONNECTED)
+        server = self.run_async(scenario)
+        environ = server.connect_environs[0]
+        query = environ.get("QUERY_STRING", "")
+        self.assertNotIn(VALID_PAIRING_CODE, query)
+        self.assertNotIn("token", query.lower())
 
-
-class TestTelemetryOverTheWire(SocketIOTestCase):
-    def test_telemetry_arrives_as_the_declared_payload(self):
-        async def scenario(server, link, agent, state):
+    def test_client_does_not_look_like_a_browser(self):
+        async def scenario(server, token_path):
+            link = self.make_link(server, token_path)
             await link.start()
-            self.assertTrue(await link.wait_connected(8.0))
-            self.assertTrue(await wait_for(lambda: server.received["telemetry"], 8.0))
-            return server.received["telemetry"][0]
+            await link.wait_connected(timeout_s=5.0)
+            await link.stop()
+            return server
 
-        payload = self.run_scenario(scenario)
-        self.assertEqual(payload["robotId"], ROBOT_ID)
-        self.assertAlmostEqual(payload["lat"], 12.9716)
-        self.assertAlmostEqual(payload["lon"], 77.5946)
-        self.assertIsNone(payload["battery"])
+        server = self.run_async(scenario)
+        environ = server.connect_environs[0]
+        self.assertNotIn("HTTP_ORIGIN", environ)
+        self.assertNotIn("Mozilla", environ.get("HTTP_USER_AGENT", ""))
+        self.assertIn("robotx-pi", environ.get("HTTP_USER_AGENT", ""))
 
-    def test_status_arrives_and_carries_the_operating_mode(self):
-        async def scenario(server, link, agent, state):
+    def test_auth_success_token_is_persisted_to_disk(self):
+        async def scenario(server, token_path):
+            link = self.make_link(server, token_path)
             await link.start()
-            self.assertTrue(await wait_for(lambda: server.received["status"], 8.0))
-            return server.received["status"][0]
+            await link.wait_connected(timeout_s=5.0)
+            await link.stop()
+            return TokenStore(token_path).load(robot_id=ROBOT_ID), token_path
 
-        payload = self.run_scenario(scenario)
-        self.assertEqual(payload["status"], OperatingMode.IDLE.value)
-        self.assertTrue(payload["protocol"]["provisional"])
+        stored, token_path = self.run_async(scenario)
+        self.assertIsNotNone(stored)
+        self.assertEqual(stored.token, ISSUED_TOKEN)
 
-    def test_no_telemetry_is_sent_without_a_position(self):
-        async def scenario(server, link, agent, state):
-            # Replace the fresh fix with an unusable one before connecting.
-            state.update_gps(GpsReading(status=GPSStatus.NO_FIX), None)
+    def test_persisted_token_is_used_instead_of_the_pairing_code(self):
+        async def scenario(server, token_path):
+            # Pre-seed a token the server will accept.
+            TokenStore(token_path).save(robot_id=ROBOT_ID, token="pre-existing")
+            server.accept_token = "pre-existing"
+            link = self.make_link(server, token_path)
             await link.start()
-            self.assertTrue(await link.wait_connected(8.0))
-            # Status still flows, so the backend is not left blind.
-            self.assertTrue(await wait_for(lambda: server.received["status"], 8.0))
-            await asyncio.sleep(1.0)
-            return server.received["telemetry"], link.stats["telemetry_skipped"]
+            ok = await link.wait_connected(timeout_s=5.0)
+            method = link.describe()["auth_method"]
+            await link.stop()
+            return ok, method, server
 
-        telemetry, skipped = self.run_scenario(scenario)
-        self.assertEqual(telemetry, [])
-        self.assertGreater(skipped, 0)
+        ok, method, server = self.run_async(scenario)
+        self.assertTrue(ok)
+        self.assertEqual(method, "TOKEN")
+        self.assertIn("token", server.auth_payloads[0])
+        self.assertNotIn("pairingCode", server.auth_payloads[0])
 
-    def test_telemetry_rate_is_bounded_by_configuration(self):
-        async def scenario(server, link, agent, state):
+    def test_refused_credential_is_reported_as_auth_failed_not_as_a_network_fault(self):
+        async def scenario(server, token_path):
+            link = self.make_link(server, token_path, backoff_auth_failed_s=30.0)
             await link.start()
-            self.assertTrue(await link.wait_connected(8.0))
-            await asyncio.sleep(2.0)
-            return len(server.received["telemetry"])
+            reached = await wait_for(lambda: link.status is LinkStatus.AUTH_FAILED)
+            described = link.describe()
+            await link.stop()
+            return reached, described, server
 
-        # At one frame per second, ~2 s of connected time cannot produce 20.
-        count = self.run_scenario(scenario, telemetry_interval_s=1.0)
-        self.assertLessEqual(count, 5)
-        self.assertGreaterEqual(count, 1)
+        reached, described, server = self.run_async(scenario, refuse_everything=True)
+        self.assertTrue(reached)
+        self.assertGreaterEqual(len(server.refusals), 1)
+        # The transport was never the problem.
+        self.assertEqual(described["stats"]["connect_failures"], 0)
+        self.assertGreaterEqual(described["stats"]["auth_failures"], 1)
 
-
-class TestCommandRoundTrip(SocketIOTestCase):
-    def test_command_is_received_applied_and_acknowledged(self):
-        async def scenario(server, link, agent, state):
+    def test_agent_keeps_running_after_an_auth_failure(self):
+        async def scenario(server, token_path):
+            agent = FakeAgent()
+            link = self.make_link(server, token_path, agent=agent, backoff_auth_failed_s=30.0)
             await link.start()
-            self.assertTrue(await link.wait_connected(8.0))
-            await wait_for(lambda: server.received["robot_hello"], 5.0)
+            await wait_for(lambda: link.status is LinkStatus.AUTH_FAILED)
+            # The link stays alive and the mission is untouched.
+            alive = link._task is not None and not link._task.done()
+            await link.stop()
+            return alive, agent
 
-            await server.send_command({"commandId": "cmd-1", "type": "STOP",
-                                       "robotId": ROBOT_ID})
-            self.assertTrue(await wait_for(lambda: server.received["command_ack"], 8.0))
-            return agent.calls, server.received["command_ack"][0]
+        alive, agent = self.run_async(scenario, refuse_everything=True)
+        self.assertTrue(alive)
+        self.assertEqual(agent.calls, [])
 
-        calls, ack = self.run_scenario(scenario)
-        self.assertEqual(calls[0][0], "stop")
-        self.assertEqual(ack["status"], "ACK")
-        self.assertEqual(ack["commandId"], "cmd-1")
-        self.assertEqual(ack["robotId"], ROBOT_ID)
-        self.assertIsInstance(ack["executedAt"], float)
 
-    def test_unknown_command_is_failed_over_the_wire(self):
-        async def scenario(server, link, agent, state):
+    def test_auth_ok_is_accepted_as_a_success_event(self):
+        """A backend that answers AUTH_OK instead of AUTH_SUCCESS must still
+        authenticate this robot, over a real socket."""
+
+        async def scenario(server, token_path):
+            link = self.make_link(server, token_path)
             await link.start()
-            self.assertTrue(await link.wait_connected(8.0))
-            await server.send_command({"commandId": "cmd-x", "type": "SELF_DESTRUCT"})
-            self.assertTrue(await wait_for(lambda: server.received["command_ack"], 8.0))
-            return agent.calls, server.received["command_ack"][0]
+            ok = await link.wait_connected(timeout_s=5.0)
+            described = link.describe()
+            await link.stop()
+            return ok, described, token_path
 
-        calls, ack = self.run_scenario(scenario)
-        self.assertEqual(calls, [])
-        self.assertEqual(ack["status"], "FAILED")
-        self.assertIn("UNKNOWN_TYPE", ack["reason"])
+        ok, described, token_path = self.run_async(scenario, success_event="AUTH_OK")
+        self.assertTrue(ok)
+        self.assertIs(described["authenticated"], True)
+        self.assertGreaterEqual(described["stats"]["auth_successes"], 1)
 
-    def test_duplicate_command_executes_once_across_the_wire(self):
-        async def scenario(server, link, agent, state):
+    def test_auth_success_and_auth_ok_together_authenticate_once(self):
+        """The real backend sends both; the second must not knock the link
+        out of STREAMING or count as a second authentication."""
+
+        async def scenario(server, token_path):
+            link = self.make_link(server, token_path)
             await link.start()
-            self.assertTrue(await link.wait_connected(8.0))
-            payload = {"commandId": "dup-1", "type": "PAUSE", "robotId": ROBOT_ID}
-            await server.send_command(payload)
-            await wait_for(lambda: len(server.received["command_ack"]) >= 1, 8.0)
-            await server.send_command(payload)
-            await wait_for(lambda: len(server.received["command_ack"]) >= 2, 8.0)
-            return agent.calls, server.received["command_ack"]
+            await link.wait_connected(timeout_s=5.0)
+            await asyncio.sleep(0.3)
+            described = link.describe()
+            await link.stop()
+            return described
 
-        calls, acks = self.run_scenario(scenario)
-        self.assertEqual(len([c for c in calls if c[0] == "pause"]), 1)
-        self.assertEqual(len(acks), 2)
-        self.assertEqual(acks[0]["executedAt"], acks[1]["executedAt"])
+        described = self.run_async(scenario)
+        self.assertTrue(described["streaming"])
+        self.assertEqual(described["stats"]["auth_successes"], 1)
 
-    def test_command_for_another_robot_is_refused_over_the_wire(self):
-        async def scenario(server, link, agent, state):
+
+class TestHeartbeatOverTheWire(ContractTestCase):
+    def test_heartbeat_arrives_on_its_cadence(self):
+        async def scenario(server, token_path):
+            link = self.make_link(server, token_path, heartbeat_interval_s=0.15)
             await link.start()
-            self.assertTrue(await link.wait_connected(8.0))
-            await server.send_command({"commandId": "c", "type": "STOP",
-                                       "robotId": "some-other-robot"})
-            self.assertTrue(await wait_for(lambda: server.received["command_ack"], 8.0))
-            return agent.calls, server.received["command_ack"][0]
+            await link.wait_connected(timeout_s=5.0)
+            await wait_for(lambda: len(server.received["HEARTBEAT"]) >= 3)
+            await link.stop()
+            return server
 
-        calls, ack = self.run_scenario(scenario)
-        self.assertEqual(calls, [])
-        self.assertEqual(ack["status"], "FAILED")
+        server = self.run_async(scenario)
+        self.assertGreaterEqual(len(server.received["HEARTBEAT"]), 3)
 
-    def test_malformed_command_does_not_break_the_next_one(self):
-        async def scenario(server, link, agent, state):
+    def test_heartbeat_arrives_even_with_no_gps_fix(self):
+        """The gap this closes: indoors the robot sends no telemetry at all,
+        and without a heartbeat the backend cannot tell it from a dead one."""
+
+        async def scenario(server, token_path):
+            link = self.make_link(
+                server, token_path, state=RobotState(ROBOT_ID), heartbeat_interval_s=0.15
+            )
             await link.start()
-            self.assertTrue(await link.wait_connected(8.0))
-            await server.send_command("not-an-object")
-            await server.send_command({"commandId": "good", "type": "STOP",
-                                       "robotId": ROBOT_ID})
-            self.assertTrue(await wait_for(lambda: agent.calls, 8.0))
-            return agent.calls
+            await link.wait_connected(timeout_s=5.0)
+            await wait_for(lambda: len(server.received["HEARTBEAT"]) >= 3)
+            described = link.describe()
+            await link.stop()
+            return server, described
 
-        calls = self.run_scenario(scenario)
-        self.assertEqual(calls[0][0], "stop")
+        server, described = self.run_async(scenario)
+        self.assertTrue(all("lat" not in f for f in server.received["TELEMETRY"]))
+        self.assertGreater(described["stats"]["positions_omitted"], 0)
+        self.assertGreaterEqual(len(server.received["HEARTBEAT"]), 3)
 
-
-class TestDisconnectAndReconnect(SocketIOTestCase):
-    def test_server_disconnect_is_detected(self):
-        async def scenario(server, link, agent, state):
+    def test_idle_heartbeat_payload_is_empty(self):
+        async def scenario(server, token_path):
+            link = self.make_link(server, token_path, heartbeat_interval_s=0.15)
             await link.start()
-            self.assertTrue(await link.wait_connected(8.0))
+            await link.wait_connected(timeout_s=5.0)
+            await wait_for(lambda: len(server.received["HEARTBEAT"]) >= 1)
+            await link.stop()
+            return server
+
+        server = self.run_async(scenario)
+        self.assertEqual(server.received["HEARTBEAT"][0], {})
+
+    def test_no_heartbeat_reaches_a_backend_that_refused_us(self):
+        async def scenario(server, token_path):
+            link = self.make_link(server, token_path, backoff_auth_failed_s=30.0,
+                                  heartbeat_interval_s=0.05)
+            await link.start()
+            await wait_for(lambda: link.status is LinkStatus.AUTH_FAILED)
+            await link.stop()
+            return server
+
+        server = self.run_async(scenario, refuse_everything=True)
+        self.assertEqual(server.received["HEARTBEAT"], [])
+
+    def test_heartbeat_resumes_after_a_reconnect(self):
+        async def scenario(server, token_path):
+            link = self.make_link(server, token_path, heartbeat_interval_s=0.15,
+                                  backoff_initial_s=0.05, backoff_max_s=0.2)
+            await link.start()
+            await link.wait_connected(timeout_s=5.0)
+            server.accept_token = ISSUED_TOKEN
+            await wait_for(lambda: len(server.received["HEARTBEAT"]) >= 1)
             await server.kick()
-            detected = await wait_for(lambda: not link.connected, 8.0)
-            return detected, state.snapshot().communication.backend
-
-        detected, backend = self.run_scenario(scenario)
-        self.assertTrue(detected, "link did not notice the server hanging up")
-        self.assertIsNot(backend, LinkStatus.CONNECTED)
-
-    def test_link_reconnects_after_being_dropped(self):
-        async def scenario(server, link, agent, state):
-            await link.start()
-            self.assertTrue(await link.wait_connected(8.0))
-            first = len(server.connections)
-
-            await server.kick()
-            await wait_for(lambda: not link.connected, 8.0)
-
-            reconnected = await wait_for(lambda: len(server.connections) > first, 15.0)
-            return reconnected, link.status, link.stats
-
-        reconnected, status, stats = self.run_scenario(scenario)
-        self.assertTrue(reconnected, "link never reconnected")
-        self.assertIs(status, LinkStatus.CONNECTED)
-        self.assertGreaterEqual(stats["connects"], 2)
-
-    def test_telemetry_resumes_after_a_reconnect(self):
-        async def scenario(server, link, agent, state):
-            await link.start()
-            self.assertTrue(await link.wait_connected(8.0))
-            await wait_for(lambda: server.received["telemetry"], 8.0)
-            await server.kick()
-            await wait_for(lambda: not link.connected, 8.0)
-            before = len(server.received["telemetry"])
-            resumed = await wait_for(lambda: len(server.received["telemetry"]) > before, 15.0)
+            await wait_for(lambda: not link.connected)
+            before = len(server.received["HEARTBEAT"])
+            await wait_for(lambda: link.connected, timeout=8.0)
+            resumed = await wait_for(
+                lambda: len(server.received["HEARTBEAT"]) > before, timeout=5.0
+            )
+            await link.stop()
             return resumed
 
-        self.assertTrue(self.run_scenario(scenario), "telemetry did not resume")
+        self.assertTrue(self.run_async(scenario))
 
-    def test_registration_is_repeated_on_reconnect(self):
-        # The server assigns a new socketId on every connection, so the robot
-        # must re-announce itself rather than assume the old association holds.
-        async def scenario(server, link, agent, state):
+
+# --- 5-9: telemetry -----------------------------------------------------------
+
+
+class TestTelemetryOverTheWire(ContractTestCase):
+    def test_telemetry_arrives_with_the_contract_fields(self):
+        async def scenario(server, token_path):
+            link = self.make_link(server, token_path)
             await link.start()
-            self.assertTrue(await link.wait_connected(8.0))
-            await wait_for(lambda: server.received["robot_hello"], 8.0)
-            await server.kick()
-            await wait_for(lambda: not link.connected, 8.0)
-            repeated = await wait_for(lambda: len(server.received["robot_hello"]) >= 2, 15.0)
-            return repeated
+            await link.wait_connected(timeout_s=5.0)
+            await wait_for(lambda: len(server.received["TELEMETRY"]) >= 1)
+            await link.stop()
+            return server
 
-        self.assertTrue(self.run_scenario(scenario))
+        server = self.run_async(scenario)
+        frame = server.received["TELEMETRY"][0]
+        self.assertEqual(set(frame), {"timestamp", "sequence", "status", "lat", "lon", "speed"})
+        self.assertAlmostEqual(frame["lat"], 12.9716)
+        self.assertAlmostEqual(frame["lon"], 77.5946)
+        self.assertAlmostEqual(frame["speed"], 1.25)
+        self.assertIsInstance(frame["sequence"], int)
 
-    def test_commands_work_again_after_a_reconnect(self):
-        async def scenario(server, link, agent, state):
+    def test_timestamp_is_epoch_milliseconds_measured_by_the_pi(self):
+        """The load-bearing field. Wrong units here are silently wrong data."""
+
+        async def scenario(server, token_path):
+            link = self.make_link(server, token_path)
+            before = int(time.time() * 1000)
             await link.start()
-            self.assertTrue(await link.wait_connected(8.0))
-            await server.kick()
-            await wait_for(lambda: not link.connected, 8.0)
-            self.assertTrue(await wait_for(lambda: link.connected, 15.0))
-            await wait_for(lambda: len(server.sids) >= 2, 5.0)
+            await link.wait_connected(timeout_s=5.0)
+            await wait_for(lambda: len(server.received["TELEMETRY"]) >= 1)
+            await link.stop()
+            return server, before, int(time.time() * 1000)
 
-            await server.send_command({"commandId": "after", "type": "STOP",
-                                       "robotId": ROBOT_ID})
-            self.assertTrue(await wait_for(lambda: agent.calls, 8.0))
-            return agent.calls
+        server, before, after = self.run_async(scenario)
+        ts = server.received["TELEMETRY"][0]["timestamp"]
+        self.assertIsInstance(ts, int)
+        # Inside the window this test ran in, so it is neither seconds
+        # (~1.7e9, far too small) nor a startup constant.
+        self.assertGreaterEqual(ts, before - 60_000)
+        self.assertLessEqual(ts, after + 1_000)
 
-        calls = self.run_scenario(scenario)
-        self.assertEqual(calls[0][0], "stop")
+    def test_every_frame_carries_a_fresh_timestamp(self):
+        """A timestamp captured once at startup and reused would pass a
+        single-frame check and still be wrong."""
+
+        async def scenario(server, token_path):
+            state = state_with_fix()
+            link = self.make_link(server, token_path, state=state, telemetry_interval_s=0.05)
+            await link.start()
+            await link.wait_connected(timeout_s=5.0)
+
+            # Move the robot, which is what advances the measurement time.
+            for _ in range(4):
+                await asyncio.sleep(0.12)
+                now = time.time()
+                state.update_gps(
+                    GpsReading(
+                        status=GPSStatus.FIX,
+                        fix=GpsFix(latitude=1.0, longitude=2.0, timestamp=now),
+                        age_s=0.0,
+                    ),
+                    Position(latitude=1.0, longitude=2.0, timestamp=now, speed_mps=0.4),
+                )
+            await wait_for(lambda: len(server.received["TELEMETRY"]) >= 3)
+            await link.stop()
+            return server
+
+        server = self.run_async(scenario)
+        stamps = [f["timestamp"] for f in server.received["TELEMETRY"] if "lat" in f]
+        self.assertGreater(len(set(stamps)), 1, f"timestamps never advanced: {stamps}")
+        self.assertEqual(stamps, sorted(stamps))
+        # One fix is one observation: never sent twice.
+        self.assertEqual(len(stamps), len(set(stamps)))
+        sequences = [f["sequence"] for f in server.received["TELEMETRY"]]
+        self.assertEqual(sequences, sorted(set(sequences)), "sequence must strictly increase")
+
+    def test_battery_is_omitted_never_invented(self):
+        async def scenario(server, token_path):
+            link = self.make_link(server, token_path)
+            await link.start()
+            await link.wait_connected(timeout_s=5.0)
+            await wait_for(lambda: len(server.received["TELEMETRY"]) >= 1)
+            await link.stop()
+            return server
+
+        server = self.run_async(scenario)
+        self.assertTrue(server.received["TELEMETRY"])
+        for frame in server.received["TELEMETRY"]:
+            self.assertNotIn("battery", frame)
+
+    def test_no_position_is_sent_without_a_usable_fix(self):
+        async def scenario(server, token_path):
+            state = RobotState(ROBOT_ID)  # no fix at all
+            link = self.make_link(server, token_path, state=state)
+            await link.start()
+            await link.wait_connected(timeout_s=5.0)
+            await asyncio.sleep(0.4)
+            described = link.describe()
+            await link.stop()
+            return server, described
+
+        server, described = self.run_async(scenario)
+        self.assertTrue(server.received["TELEMETRY"])
+        for frame in server.received["TELEMETRY"]:
+            self.assertEqual(set(frame), {"timestamp", "sequence", "status"})
+        self.assertGreater(described["stats"]["positions_omitted"], 0)
+        # The robot is still online; it simply has nothing truthful to report.
+        self.assertGreaterEqual(described["stats"]["auth_successes"], 1)
+
+    def test_no_telemetry_is_sent_before_authentication(self):
+        async def scenario(server, token_path):
+            link = self.make_link(server, token_path, backoff_auth_failed_s=30.0)
+            await link.start()
+            await wait_for(lambda: link.status is LinkStatus.AUTH_FAILED)
+            await link.stop()
+            return server
+
+        server = self.run_async(scenario, refuse_everything=True)
+        self.assertEqual(server.received["TELEMETRY"], [])
+
+    def test_telemetry_rate_is_bounded_by_configuration(self):
+        async def scenario(server, token_path):
+            link = self.make_link(server, token_path, telemetry_interval_s=0.3)
+            await link.start()
+            await link.wait_connected(timeout_s=5.0)
+            await asyncio.sleep(1.0)
+            await link.stop()
+            return server
+
+        server = self.run_async(scenario)
+        # ~1 s at 0.3 s intervals: a handful, not a flood.
+        self.assertLessEqual(len(server.received["TELEMETRY"]), 6)
 
 
-class TestBackendUnavailable(SocketIOTestCase):
-    def test_link_keeps_retrying_when_nothing_is_listening(self):
-        async def scenario():
-            cfg = BackendConfig(
-                enabled=True,
-                # Port 1 on loopback: nothing will ever answer.
-                server_url="http://127.0.0.1:1",
-                robot_id=ROBOT_ID,
-                robot_token=VALID_TOKEN,
-                backoff_initial_s=0.05,
-                backoff_max_s=0.2,
+# --- 10-15: commands ----------------------------------------------------------
+
+
+class TestCommandsOverTheWire(ContractTestCase):
+    def _run_command(self, command_type, agent_mode=OperatingMode.AUTO, payload=None):
+        async def scenario(server, token_path):
+            agent = FakeAgent(mode=agent_mode)
+            link = self.make_link(server, token_path, agent=agent)
+            await link.start()
+            await link.wait_connected(timeout_s=5.0)
+            await server.send_command(
+                payload or {"commandId": "c-1", "type": command_type,
+                            "timestamp": int(time.time() * 1000)}
             )
+            await wait_for(lambda: len(server.received["COMMAND_ACK"]) >= 1, timeout=1.0)
+            await link.stop()
+            return server, agent
+
+        return self.run_async(scenario)
+
+    def test_ack_is_a_separate_event_named_command_ack(self):
+        """The contract requires an emitted COMMAND_ACK event, never a
+        Socket.IO callback acknowledgement."""
+
+        server, _ = self._run_command("STOP")
+        self.assertEqual(len(server.received["COMMAND_ACK"]), 1)
+        self.assertEqual(server.received["COMMAND_ACK"][0]["commandId"], "c-1")
+
+    def test_stop_is_applied_and_acknowledged(self):
+        server, agent = self._run_command("STOP")
+        self.assertEqual([c[0] for c in agent.calls], ["stop"])
+        self.assertEqual(server.received["COMMAND_ACK"], [{"commandId": "c-1"}])
+
+    def test_pause_is_applied_and_acknowledged(self):
+        server, agent = self._run_command("PAUSE")
+        self.assertEqual([c[0] for c in agent.calls], ["pause"])
+        self.assertEqual(server.received["COMMAND_ACK"], [{"commandId": "c-1"}])
+
+    def test_resume_is_applied_from_paused(self):
+        server, agent = self._run_command("RESUME", agent_mode=OperatingMode.PAUSED)
+        self.assertEqual([c[0] for c in agent.calls], ["resume"])
+        self.assertEqual(server.received["COMMAND_ACK"], [{"commandId": "c-1"}])
+
+    def test_resume_from_a_stopped_mission_is_refused_and_not_acked(self):
+        # No FAILED form exists: left unacknowledged, the backend marks it FAILED.
+        server, agent = self._run_command("RESUME", agent_mode=OperatingMode.STOPPED)
+        self.assertEqual(agent.calls, [])
+        self.assertEqual(server.received["COMMAND_ACK"], [])
+
+    def test_return_is_applied_and_acknowledged(self):
+        server, agent = self._run_command("RETURN")
+        self.assertEqual([c[0] for c in agent.calls], ["return"])
+        self.assertEqual(server.received["COMMAND_ACK"], [{"commandId": "c-1"}])
+
+    def test_bare_stop_event_cancels_the_task(self):
+        async def scenario(server, token_path):
+            agent = FakeAgent()
+            link = self.make_link(server, token_path, agent=agent)
+            await link.start()
+            await link.wait_connected(timeout_s=5.0)
+            await server.send_stop({"taskId": "task-9", "reason": "TASK_CANCELLED",
+                                    "timestamp": int(time.time() * 1000)})
+            await wait_for(lambda: agent.calls, timeout=2.0)
+            await asyncio.sleep(0.2)
+            await link.stop()
+            return server, agent
+
+        server, agent = self.run_async(scenario)
+        self.assertEqual([c[0] for c in agent.calls], ["stop"])
+        # The bare STOP expects no acknowledgement (handoff §14).
+        self.assertEqual(server.received["COMMAND_ACK"], [])
+
+    def test_duplicate_command_id_executes_once_and_acks_identically(self):
+        """The backend redispatches at roughly 5 s, 10 s and 15 s."""
+
+        async def scenario(server, token_path):
+            agent = FakeAgent()
+            link = self.make_link(server, token_path, agent=agent)
+            await link.start()
+            await link.wait_connected(timeout_s=5.0)
+            command = {"commandId": "dup-1", "type": "STOP", "robotId": ROBOT_ID}
+            for _ in range(3):
+                await server.send_command(command)
+                await asyncio.sleep(0.1)
+            await wait_for(lambda: len(server.received["COMMAND_ACK"]) >= 3)
+            described = link.describe()
+            await link.stop()
+            return server, agent, described
+
+        server, agent, described = self.run_async(scenario)
+        # Executed exactly once...
+        self.assertEqual([c[0] for c in agent.calls], ["stop"])
+        # ...acknowledged every time, with an unchanging result.
+        acks = server.received["COMMAND_ACK"]
+        self.assertGreaterEqual(len(acks), 3)
+        self.assertEqual(acks, [{"commandId": "dup-1"}] * len(acks))
+        self.assertGreaterEqual(described["stats"]["commands_duplicate"], 2)
+
+    def test_duplicate_bare_stop_for_one_task_executes_once(self):
+        async def scenario(server, token_path):
+            agent = FakeAgent()
+            link = self.make_link(server, token_path, agent=agent)
+            await link.start()
+            await link.wait_connected(timeout_s=5.0)
+            for _ in range(3):
+                await server.send_stop({"taskId": "task-9"})
+                await asyncio.sleep(0.1)
+            await asyncio.sleep(0.2)
+            await link.stop()
+            return agent
+
+        agent = self.run_async(scenario)
+        self.assertEqual([c[0] for c in agent.calls], ["stop"])
+
+    def test_unknown_command_type_is_never_acked_or_executed(self):
+        server, agent = self._run_command(
+            "MOVE", payload={"commandId": "c-x", "type": "MOVE", "robotId": ROBOT_ID}
+        )
+        self.assertEqual(agent.calls, [])
+        self.assertEqual(server.received["COMMAND_ACK"], [])
+
+    def test_command_for_another_robot_is_refused(self):
+        server, agent = self._run_command(
+            "STOP", payload={"commandId": "c-y", "type": "STOP", "robotId": "some-other-robot"}
+        )
+        self.assertEqual(agent.calls, [])
+        # Not even a FAILED: that commandId is another robot's Command row.
+        self.assertEqual(server.received.get("COMMAND_ACK", []), [])
+
+    def test_malformed_commands_do_not_break_the_next_one(self):
+        async def scenario(server, token_path):
+            agent = FakeAgent()
+            link = self.make_link(server, token_path, agent=agent)
+            await link.start()
+            await link.wait_connected(timeout_s=5.0)
+
+            for junk in (
+                "not-an-object",
+                12345,
+                [],
+                {},
+                {"type": "STOP"},                      # no commandId
+                {"commandId": "z", "type": None},
+                {"commandId": "z2", "type": {"nested": "object"}},
+            ):
+                await server.send_command(junk)
+                await asyncio.sleep(0.05)
+
+            # The link is still healthy and still obeys a good command.
+            await server.send_command(
+                {"commandId": "good-1", "type": "STOP", "robotId": ROBOT_ID}
+            )
+            await wait_for(lambda: any(
+                a.get("commandId") == "good-1" for a in server.received["COMMAND_ACK"]
+            ))
+            described = link.describe()
+            await link.stop()
+            return server, agent, described
+
+        server, agent, described = self.run_async(scenario)
+        self.assertEqual([c[0] for c in agent.calls], ["stop"])
+        self.assertEqual(server.received["COMMAND_ACK"], [{"commandId": "good-1"}])
+        self.assertGreater(described["stats"]["commands_rejected"], 0)
+        self.assertIs(described["status"], described["status"])  # link survived
+
+
+# --- engine envelopes over the wire -----------------------------------------
+
+
+class TestEngineOverTheWire(ContractTestCase):
+    """SIMULATED signed envelopes (tests.fixtures.engine) over a real socket."""
+
+    def test_offer_on_the_lowercase_command_event_is_acked_then_answered_once(self):
+        from tests.fixtures import engine as fx
+
+        async def scenario(server, token_path):
+            agent = FakeAgent()
+            link = self.make_link(server, token_path, agent=agent,
+                                  command_signing_key=fx.TEST_SIGNING_KEY)
+            await link.start()
+            await link.wait_connected(timeout_s=5.0)
+            env = fx.envelope(agent_id=ROBOT_ID)
+            await server.send_engine(env)
+            await server.send_engine(env)  # redelivery
+            await wait_for(lambda: len(server.received["COMMAND_ACK"]) >= 2)
+            await asyncio.sleep(0.2)
+            await link.stop()
+            return server, agent
+
+        server, agent = self.run_async(scenario)
+        self.assertEqual(server.received["COMMAND_ACK"][0],
+                         {"outboxId": "ob-19", "fence": "42", "authorityEpoch": None})
+        # The FakeAgent declines, exactly once; never an automatic accept.
+        self.assertEqual(server.received["OFFER_REJECT"],
+                         [{"commitmentId": "c-7f3a", "fence": "42", "reason": "NO_MOTOR_LINK"}])
+        self.assertEqual(server.received["OFFER_ACCEPT"], [])
+
+    def test_task_assign_over_the_wire_gets_no_reply_and_starts_nothing(self):
+        from tests.fixtures.task_assign import task_assign_payload
+
+        async def scenario(server, token_path):
+            agent = FakeAgent(mode=OperatingMode.IDLE)
+            link = self.make_link(server, token_path, agent=agent)
+            await link.start()
+            await link.wait_connected(timeout_s=5.0)
+            await server.send_task_assign(task_assign_payload(task_id="T-1"))
+            await wait_for(lambda: link.stats["tasks_received"] >= 1)
+            await link.stop()
+            return server, agent
+
+        server, agent = self.run_async(scenario)
+        self.assertEqual(agent.calls, [])
+        self.assertEqual(server.received["COMMAND_ACK"], [])
+
+
+# --- 16-20: disconnect, reconnect, shutdown -----------------------------------
+
+
+class TestDisconnectAndReconnect(ContractTestCase):
+    def test_server_disconnect_is_detected_during_streaming(self):
+        async def scenario(server, token_path):
+            link = self.make_link(server, token_path)
+            await link.start()
+            await link.wait_connected(timeout_s=5.0)
+            await wait_for(lambda: len(server.received["TELEMETRY"]) >= 1)
+            await server.kick()
+            dropped = await wait_for(lambda: not link.connected)
+            await link.stop()
+            return dropped
+
+        self.assertTrue(self.run_async(scenario))
+
+    def test_link_reconnects_and_reauthenticates_after_a_drop(self):
+        async def scenario(server, token_path):
+            link = self.make_link(server, token_path, backoff_initial_s=0.05, backoff_max_s=0.2)
+            await link.start()
+            await link.wait_connected(timeout_s=5.0)
+            # The server will accept the token it just issued.
+            server.accept_token = ISSUED_TOKEN
+            first_auths = len(server.auth_payloads)
+            await server.kick()
+            await wait_for(lambda: not link.connected)
+            back = await wait_for(lambda: link.connected, timeout=8.0)
+            described = link.describe()
+            await link.stop()
+            return back, described, server, first_auths
+
+        back, described, server, first_auths = self.run_async(scenario)
+        self.assertTrue(back)
+        self.assertGreater(len(server.auth_payloads), first_auths)
+        self.assertGreaterEqual(described["stats"]["auth_successes"], 2)
+
+    def test_telemetry_resumes_after_a_reconnect(self):
+        async def scenario(server, token_path):
+            link = self.make_link(server, token_path, backoff_initial_s=0.05, backoff_max_s=0.2)
+            await link.start()
+            await link.wait_connected(timeout_s=5.0)
+            server.accept_token = ISSUED_TOKEN
+            await wait_for(lambda: len(server.received["TELEMETRY"]) >= 1)
+            await server.kick()
+            await wait_for(lambda: not link.connected)
+            before = len(server.received["TELEMETRY"])
+            await wait_for(lambda: link.connected, timeout=8.0)
+            resumed = await wait_for(
+                lambda: len(server.received["TELEMETRY"]) > before, timeout=5.0
+            )
+            await link.stop()
+            return resumed
+
+        self.assertTrue(self.run_async(scenario))
+
+    def test_commands_still_work_after_a_reconnect(self):
+        async def scenario(server, token_path):
+            agent = FakeAgent()
+            link = self.make_link(
+                server, token_path, agent=agent, backoff_initial_s=0.05, backoff_max_s=0.2
+            )
+            await link.start()
+            await link.wait_connected(timeout_s=5.0)
+            server.accept_token = ISSUED_TOKEN
+            await server.kick()
+            await wait_for(lambda: not link.connected)
+            await wait_for(lambda: link.connected, timeout=8.0)
+
+            await server.send_command(
+                {"commandId": "after-reconnect", "type": "PAUSE", "robotId": ROBOT_ID}
+            )
+            got = await wait_for(lambda: any(
+                a.get("commandId") == "after-reconnect" for a in server.received["COMMAND_ACK"]
+            ), timeout=5.0)
+            await link.stop()
+            return got, agent
+
+        got, agent = self.run_async(scenario)
+        self.assertTrue(got)
+        self.assertIn("pause", [c[0] for c in agent.calls])
+
+    def test_listeners_are_not_duplicated_across_reconnects(self):
+        """A duplicated COMMAND listener would execute the operator's command
+        twice. This is the assertion that catches it."""
+
+        async def scenario(server, token_path):
+            agent = FakeAgent()
+            link = self.make_link(
+                server, token_path, agent=agent, backoff_initial_s=0.05, backoff_max_s=0.2
+            )
+            await link.start()
+            await link.wait_connected(timeout_s=5.0)
+            server.accept_token = ISSUED_TOKEN
+
+            for _ in range(3):
+                await server.kick()
+                await wait_for(lambda: not link.connected)
+                await wait_for(lambda: link.connected, timeout=8.0)
+
+            await server.send_command(
+                {"commandId": "once-only", "type": "STOP", "robotId": ROBOT_ID}
+            )
+            await wait_for(lambda: len(server.received["COMMAND_ACK"]) >= 1)
+            await asyncio.sleep(0.3)
+            described = link.describe()
+            await link.stop()
+            return described, agent, server
+
+        described, agent, server = self.run_async(scenario)
+        self.assertEqual(described["handler_registrations"], 1)
+        # One command, one execution, one acknowledgement.
+        self.assertEqual([c[0] for c in agent.calls], ["stop"])
+        acks = [a for a in server.received["COMMAND_ACK"] if a["commandId"] == "once-only"]
+        self.assertEqual(len(acks), 1)
+
+
+class TestBackendUnavailable(ContractTestCase):
+    def test_agent_survives_a_backend_that_is_down_at_startup(self):
+        async def scenario():
             state = state_with_fix()
             agent = FakeAgent()
-            link = BackendLink(cfg, state, agent)
-            try:
-                await link.start()
-                self.assertFalse(await link.wait_connected(1.0))
-                await wait_for(lambda: link.stats["connect_failures"] >= 2, 6.0)
-                return link.stats["connect_failures"], link.status, agent.calls
-            finally:
-                await link.stop()
-
-        failures, status, calls = asyncio.run(asyncio.wait_for(scenario(), 25.0))
-        self.assertGreaterEqual(failures, 2)
-        self.assertIsNot(status, LinkStatus.CONNECTED)
-        # A backend that was never reachable must not have touched the mission.
-        self.assertEqual(calls, [])
-
-    def test_link_connects_once_the_backend_appears(self):
-        # Backend unavailable at boot, then started: the Pi must find it
-        # without being restarted.
-        async def scenario():
-            server = RecordingServer(require_token=True)
-            await server.start()
-            port = server.port
-            await server.stop()  # free the port; the Pi will fail to connect
-
             cfg = BackendConfig(
                 enabled=True,
-                server_url=f"http://127.0.0.1:{port}",
+                # Port 1 is reliably closed: ECONNREFUSED, not a refused login.
+                server_url="http://127.0.0.1:1",
                 robot_id=ROBOT_ID,
-                robot_token=VALID_TOKEN,
-                backoff_initial_s=0.1,
-                backoff_max_s=0.5,
+                pairing_code=VALID_PAIRING_CODE,
+                backoff_initial_s=0.05,
+                backoff_max_s=0.1,
+                loss_grace_s=30.0,
             )
-            link = BackendLink(cfg, state_with_fix(), FakeAgent())
-            later = RecordingServer(require_token=True)
-            try:
+            with tempfile.TemporaryDirectory() as tmp:
+                link = BackendLink(
+                    cfg, state, agent,
+                    token_store=TokenStore(os.path.join(tmp, "s.json")),
+                )
                 await link.start()
-                await wait_for(lambda: link.stats["connect_failures"] >= 1, 6.0)
-
-                # Bring a server up on the same port the Pi keeps retrying.
-                later.app = web.Application()
-                later.sio.attach(later.app)
-                later.runner = web.AppRunner(later.app)
-                await later.runner.setup()
-                site = web.TCPSite(later.runner, "127.0.0.1", port)
-                await site.start()
-                later.port = port
-
-                return await wait_for(lambda: link.connected, 15.0)
-            finally:
+                await asyncio.sleep(0.6)
+                described = link.describe()
                 await link.stop()
-                await later.stop()
+            return described, agent
 
-        self.assertTrue(asyncio.run(asyncio.wait_for(scenario(), 40.0)),
-                        "link did not connect after the backend came up")
+        described, agent = asyncio.run(scenario())
+        self.assertGreater(described["stats"]["connect_failures"], 0)
+        # Crucially: a dead backend is never mistaken for a refused credential.
+        self.assertEqual(described["stats"]["auth_failures"], 0)
+        self.assertEqual(described["status"], LinkStatus.DISCONNECTED.value)
+        # The mission was not touched.
+        self.assertEqual(agent.calls, [])
+
+    def test_link_connects_once_the_backend_appears(self):
+        async def scenario():
+            server = ContractServer()
+            # Bind a port, learn its number, then free it so nothing is
+            # listening when the link starts.
+            await server.start()
+            port = server.port
+            await server.stop()
+
+            with tempfile.TemporaryDirectory() as tmp:
+                cfg = BackendConfig(
+                    enabled=True,
+                    server_url=f"http://127.0.0.1:{port}",
+                    robot_id=ROBOT_ID,
+                    pairing_code=VALID_PAIRING_CODE,
+                    telemetry_interval_s=0.1,
+                    backoff_initial_s=0.05,
+                    backoff_max_s=0.2,
+                )
+                link = BackendLink(
+                    cfg, state_with_fix(), FakeAgent(),
+                    token_store=TokenStore(os.path.join(tmp, "s.json")),
+                )
+                await link.start()
+                await asyncio.sleep(0.4)
+                down_status = link.status
+
+                # The backend comes up on the same port. No restart of the Pi.
+                later = ContractServer()
+                later_app_runner = web.AppRunner(later.app)
+                await later_app_runner.setup()
+                site = web.TCPSite(later_app_runner, "127.0.0.1", port)
+                await site.start()
+                try:
+                    came_up = await wait_for(lambda: link.connected, timeout=10.0)
+                    got_telemetry = await wait_for(
+                        lambda: len(later.received["TELEMETRY"]) >= 1, timeout=5.0
+                    )
+                finally:
+                    await link.stop()
+                    await later_app_runner.cleanup()
+            return down_status, came_up, got_telemetry
+
+        down_status, came_up, got_telemetry = asyncio.run(scenario())
+        self.assertIs(down_status, LinkStatus.DISCONNECTED)
+        self.assertTrue(came_up)
+        self.assertTrue(got_telemetry)
 
 
-class TestIntegrationClaims(SocketIOTestCase):
-    def test_a_working_transport_is_still_not_reported_as_integrated(self):
-        # The whole point: everything below works, and the link still refuses
-        # to claim integration, because the event names are guesses.
-        async def scenario(server, link, agent, state):
+class TestCleanShutdown(ContractTestCase):
+    def test_stop_closes_the_socket_and_leaves_no_task_running(self):
+        async def scenario(server, token_path):
+            link = self.make_link(server, token_path)
             await link.start()
-            self.assertTrue(await link.wait_connected(8.0))
-            await wait_for(lambda: server.received["telemetry"], 8.0)
-            return link.describe()
+            await link.wait_connected(timeout_s=5.0)
+            await link.stop()
+            await asyncio.sleep(0.1)
+            return link
 
-        described = self.run_scenario(scenario)
-        self.assertEqual(described["status"], "CONNECTED")
-        self.assertTrue(described["stats"]["telemetry_sent"] >= 1)
-        self.assertIs(described["integrated"], False)
+        link = self.run_async(scenario)
+        self.assertIsNone(link._task)
+        self.assertFalse(link.connected)
+        self.assertEqual(link.status, LinkStatus.DISCONNECTED)
 
-    def test_a_declared_binding_over_a_live_socket_is_reported_integrated(self):
-        async def scenario(server, link, agent, state):
-            await link.start()
-            self.assertTrue(await link.wait_connected(8.0))
-            return link.describe()
+    def test_stop_is_safe_when_the_link_never_connected(self):
+        async def scenario():
+            with tempfile.TemporaryDirectory() as tmp:
+                cfg = BackendConfig(enabled=False, robot_id=ROBOT_ID)
+                link = BackendLink(
+                    cfg, state_with_fix(), FakeAgent(),
+                    token_store=TokenStore(os.path.join(tmp, "s.json")),
+                )
+                await link.stop()
+            return link
 
-        described = self.run_scenario(
-            scenario, binding=ProtocolBinding(source=BindingSource.FILE)
-        )
-        self.assertIs(described["integrated"], True)
+        link = asyncio.run(scenario())
+        self.assertEqual(link.status, LinkStatus.DISABLED)
 
 
 if __name__ == "__main__":
