@@ -55,5 +55,8 @@ def build_telemetry(snapshot: RobotSnapshot) -> Dict[str, Any]:
         "battery": snapshot.power.to_dict(),
         "health": snapshot.health.to_dict(),
         "communication": snapshot.communication.to_dict(),
+        # What the ESP32 reports, as reported; null with no ESP32 link. DIAG is
+        # deliberately not here -- it is diagnostics, served from the snapshot.
+        "controller": None if snapshot.controller is None else snapshot.controller.to_dict(),
         "last_error": snapshot.last_error,
     }

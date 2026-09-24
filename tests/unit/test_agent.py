@@ -261,7 +261,9 @@ class TestTelemetryAndHealth(AgentTestCase):
         agent = self.make_agent()
         asyncio.run(self._start_then_stop(agent))
         comms = agent.state.snapshot().communication
-        self.assertIs(comms.esp32, Esp32LinkStatus.NOT_IMPLEMENTED)
+        # The ESP32 link exists now; with ROBOTX_ESP32_ENABLED unset it is off.
+        self.assertIs(comms.esp32, Esp32LinkStatus.DISABLED)
+        self.assertIsNone(agent.esp32)
         self.assertIs(comms.backend, LinkStatus.DISABLED)
 
     async def _start_then_stop(self, agent):

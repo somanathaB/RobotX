@@ -4,10 +4,12 @@ Every subsystem writes its result here once per tick, and every reader
 (telemetry, the HTTP API, health) reads from here. No subsystem keeps its own
 parallel copy of the robot's mode, position, or intent.
 
-It holds only what the Pi can actually know. There is no battery percentage,
-no wheel odometry and no motor feedback, because in the target architecture the
-Pi does not own those sensors -- the ESP32 does, and the link to it does not
-exist yet. Those fields are absent rather than filled with placeholder numbers.
+It holds only what the Pi can actually know. The ESP32 owns the motor and
+range sensors; what it reports arrives through `robotx.esp32` and is held here
+as `controller` (operational TELEMETRY) and `controller_diag` (DIAG), exactly as
+reported. There is no battery percentage and no wheel odometry, because the
+ESP32 protocol does not carry them; those fields are absent rather than filled
+with placeholder numbers.
 """
 
 from __future__ import annotations
@@ -22,6 +24,9 @@ from robotx.control.motion import MotionIntent
 from robotx.control.safety import UNEVALUATED, SafetyDecision
 from robotx.hardware.battery import BATTERY_UNAVAILABLE_REASON
 from robotx.diagnostics.health import HealthReport, HealthStatus
+# Esp32LinkStatus is defined beside the link that produces it and re-exported
+# here, where every consumer has always imported it from.
+from robotx.esp32.state import ControllerDiag, ControllerState, Esp32LinkStatus  # noqa: F401
 from robotx.hardware.gps import GpsReading, GPSStatus
 from robotx.mission.mission import ActiveMission
 from robotx.navigation.navigator import NavigationState
@@ -116,34 +121,6 @@ class BackendLinkStatus(str, Enum):
             BackendLinkStatus.AUTHENTICATED,
             BackendLinkStatus.STREAMING,
         )
-
-
-class Esp32LinkStatus(str, Enum):
-    """State of the Pi's link to the ESP32 motor/sensor controller.
-
-    Deliberately limited to what can be established **without knowing the UART
-    protocol**. Opening a serial port, having bytes arrive, and timing how long
-    since the last byte are all observable whatever the framing turns out to
-    be. Anything finer -- whether a frame parsed, whether the ESP32 is healthy,
-    what its failsafe is doing -- requires the firmware contract and is
-    deliberately absent until that contract exists.
-
-    `NOT_IMPLEMENTED` is the value today: no transport code exists at all. It
-    is distinct from `DISABLED` (a link that exists but was switched off) and
-    from `DISCONNECTED` (a link that exists, is wanted, and is not up), because
-    a robot with no ESP32 code is not the same as one whose ESP32 has failed.
-    """
-
-    NOT_IMPLEMENTED = "NOT_IMPLEMENTED"  # planned; no transport code exists yet
-    DISABLED = "DISABLED"                # switched off by configuration
-    DISCONNECTED = "DISCONNECTED"        # port not open
-    CONNECTING = "CONNECTING"            # opening the port
-    UP = "UP"                            # port open, data arriving
-    STALE = "STALE"                      # port open, nothing received recently
-
-    @property
-    def is_up(self) -> bool:
-        return self is Esp32LinkStatus.UP
 
 
 @dataclass(frozen=True)
@@ -277,6 +254,10 @@ class RobotSnapshot:
     # missions -- a Rover driving a locally supplied route has none.
     mission: Optional[ActiveMission] = None
     last_error: Optional[str] = None
+    # What the ESP32 reports, as reported. None until an ESP32 link exists and
+    # has something to say. DIAG is kept separate from the operational block.
+    controller: Optional[ControllerState] = None
+    controller_diag: Optional[ControllerDiag] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -294,6 +275,10 @@ class RobotSnapshot:
             "safety": self.safety.to_dict(),
             "power": self.power.to_dict(),
             "communication": self.communication.to_dict(),
+            "controller": None if self.controller is None else self.controller.to_dict(),
+            "controller_diag": None
+            if self.controller_diag is None
+            else self.controller_diag.to_dict(),
             "health": self.health.to_dict(),
             "last_error": self.last_error,
         }
@@ -323,6 +308,8 @@ class RobotState:
         self._power = PowerState()
         self._communication = CommunicationState()
         self._health = HealthReport(status=HealthStatus.UNKNOWN)
+        self._controller: Optional[ControllerState] = None
+        self._controller_diag: Optional[ControllerDiag] = None
         self._last_error: Optional[str] = None
         self._updated_at = self._started_at
 
@@ -437,6 +424,16 @@ class RobotState:
             self._communication = replace(self._communication, **changes)
             self._updated_at = time.time()
 
+    def update_controller(
+        self, controller: Optional[ControllerState], diag: Optional[ControllerDiag]
+    ) -> None:
+        """Record what the ESP32 reported. Written by the agent from the link."""
+
+        with self._lock:
+            self._controller = controller
+            self._controller_diag = diag
+            self._updated_at = time.time()
+
     # --- reads ---------------------------------------------------------------
 
     def snapshot(self) -> RobotSnapshot:
@@ -459,4 +456,6 @@ class RobotState:
                 communication=self._communication,
                 health=self._health,
                 last_error=self._last_error,
+                controller=self._controller,
+                controller_diag=self._controller_diag,
             )

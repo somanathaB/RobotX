@@ -236,20 +236,52 @@ Endpoints are unauthenticated: local trusted network only.
 
 ## 4. Where the ESP32 attaches
 
-The seam is `MotionIntent`. A transport would:
+`robotx/esp32/` is the Pi side of the UART link, protocol v2 as specified in
+`PROTOCOL.md` (framing `PAYLOAD*CRC4\n`, CRC-16/CCITT-FALSE, 115200 8N1 on
+`/dev/ttyAMA0`). It is its own boundary, separate from `communication/`.
 
-1. Read `agent.state.snapshot().motion_intent` (or subscribe at the point in
-   `RobotAgent.tick()` where the intent is published).
-2. Serialize `MotionIntent.to_dict()`, or a compact binary form of the same
-   fields, and send it over UART.
-3. Report the link's state back via `RobotState.update_communication(esp32=...)`
-   — `LinkStatus.NOT_IMPLEMENTED` is the current value.
+```
+DecisionMaker -> MotionIntent -> SafetyGate -> SafetyDecision ─┐
+                                                              ▼
+RobotState <── agent.tick() <── Esp32Link.status()      Esp32Link.submit()
+  controller       (per tick)        ▲                        │
+  controller_diag                    │ one I/O thread owns the port
+  communication.esp32                └── /dev/ttyAMA0 ◄───────┘
+```
 
-The ESP32 side owns: converting normalized velocity to PWM, the duty ceiling,
-E-stop, ultrasonic/IR reflexes, encoder feedback, and refusing a stale intent
-(`MotionIntent.timestamp` exists for exactly that check).
+| Module | Role |
+|---|---|
+| `protocol.py` | CRC, strict inbound decoding (per-type documented fields), command encoding for **PING, STOP and DRIVE only** |
+| `transport.py` | pyserial port (exclusive, `TIOCEXCL`), bounded line assembly |
+| `state.py` | `Esp32LinkStatus`, `ControllerTelemetry`, `ControllerState`, `ControllerDiag` — values only |
+| `link.py` | `Esp32Link`: the port's single owner, connection state, sequence, ACK matching, reboot detection |
 
-**None of this is implemented.** No UART code, no protocol, no framing.
+Rules the link enforces:
+
+- **Off by default.** `ROBOTX_ESP32_ENABLED=0`. With `ROBOTX_ESP32_TRANSMIT_ENABLED=0`
+  it never writes; otherwise it sends a resync LF per connection and one PING
+  to prove the Pi -> ESP32 direction. `ROBOTX_ESP32_MOTION_ENABLED=0` (default)
+  means no STOP or DRIVE, ever.
+- **Only the gate's output.** `submit()` accepts a `SafetyDecision`, never a
+  raw intent. Vetoed, stopping or stale decisions become STOP; DRIVE is sent
+  only while the link is UP and the ESP32 reports `motor_drive_available`.
+  One pending motion command at most, dropped if not sent within 0.3 s,
+  never retried, never replayed after a reconnect.
+- **Reboots latch.** A second READY or `uptime_ms` going backwards latches the
+  agent's existing emergency stop. Clearing it acknowledges the reboot; the
+  link must then re-PING before it carries motion.
+- **GPS stays off the UART.** The agent refuses to start GPS on the ESP32's
+  device and reports GPS health FAILED with the reason.
+
+`Esp32LinkStatus`: `DISABLED`, `DISCONNECTED` (retrying with capped backoff),
+`CONNECTING` (port open; waiting for TELEMETRY — the boot I2C scan can take
+~2 min — or for the PING ACK), `UP`, `STALE` (TELEMETRY stopped for 1 s),
+`DEGRADED` (reboot latched, protocol mismatch, or 3 unanswered commands),
+`STOPPING`. TELEMETRY goes to `snapshot.controller` and local telemetry; DIAG
+goes to `snapshot.controller_diag` and health, never to the telemetry frame.
+
+The ESP32 side still owns converting DRIVE units to PWM, the duty ceiling and
+deadband, obstacle gating, and its own 2 s command watchdog.
 
 ## 5. Where the backend attaches
 

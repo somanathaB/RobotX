@@ -32,6 +32,15 @@ def main() -> int:
 
     setup_logging("INFO")
 
+    # The ESP32 is wired to its UART whether or not RobotX's link is enabled;
+    # opening it here would reconfigure that line and steal its frames.
+    import os
+
+    if os.path.realpath(SETTINGS.gps_port) == os.path.realpath(SETTINGS.esp32_port):
+        print(f"REFUSING: {SETTINGS.gps_port} is the ESP32 UART (ROBOTX_ESP32_PORT). "
+              "Set ROBOTX_GPS_PORT to the GPS receiver's own serial port.")
+        return 2
+
     gps = GPSReader(GPSConfig.from_settings(SETTINGS))
 
     print("Starting GPS reader...")

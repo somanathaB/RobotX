@@ -137,6 +137,26 @@ class Settings:
     # Seconds to wait before retrying a failed serial open.
     gps_reconnect_interval_s: float = 5.0
 
+    # --- ESP32 link (robotx.esp32) --------------------------------------------
+    # The UART to the ESP32 motor/sensor controller. Off by default, so the
+    # agent runs standalone. Name the port explicitly: /dev/serial0 is refused.
+    esp32_enabled: bool = False
+    esp32_port: str = "/dev/ttyAMA0"
+    esp32_baudrate: int = 115200
+    # Off: the link never writes a byte (receive-only). On: it may send the
+    # documented resync LF and PING.
+    esp32_transmit_enabled: bool = True
+    # Off: no STOP or DRIVE is ever sent. Leave off until motion is authorised.
+    esp32_motion_enabled: bool = False
+    # TELEMETRY older than this makes the link STALE (TELEMETRY is every 200 ms).
+    esp32_stale_after_s: float = 1.0
+    # An ACK/ERROR not received within this counts as a timeout.
+    esp32_ack_timeout_s: float = 0.5
+    # A motion command not written within this is dropped, never sent late.
+    # At most 1.0 s (enforced), far inside the ESP32's own 2 s watchdog.
+    esp32_command_max_age_s: float = 0.3
+    esp32_reconnect_max_s: float = 10.0
+
     # --- Position estimation ------------------------------------------------
     # Minimum movement between two fixes before a GPS-track heading is derived.
     position_heading_min_move_m: float = 1.5
@@ -359,6 +379,15 @@ class Settings:
             gps_timeout_s=_get_float(e, "ROBOTX_GPS_TIMEOUT_S", d.gps_timeout_s),
             gps_stale_after_s=_get_float(e, "ROBOTX_GPS_STALE_AFTER_S", d.gps_stale_after_s),
             gps_reconnect_interval_s=_get_float(e, "ROBOTX_GPS_RECONNECT_INTERVAL_S", d.gps_reconnect_interval_s),
+            esp32_enabled=_get_bool(e, "ROBOTX_ESP32_ENABLED", d.esp32_enabled),
+            esp32_port=_get_str(e, "ROBOTX_ESP32_PORT", d.esp32_port),
+            esp32_baudrate=_get_int(e, "ROBOTX_ESP32_BAUDRATE", d.esp32_baudrate),
+            esp32_transmit_enabled=_get_bool(e, "ROBOTX_ESP32_TRANSMIT_ENABLED", d.esp32_transmit_enabled),
+            esp32_motion_enabled=_get_bool(e, "ROBOTX_ESP32_MOTION_ENABLED", d.esp32_motion_enabled),
+            esp32_stale_after_s=_get_float(e, "ROBOTX_ESP32_STALE_AFTER_S", d.esp32_stale_after_s),
+            esp32_ack_timeout_s=_get_float(e, "ROBOTX_ESP32_ACK_TIMEOUT_S", d.esp32_ack_timeout_s),
+            esp32_command_max_age_s=_get_float(e, "ROBOTX_ESP32_COMMAND_MAX_AGE_S", d.esp32_command_max_age_s),
+            esp32_reconnect_max_s=_get_float(e, "ROBOTX_ESP32_RECONNECT_MAX_S", d.esp32_reconnect_max_s),
             position_heading_min_move_m=_get_float(e, "ROBOTX_HEADING_MIN_MOVE_M", d.position_heading_min_move_m),
             position_heading_min_speed_mps=_get_float(e, "ROBOTX_HEADING_MIN_SPEED_MPS", d.position_heading_min_speed_mps),
             nav_waypoint_arrival_m=_get_float(e, "ROBOTX_NAV_WAYPOINT_ARRIVAL_M", d.nav_waypoint_arrival_m),

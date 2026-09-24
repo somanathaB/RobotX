@@ -23,6 +23,7 @@ application     agent lifecycle + HTTP API (composition root)
 perception      (parallel branch: config, hardware -> perception -> control, state)
 diagnostics     (parallel branch: config -> diagnostics -> state, application)
 communication   (backend boundary; imported lazily by application/agent.py)
+esp32           (ESP32 UART boundary: config, control -> esp32 -> state, application)
 ```
 
 ## Modules
@@ -50,9 +51,13 @@ communication   (backend boundary; imported lazily by application/agent.py)
 | `control/motion.py` | — | — |
 | `control/decision.py` | `config.logging_setup`, `control.motion`, `navigation.navigator`, `perception.types` | — |
 | `diagnostics/health.py` | `config.logging_setup` | `os`, `pathlib` |
-| `state/robot_state.py` | `control.motion`, `diagnostics.health`, `hardware.gps`, `localization.position`, `navigation.navigator`, `perception.types` | — |
+| `esp32/protocol.py` | — | `json`, `re` |
+| `esp32/transport.py` | `esp32.protocol` | `serial` (lazy), `fcntl`, `termios` |
+| `esp32/state.py` | — | — |
+| `esp32/link.py` | `config.logging_setup`, `control.motion`, `control.safety`, `esp32.*` | `threading` |
+| `state/robot_state.py` | `control.motion`, `diagnostics.health`, `esp32.state`, `hardware.gps`, `localization.position`, `navigation.navigator`, `perception.types` | — |
 | `state/telemetry.py` | `hardware.battery`, `state.robot_state` | — |
-| `application/agent.py` | `config.*`, `control.decision`, `control.motion`, `diagnostics.health`, `hardware.camera`, `hardware.gps`, `localization.position`, `navigation.navigator`, `perception.pipeline`, `perception.types`, `state.*` | `asyncio` |
+| `application/agent.py` | `config.*`, `control.decision`, `control.motion`, `diagnostics.health`, `esp32.link`, `hardware.camera`, `hardware.gps`, `localization.position`, `navigation.navigator`, `perception.pipeline`, `perception.types`, `state.*` | `asyncio` |
 | `application/main.py` | `application.agent`, `config.*`, `diagnostics.health`, `state.telemetry` | `fastapi`, `pydantic` |
 
 ## Not in the agent's import graph

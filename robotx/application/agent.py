@@ -12,17 +12,20 @@ it will never do is act as if a missing subsystem were a healthy one -- the
 decision layer stops the robot whenever perception is not usable.
 
 The agent does not start motors, and imports no motor driver. It publishes a
-`MotionIntent`; the ESP32 will consume it once that link exists.
+`MotionIntent`; when the ESP32 link is enabled, the *gated* decision is handed
+to `robotx.esp32.link.Esp32Link`, which is the only path to the ESP32 and
+carries motion only when `ROBOTX_ESP32_MOTION_ENABLED` is set.
 
 Each tick:
-    GPS -> position -> navigation -> (with perception) decision -> motion intent
-    -> state -> telemetry / health
+    GPS -> position -> ESP32 status -> navigation -> (with perception) decision
+    -> safety gate -> motion intent -> ESP32 link -> state -> telemetry / health
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
@@ -37,6 +40,7 @@ from robotx.diagnostics.health import (
     HealthMonitor,
     HealthStatus,
 )
+from robotx.esp32.link import Esp32Config, Esp32Link, Esp32Status
 from robotx.hardware.camera import CameraConfig, CameraError, CameraStatus, CameraStream
 from robotx.hardware.gps import GPSConfig, GPSReader, GpsReading, GPSStatus
 from robotx.mission.manager import MissionAssignment, MissionManager
@@ -121,6 +125,14 @@ class RobotAgent:
         self.camera: Optional[CameraStream] = None
         self.perception: Optional[PerceptionPipeline] = None
         self.gps: Optional[GPSReader] = None
+        # Set when GPS was not started because its port is the ESP32's UART.
+        self._gps_port_conflict: Optional[str] = None
+        # The one owner of the ESP32 UART. None when ROBOTX_ESP32_ENABLED=0.
+        self.esp32: Optional[Esp32Link] = None
+        # Why an enabled ESP32 link was not started, if its config was invalid.
+        self._esp32_config_error: Optional[str] = None
+        # ESP32 reboots already acted on, so each triggers the latch once.
+        self._esp32_reboots_handled = 0
         # Typed as Any to keep `socketio` out of this module's imports; see
         # `_start_backend_link`. None whenever no backend is configured.
         self.backend: Optional[Any] = None
@@ -187,13 +199,21 @@ class RobotAgent:
 
         self._start_camera()
         self._start_perception()
+        # Before GPS: GPS must not be allowed onto the ESP32's UART.
+        self._start_esp32()
         self._start_gps()
 
         self.state.update_communication(
-            esp32=Esp32LinkStatus.NOT_IMPLEMENTED,
+            esp32=Esp32LinkStatus.DISABLED,
+            esp32_detail=(
+                f"configuration error: {self._esp32_config_error}"
+                if self._esp32_config_error
+                else "disabled by configuration"
+            ),
             backend=BackendLinkStatus.DISABLED,
             backend_detail="",
         )
+        self._update_esp32()
         self.state.set_mode(OperatingMode.IDLE)
 
         self._running = True
@@ -266,7 +286,12 @@ class RobotAgent:
             except Exception:
                 logger.exception("Agent loop raised during shutdown")
 
-        # Release in reverse order of acquisition.
+        # Release in reverse order of acquisition. The ESP32 link goes first:
+        # the loop has stopped, so nothing can submit to it any more, and if it
+        # was carrying motion it sends a final STOP before closing the port.
+        if self.esp32 is not None:
+            self.esp32.stop()
+            self._update_esp32()
         if self.perception is not None:
             self.perception.stop()
         if self.gps is not None:
@@ -307,8 +332,63 @@ class RobotAgent:
         if not self.settings.gps_enabled:
             log_event(logger, "gps.disabled", "disabled by configuration")
             return
+        if _same_device(self.settings.gps_port, self.settings.esp32_port):
+            # The ESP32 UART is reserved whether or not the link is enabled:
+            # the ESP32 is wired there either way. A GPS reader on it would
+            # steal frames from the link (or from a bench test), and reconfigure
+            # the line to the GPS baud rate.
+            self._gps_port_conflict = self.settings.gps_port
+            log_event(
+                logger,
+                "gps.port_conflict",
+                "GPS not started: its port is reserved for the ESP32 UART",
+                level=logging.CRITICAL,
+                gps_port=self.settings.gps_port,
+                esp32_port=self.settings.esp32_port,
+                esp32_enabled=self.settings.esp32_enabled,
+            )
+            return
         self.gps = GPSReader(GPSConfig.from_settings(self.settings))
         self.gps.start()
+
+    def _start_esp32(self) -> None:
+        if not self.settings.esp32_enabled:
+            log_event(logger, "esp32.disabled", "disabled by configuration")
+            return
+        try:
+            cfg = Esp32Config.from_settings(self.settings)
+        except ValueError as e:
+            # Same stance as a bad backend config: the robot still comes up,
+            # with no motor link -- which is the safe state -- and says why.
+            self._esp32_config_error = str(e)
+            log_event(logger, "esp32.config_invalid", "ESP32 link not started",
+                      level=logging.ERROR, error=str(e))
+            return
+        self.esp32 = Esp32Link(cfg)
+        self.esp32.start()
+
+    def _update_esp32(self) -> Optional[Esp32Status]:
+        """Copy the link's view into state, and act on a detected ESP32 reboot.
+
+        A reboot latches the existing emergency stop: whatever the ESP32 was
+        doing before it restarted is unknown, so nothing moves again until an
+        operator clears the latch (which also acknowledges the reboot).
+        """
+
+        if self.esp32 is None:
+            return None
+        status = self.esp32.status()
+        self.state.update_communication(
+            esp32=status.link,
+            esp32_detail=status.detail,
+            esp32_since=status.since,
+            esp32_last_rx_at=status.last_rx_at,
+        )
+        self.state.update_controller(status.controller, status.diag)
+        if status.controller.reboot_count > self._esp32_reboots_handled:
+            self._esp32_reboots_handled = status.controller.reboot_count
+            self.emergency_stop(f"ESP32 rebooted: {status.detail}")
+        return status
 
     # --- mission control (local, no backend required) ------------------------
 
@@ -412,6 +492,10 @@ class RobotAgent:
         # Motor authority belongs to the ESP32. Without that link the Rover
         # cannot move at all, whatever it accepts.
         if not snapshot.communication.esp32.is_up:
+            return OfferDecision.reject("NO_MOTOR_LINK")
+        # An UP link is not yet a motor link: motion must be enabled on the Pi
+        # and the ESP32 must report that its drive is actually available.
+        if self.esp32 is not None and not self.esp32.status().motion_ready:
             return OfferDecision.reject("NO_MOTOR_LINK")
         if snapshot.position is None or not snapshot.position.is_measured or not snapshot.gps.has_fix:
             return OfferDecision.reject("NO_POSITION_FIX")
@@ -578,6 +662,10 @@ class RobotAgent:
         released = self.safety.clear_estop(reason)
         if released:
             self.state.clear_error()
+        # The same operator act acknowledges a latched ESP32 reboot. The link
+        # still has to re-prove itself with a fresh PING before carrying motion.
+        if self.esp32 is not None:
+            self.esp32.acknowledge_reboot()
         return released
 
     @property
@@ -674,6 +762,20 @@ class RobotAgent:
         #    write this same field. Either way consumers read it from state.
         self.state.update_power(PowerState.from_status_dict(battery_status()))
 
+        # 2b. ESP32 link: what it reports goes into state before anything
+        #     decides, and a link that can no longer carry motion pauses a
+        #     running mission rather than letting it continue unexecuted.
+        link = self.esp32
+        esp32 = self._update_esp32()
+        if (
+            link is not None
+            and esp32 is not None
+            and link.cfg.motion_enabled
+            and self.state.mode.mission_active
+            and not esp32.motion_ready
+        ):
+            self.pause_mission(f"ESP32 cannot carry motion: {esp32.link.value} ({esp32.detail})")
+
         # 3. Navigation
         navigation = self.navigator.update(position)
         self.state.update_navigation(navigation)
@@ -718,6 +820,11 @@ class RobotAgent:
         intent = safety.intent
         self.state.update_safety(safety)
         self.state.update_motion_intent(intent)
+
+        # 5c. The gate's decision -- never the proposal -- is what the ESP32
+        #     link may carry. It sends nothing unless motion is enabled.
+        if self.esp32 is not None:
+            self.esp32.submit(safety)
 
         # Close the dead-reckoning loop with the *gated* intent, never the
         # proposed one. Only what survives the safety gate can reach the
@@ -837,6 +944,13 @@ class RobotAgent:
         return ComponentHealth("perception", status, result.error or detail)
 
     def _gps_health(self, snapshot: RobotSnapshot) -> ComponentHealth:
+        if self.gps is None and self._gps_port_conflict is not None:
+            return ComponentHealth(
+                "gps",
+                HealthStatus.FAILED,
+                f"not started: {self._gps_port_conflict} is reserved for the ESP32 UART "
+                "(set ROBOTX_GPS_PORT to the receiver's own port, or ROBOTX_GPS_ENABLED=0)",
+            )
         if self.gps is None:
             return ComponentHealth(
                 "gps", HealthStatus.UNKNOWN, "disabled by configuration"
@@ -865,22 +979,38 @@ class RobotAgent:
         link, and this link's state must never be influenced by whether a
         remote platform happens to be reachable.
 
-        `NOT_IMPLEMENTED` is UNKNOWN rather than FAILED: no transport code
-        exists yet, and reporting a planned link as broken would make every
-        standalone rover permanently unhealthy for a component it does not
-        have.
+        `NOT_IMPLEMENTED` and `DISABLED` are UNKNOWN rather than FAILED: a
+        rover with no ESP32 link configured would otherwise be permanently
+        unhealthy for a component it does not have.
+
+        An UP link is only HEALTHY when the ESP32 itself reports nothing
+        wrong. What it reports -- drive unavailable, a sensor it no longer
+        trusts, a latched stop -- degrades the component with the reason, so
+        an operator sees *why* the rover will not move without reading DIAG.
         """
 
         status = snapshot.communication.esp32
         detail = snapshot.communication.esp32_detail or status.value
 
         if status is Esp32LinkStatus.NOT_IMPLEMENTED:
-            return ComponentHealth(
-                "esp32", HealthStatus.UNKNOWN, "ESP32 link is not implemented yet"
-            )
+            return ComponentHealth("esp32", HealthStatus.UNKNOWN, "no ESP32 link has reported")
         if status is Esp32LinkStatus.DISABLED:
+            if self._esp32_config_error:
+                # Enabled by the operator but not started: a real fault.
+                return ComponentHealth(
+                    "esp32", HealthStatus.FAILED, f"not started: {self._esp32_config_error}"
+                )
             return ComponentHealth("esp32", HealthStatus.UNKNOWN, "disabled by configuration")
+        if status is Esp32LinkStatus.STOPPING:
+            return ComponentHealth("esp32", HealthStatus.UNKNOWN, "stopping")
+        if status is Esp32LinkStatus.CONNECTING:
+            return ComponentHealth("esp32", HealthStatus.DEGRADED, detail)
+        if status is Esp32LinkStatus.DEGRADED:
+            return ComponentHealth("esp32", HealthStatus.DEGRADED, detail)
         if status.is_up:
+            problems = _controller_problems(snapshot)
+            if problems:
+                return ComponentHealth("esp32", HealthStatus.DEGRADED, "; ".join(problems))
             return ComponentHealth("esp32", HealthStatus.HEALTHY, detail)
         if status is Esp32LinkStatus.STALE:
             # The port is open but the controller has gone quiet. That is worse
@@ -928,3 +1058,32 @@ def _gps_unavailable() -> GpsReading:
     """The reading reported when GPS is switched off by configuration."""
 
     return GpsReading(status=GPSStatus.UNAVAILABLE, error="GPS disabled")
+
+
+def _same_device(a: str, b: str) -> bool:
+    """Whether two device paths name the same tty (symlinks resolved)."""
+
+    return os.path.realpath(a) == os.path.realpath(b)
+
+
+def _controller_problems(snapshot: RobotSnapshot) -> List[str]:
+    """What the ESP32 itself reports as wrong, from TELEMETRY and DIAG SYSTEM."""
+
+    controller = snapshot.controller
+    if controller is None or controller.telemetry is None:
+        return []
+    tel = controller.telemetry
+    problems: List[str] = []
+    if not tel.motor_drive_available:
+        system = snapshot.controller_diag.system if snapshot.controller_diag else None
+        why = (system or {}).get("motor_drive_status") or tel.block_reason
+        problems.append(f"motor drive unavailable ({why})")
+    if not tel.front_valid:
+        problems.append("front sensing not valid")
+    if tel.rear_sensor_fault:
+        problems.append("rear sensor fault")
+    if tel.safety_stop:
+        problems.append("ESP32 safety stop latched")
+    if tel.command_timeout:
+        problems.append("ESP32 command watchdog latched")
+    return problems
