@@ -386,6 +386,70 @@ class TestReboot(unittest.TestCase):
         link.poll_once()
         self.assert_latched(link)
 
+    def test_a_ready_without_uptime_latches_once_and_resets_the_baseline(self):
+        link, port, clock = fresh(motion_enabled=True)
+        fx.bring_up(link, port, clock)
+        port.feed(fx.frame({"type": "EVENT", "event": "READY", "seq": None, "proto": 2}))
+        link.poll_once()
+        self.assert_latched(link)
+        port.feed(fx.telemetry(uptime_ms=250, last_seq=None))   # lower than before, but a new boot
+        link.poll_once()
+        self.assertEqual(link.status().controller.reboot_count, 1)   # not counted twice
+
+    def test_the_real_i2cscan_event_is_accepted_not_rejected(self):
+        link, port, clock = fresh(transmit_enabled=False)
+        link.poll_once()
+        port.feed(fx.REAL_TELEMETRY + fx.frame({"type": "EVENT", "event": "I2CSCAN", "seq": None,
+                                                "trigger": "BOOT", "scan_ms": 15, "count": 4}))
+        link.poll_once()
+        st = link.status()
+        self.assertEqual((st.controller.counters.events, st.controller.counters.rejected_lines), (1, 0))
+        self.assertEqual(st.controller.last_event, "I2CSCAN")
+        self.assertEqual(st.controller.reboot_count, 0)       # I2CSCAN alone is not a reboot
+
+    def test_a_silent_esp32_is_stale_even_while_a_reboot_is_latched(self):
+        link, port, clock = fresh(motion_enabled=True)
+        fx.bring_up(link, port, clock)
+        port.feed(fx.ready(uptime_ms=24))                    # reboot, then the ESP32 goes quiet
+        link.poll_once()
+        self.assertIs(link.status().link, S.DEGRADED)
+        clock.advance(1.5)
+        link.poll_once()
+        st = link.status()
+        self.assertIs(st.link, S.STALE)
+        self.assertIn("no TELEMETRY", st.detail)
+        self.assertIn("rebooted", st.detail)                 # neither fact hides the other
+        self.assertTrue(st.controller.reboot_latched)
+        self.assertFalse(st.motion_ready)
+
+        port.feed(fx.telemetry(uptime_ms=1600, last_seq=None))   # it speaks again: still latched
+        link.poll_once()
+        st = link.status()
+        self.assertIs(st.link, S.DEGRADED)
+        self.assertTrue(st.controller.reboot_latched)
+        self.assertEqual(st.controller.reboot_count, 1)
+        self.assertEqual(port.command_names(), ["PING"])      # nothing sent while latched
+
+        self.assertTrue(link.acknowledge_reboot())
+        port.feed(fx.telemetry(uptime_ms=1800, last_seq=None))
+        link.poll_once()
+        self.assertIs(link.status().link, S.CONNECTING)       # must re-prove itself
+        port.feed(fx.ack(1))
+        link.poll_once()
+        self.assertIs(link.status().link, S.UP)
+
+    def test_staleness_outranks_other_degradations(self):
+        link, port, clock = fresh(ping_retry_s=0.6)
+        link.poll_once()
+        port.feed(fx.REAL_TELEMETRY)
+        link.poll_once()
+        port.feed(fx.ack(port.commands()[-1]["seq"], proto=3))   # protocol mismatch
+        link.poll_once()
+        self.assertIs(link.status().link, S.DEGRADED)
+        clock.advance(2.0)
+        link.poll_once()
+        self.assertIs(link.status().link, S.STALE)
+
     def test_the_latch_holds_motion_until_acknowledged_then_requires_a_fresh_ping(self):
         link, port, clock = fresh(motion_enabled=True)
         fx.bring_up(link, port, clock)

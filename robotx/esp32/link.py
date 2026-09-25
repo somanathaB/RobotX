@@ -491,7 +491,10 @@ class Esp32Link:
             self._note_proto(data.get("proto"), "READY")
             if known:
                 self._reboot("READY received from a running ESP32")
-            self._last_uptime = data["uptime_ms"]
+            # The new boot's baseline. uptime_ms is optional on EVENTs; without
+            # it the next TELEMETRY sets the baseline, so a reboot READY already
+            # reported is not counted a second time as an uptime rollback.
+            self._last_uptime = data.get("uptime_ms")
             self._seq.resync(None)
             self._seq_synced = True
             log_event(logger, "esp32.ready", firmware=self._firmware, proto=data.get("proto"))
@@ -585,11 +588,24 @@ class Esp32Link:
         )
 
     def _refresh_status(self, now: float) -> None:
-        """Derive the link state from the facts. Lock held."""
+        """Derive the link state from the facts. Lock held.
+
+        Loss of fresh TELEMETRY is checked first: a silent ESP32 is STALE
+        whatever else is latched, so a latched reboot can never make it look
+        merely degraded. The latch itself is untouched by this ordering -- it
+        still blocks motion and still needs acknowledging -- and it is named
+        in the STALE detail so neither fact hides the other.
+        """
 
         if not self._port_open or self._stopping:
             return
-        if self._reboot_latched:
+        if self._telemetry_this_connection and not self._telemetry_fresh(now):
+            age = now - (self._telemetry_mono or now)
+            detail = f"no TELEMETRY for {age:.1f}s"
+            if self._reboot_latched:
+                detail += f"; ESP32 rebooted ({self._reboot_reason}), motion held until acknowledged"
+            self._set_status(Esp32LinkStatus.STALE, detail)
+        elif self._reboot_latched:
             self._set_status(Esp32LinkStatus.DEGRADED,
                              f"ESP32 rebooted ({self._reboot_reason}); motion held until acknowledged")
         elif self._proto_problem is not None:
@@ -600,9 +616,6 @@ class Esp32Link:
         elif not self._telemetry_this_connection:
             self._set_status(Esp32LinkStatus.CONNECTING,
                              "port open; waiting for TELEMETRY (the ESP32 boot I2C scan can take ~2 min)")
-        elif not self._telemetry_fresh(now):
-            age = now - (self._telemetry_mono or now)
-            self._set_status(Esp32LinkStatus.STALE, f"no TELEMETRY for {age:.1f}s")
         elif self.cfg.transmit_enabled and not self._bidirectional:
             self._set_status(Esp32LinkStatus.CONNECTING, "TELEMETRY arriving; waiting for PING ACK")
         else:

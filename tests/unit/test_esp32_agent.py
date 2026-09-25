@@ -185,6 +185,36 @@ class TestRebootLatchesTheEmergencyStop(unittest.TestCase):
         self.assertFalse(agent.emergency_stopped)
 
 
+class TestSilenceAfterReboot(unittest.TestCase):
+    def test_a_reboot_then_silence_is_failed_and_stays_latched_until_cleared(self):
+        agent, link, port, clock = agent_with_link()
+        agent.tick()
+        port.feed(fx.ready(uptime_ms=24))
+        link.poll_once()
+        agent.tick()
+        self.assertTrue(agent.emergency_stopped)
+
+        clock.advance(2.0)                                  # the ESP32 goes quiet
+        link.poll_once()
+        snap = agent.tick()
+        self.assertIs(snap.communication.esp32, Esp32LinkStatus.STALE)
+        h = agent._component_health(snap)["esp32"]
+        self.assertIs(h.status, HealthStatus.FAILED)
+        self.assertTrue(agent.emergency_stopped)
+        self.assertIs(snap.mode, OperatingMode.STOPPED)
+
+        port.feed(fx.telemetry(uptime_ms=2100, last_seq=None))   # back, still latched
+        link.poll_once()
+        snap = agent.tick()
+        self.assertIs(snap.communication.esp32, Esp32LinkStatus.DEGRADED)
+        self.assertTrue(agent.emergency_stopped)
+
+        self.assertTrue(agent.clear_emergency_stop("operator"))
+        snap = agent.tick()
+        self.assertIs(snap.mode, OperatingMode.STOPPED)          # clearing resumes nothing
+        self.assertFalse(link.status().motion_ready)
+
+
 class TestSafetyPath(unittest.TestCase):
     def test_the_link_receives_the_gated_decision_not_the_proposal(self):
         agent, link, port, clock = agent_with_link(motion=True, drive_available=True)

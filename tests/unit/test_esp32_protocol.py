@@ -156,7 +156,68 @@ class TestDecodeRejects(unittest.TestCase):
         self.assertIs(self.reason(fx.ack(5, result="MAYBE")), FrameError.BAD_FIELDS)
         self.assertIs(self.reason(fx.frame({"type": "DIAG", "section": "X", "uptime_ms": 1})),
                       FrameError.BAD_FIELDS)
-        self.assertIs(self.reason(fx.frame({"type": "EVENT", "event": "READY", "seq": None})),
+
+
+class TestEventSchema(unittest.TestCase):
+    """EVENT follows the firmware's real format: event and seq required, uptime_ms optional."""
+
+    # The start of the EVENT I2CSCAN the real ESP32 sent on 2026-09-25, exactly
+    # as far as it was logged. It has no uptime_ms. Only these observed keys are
+    # used; the rest of the real frame (its device list) was not captured.
+    OBSERVED_I2CSCAN = {"type": "EVENT", "event": "I2CSCAN", "seq": None, "trigger": "BOOT",
+                        "sda": 21, "scl": 22, "clock_hz": 100000, "scan_ms": 15,
+                        "bus_writes": "none", "count": 4, "list_full": False}
+
+    def reason(self, obj):
+        result = p.decode_line(fx.frame(obj))
+        self.assertIsInstance(result, Rejected, obj)
+        return result.reason
+
+    def test_event_and_seq_without_uptime_is_accepted(self):
+        f = p.decode_line(fx.frame(self.OBSERVED_I2CSCAN))
+        self.assertIsInstance(f, Frame)
+        self.assertEqual((f.data["event"], f.data["scan_ms"]), ("I2CSCAN", 15))
+        self.assertNotIn("uptime_ms", f.data)
+        self.assertIsInstance(p.decode_line(fx.frame({"type": "EVENT", "event": "READY", "seq": None})),
+                              Frame)
+
+    def test_event_with_a_valid_uptime_is_accepted(self):
+        for uptime in (0, 24, 3588443):
+            f = p.decode_line(fx.event("READY", uptime_ms=uptime))
+            self.assertIsInstance(f, Frame)
+            self.assertEqual(f.data["uptime_ms"], uptime)
+        self.assertIsInstance(p.decode_line(fx.frame(
+            {"type": "EVENT", "event": "MOTORTEST_DONE", "seq": 17, "uptime_ms": 5, "reason": "EXPIRED"})),
+            Frame)
+
+    def test_an_invalid_uptime_is_still_rejected_when_present(self):
+        for bad in ("24", 2.5, True, None, [1], {"ms": 1}):
+            obj = {"type": "EVENT", "event": "READY", "seq": None, "uptime_ms": bad}
+            self.assertIs(self.reason(obj), FrameError.BAD_FIELDS, bad)
+
+    def test_event_and_seq_are_still_required_and_typed(self):
+        self.assertIs(self.reason({"type": "EVENT", "seq": None, "uptime_ms": 1}), FrameError.BAD_FIELDS)
+        self.assertIs(self.reason({"type": "EVENT", "event": "READY", "uptime_ms": 1}), FrameError.BAD_FIELDS)
+        self.assertIs(self.reason({"type": "EVENT", "event": 7, "seq": None}), FrameError.BAD_FIELDS)
+        self.assertIs(self.reason({"type": "EVENT", "event": "READY", "seq": "1"}), FrameError.BAD_FIELDS)
+        self.assertIs(self.reason({"type": "EVENT", "event": "READY", "seq": 1.0}), FrameError.BAD_FIELDS)
+
+    def test_framing_crc_and_json_protections_are_unchanged_for_events(self):
+        good = fx.frame(self.OBSERVED_I2CSCAN)
+        payload = good[: good.rindex(b"*")]
+        self.assertIs(p.decode_line(payload + b"*0000\n").reason, FrameError.BAD_CRC)
+        self.assertIs(p.decode_line(good.replace(b'"scan_ms":15', b'"scan_ms":16')).reason,
+                      FrameError.BAD_CRC)
+        self.assertIs(p.decode_line(payload + b"\n").reason, FrameError.NOT_A_FRAME)
+        self.assertIs(p.decode_line(b"\xf0" + good).reason, FrameError.NOT_ASCII)
+        self.assertIs(p.decode_line(fx.frame('{"type":"EVENT","event":"A","seq":null,"seq":null}')).reason,
+                      FrameError.BAD_JSON)
+
+    def test_other_types_still_require_their_uptime(self):
+        data = dict(fx.REAL_TELEMETRY_FIELDS)
+        del data["uptime_ms"]
+        self.assertIs(p.decode_line(fx.frame(data)).reason, FrameError.BAD_FIELDS)
+        self.assertIs(p.decode_line(fx.frame({"type": "DIAG", "section": "FRONT"})).reason,
                       FrameError.BAD_FIELDS)
 
 

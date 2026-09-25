@@ -131,7 +131,11 @@ _INT, _OPT_INT, _STR, _BOOL, _OPT_NUM, _LIST = "int", "int?", "str", "bool", "nu
 _REQUIRED: Dict[str, Tuple[Tuple[str, str], ...]] = {
     "ACK": (("seq", _INT), ("cmd", _STR), ("result", _STR), ("reason", _STR)),
     "ERROR": (("seq", _OPT_INT), ("reason", _STR)),
-    "EVENT": (("event", _STR), ("seq", _OPT_INT), ("uptime_ms", _INT)),
+    # PROTOCOL.md section 10 says every EVENT carries uptime_ms, but the real
+    # firmware (82f2a8a) sends EVENT I2CSCAN without it (captured on the Pi,
+    # 2026-09-25). The implementation is the contract the Pi must accept, so
+    # uptime_ms is optional here -- and still type-checked when present.
+    "EVENT": (("event", _STR), ("seq", _OPT_INT)),
     # The same twenty keys test_link.py t18 requires of real telemetry.
     "TELEMETRY": (
         ("uptime_ms", _INT), ("state", _STR), ("block_reason", _STR),
@@ -148,6 +152,7 @@ _REQUIRED: Dict[str, Tuple[Tuple[str, str], ...]] = {
 }
 
 _OPTIONAL: Dict[str, Tuple[Tuple[str, str], ...]] = {
+    "EVENT": (("uptime_ms", _INT),),
     "TELEMETRY": (
         ("front_warning", _BOOL), ("rear_available", _BOOL),
         ("rear_obstacle", _BOOL), ("rear_sensor_fault", _BOOL),
