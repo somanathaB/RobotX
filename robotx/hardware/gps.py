@@ -122,7 +122,8 @@ def parse_nmea_sentence(sentence: str, previous: Optional[GpsFix] = None) -> Opt
     Fields the sentence does not carry are taken from `previous` when it is the
     same fix continuing (GGA and RMC arrive in separate sentences), so a caller
     that only sees RMC still reports the satellite count from the last GGA.
-    Invalid fixes (`RMC` status != 'A', `GGA` quality 0) return None.
+    Invalid fixes (`RMC`/`GLL` status != 'A', `GGA` quality 0, `GNS` mode all
+    'N') return None.
     """
 
     try:
@@ -183,7 +184,21 @@ def parse_nmea_sentence(sentence: str, previous: Optional[GpsFix] = None) -> Opt
         except (TypeError, ValueError):
             track = None
 
-    elif sentence_type not in {"GLL", "GNS"}:
+    elif sentence_type == "GLL":
+        # Same rule as RMC. A receiver that has lost its fix can still fill in
+        # the last position with status 'V'; that must not count as a fix.
+        status = str(getattr(msg, "status", "") or "")
+        if status.upper() != "A":
+            return None
+
+    elif sentence_type == "GNS":
+        # One mode character per constellation; 'N' means no fix from that
+        # one. Any other character means some constellation has a fix.
+        mode = str(getattr(msg, "mode_indicator", "") or "").upper()
+        if not mode or all(c == "N" for c in mode):
+            return None
+
+    else:
         # Other sentences (GSV, VTG, ...) carry no position.
         return None
 

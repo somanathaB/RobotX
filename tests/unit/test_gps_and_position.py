@@ -21,12 +21,43 @@ from robotx.localization.position import (
 )
 
 
-# Real-shaped NMEA sentences (checksums are not verified by the parser).
+def nmea(body: str) -> str:
+    """Wrap a sentence body with its correct checksum."""
+
+    c = 0
+    for ch in body:
+        c ^= ord(ch)
+    return f"${body}*{c:02X}"
+
+
+# Real-shaped NMEA sentences. A checksum that is present IS verified (pynmea2
+# rejects a mismatch), so every fixture must carry the correct one -- otherwise
+# a "no fix" test passes on the checksum and never reaches the validity rule.
 GGA_VALID = "$GPGGA,123519,4807.038,N,01131.000,E,1,08,0.9,545.4,M,46.9,M,,*47"
-GGA_NO_FIX = "$GPGGA,123519,4807.038,N,01131.000,E,0,00,,,M,,M,,*47"
+GGA_NO_FIX = "$GPGGA,123519,4807.038,N,01131.000,E,0,00,,,M,,M,,*52"
 RMC_VALID = "$GPRMC,123519,A,4807.038,N,01131.000,E,022.4,084.4,230394,003.1,W*6A"
-RMC_INVALID = "$GPRMC,123519,V,4807.038,N,01131.000,E,022.4,084.4,230394,003.1,W*6A"
+RMC_INVALID = "$GPRMC,123519,V,4807.038,N,01131.000,E,022.4,084.4,230394,003.1,W*7D"
 GSV_NO_POSITION = "$GPGSV,3,1,11,03,03,111,00,04,15,270,00,06,01,010,00,13,06,292,00*74"
+# u-blox M9 shaped (GN talker). Void sentences still carry coordinates, which is
+# exactly the case the validity rule has to catch.
+GLL_VALID = nmea("GNGLL,4807.038,N,01131.000,E,123519.00,A,A")
+GLL_VOID = nmea("GNGLL,4807.038,N,01131.000,E,123519.00,V,N")
+GLL_NO_STATUS = nmea("GPGLL,4807.038,N,01131.000,E,123519.00")
+
+
+def gns(mode: str) -> str:
+    return nmea(f"GNGNS,123519.00,4807.038,N,01131.000,E,{mode},08,0.9,545.4,46.9,,,V")
+
+
+class TestFixtures(unittest.TestCase):
+    def test_every_fixture_passes_the_checksum(self):
+        import pynmea2
+
+        fixtures = [GGA_VALID, GGA_NO_FIX, RMC_VALID, RMC_INVALID, GSV_NO_POSITION,
+                    GLL_VALID, GLL_VOID, GLL_NO_STATUS, gns("A"), gns("NNNN")]
+        for sentence in fixtures:
+            with self.subTest(sentence=sentence):
+                pynmea2.parse(sentence)  # raises ChecksumError on a mismatch
 
 
 class TestNmeaParsing(unittest.TestCase):
@@ -67,6 +98,80 @@ class TestNmeaParsing(unittest.TestCase):
         rmc = parse_nmea_sentence(RMC_VALID, previous=gga)
         self.assertEqual(rmc.satellites, 8)
         self.assertIsNotNone(rmc.track_deg)
+
+    def test_gll_with_active_status_gives_position(self):
+        fix = parse_nmea_sentence(GLL_VALID)
+        self.assertIsNotNone(fix)
+        self.assertAlmostEqual(fix.latitude, 48.1173, places=3)
+        self.assertAlmostEqual(fix.longitude, 11.5166, places=3)
+
+    def test_gll_with_void_status_is_rejected(self):
+        self.assertIsNone(parse_nmea_sentence(GLL_VOID))
+
+    def test_gll_without_status_is_rejected(self):
+        # Same rule as RMC: only an explicit 'A' is a valid position.
+        self.assertIsNone(parse_nmea_sentence(GLL_NO_STATUS))
+
+    def test_gns_with_a_fix_mode_gives_position(self):
+        # 'AAAN': GPS/GLONASS/Galileo autonomous, BeiDou none -- still a fix.
+        for mode in ("A", "D", "AN", "NA", "AAAN", "a"):
+            with self.subTest(mode=mode):
+                fix = parse_nmea_sentence(gns(mode))
+                self.assertIsNotNone(fix)
+                self.assertAlmostEqual(fix.latitude, 48.1173, places=3)
+
+    def test_gns_with_no_fix_mode_is_rejected(self):
+        for mode in ("N", "NN", "NNNN", ""):
+            with self.subTest(mode=mode):
+                self.assertIsNone(parse_nmea_sentence(gns(mode)))
+
+    def test_void_gll_after_a_fix_keeps_the_previous_fix(self):
+        # Rejection must not wipe carried-over data: the caller keeps `previous`.
+        gga = parse_nmea_sentence(GGA_VALID)
+        self.assertIsNone(parse_nmea_sentence(GLL_VOID, previous=gga))
+        self.assertIsNone(parse_nmea_sentence(gns("NNNN"), previous=gga))
+
+
+class _FakeSerial:
+    def __init__(self, lines):
+        self._lines = list(lines)
+
+    def readline(self):
+        return self._lines.pop(0) if self._lines else b""
+
+
+class TestReaderIgnoresVoidSentences(unittest.TestCase):
+    """A lost fix must age out, not be kept fresh by void GLL/GNS sentences."""
+
+    def _reader_with_old_fix(self, lines):
+        reader = GPSReader(GPSConfig(stale_after_s=5.0))
+        reader._fix = GpsFix(latitude=48.1, longitude=11.5, timestamp=time.time() - 30)
+        reader._status = GPSStatus.FIX
+        reader._serial = _FakeSerial(line.encode("ascii") + b"\r\n" for line in lines)
+        return reader
+
+    def test_void_sentences_do_not_refresh_an_old_fix(self):
+        reader = self._reader_with_old_fix([GLL_VOID, gns("NNNN"), GGA_NO_FIX, RMC_INVALID])
+        for _ in range(4):
+            reader._read_once()
+        reading = reader.get_reading()
+        self.assertIs(reading.status, GPSStatus.STALE)
+        self.assertFalse(reading.has_fix)
+        self.assertEqual(reading.sentences_seen, 4)
+
+    def test_valid_gll_does_refresh_the_fix(self):
+        reader = self._reader_with_old_fix([GLL_VALID])
+        reader._read_once()
+        self.assertTrue(reader.get_reading().has_fix)
+
+    def test_void_sentences_without_any_fix_report_no_fix(self):
+        reader = GPSReader(GPSConfig())
+        reader._serial = _FakeSerial([GLL_VOID.encode() + b"\r\n", gns("N").encode() + b"\r\n"])
+        reader._read_once()
+        reader._read_once()
+        reading = reader.get_reading()
+        self.assertIs(reading.status, GPSStatus.NO_FIX)
+        self.assertIsNone(reading.fix)
 
 
 class TestGpsReading(unittest.TestCase):
