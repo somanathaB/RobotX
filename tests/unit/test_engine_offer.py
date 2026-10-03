@@ -101,7 +101,8 @@ def fire(link, sio, *envelopes, connect=True):
             await connect_and_auth(link)
         before = len(sio.emitted)
         for env in envelopes:
-            await sio.fire("command", env)
+            # The backend emits each envelope under its own command name.
+            await sio.fire(env.get("command") if isinstance(env, dict) and isinstance(env.get("command"), str) else "OFFER", env)
         return sio.emitted[before:]
 
     import asyncio
@@ -748,7 +749,7 @@ class T16ReconnectDoesNotDuplicate(CompletionTests):
             for _ in range(3):
                 await link._publish_custody()
                 await link._publish_task_complete()
-            await sio.fire("command", fx.envelope())  # a redelivered OFFER
+            await sio.fire("OFFER", fx.envelope())  # a redelivered OFFER
 
         asyncio.run(reconnect_and_publish())
         self.assertEqual(len(sio.events_named("OFFER_ACCEPT")), 1)

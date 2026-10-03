@@ -89,6 +89,11 @@ class RangeStatus(str, Enum):
         return self is RangeStatus.VALID
 
 
+# The rule name a decision carries while the e-stop latch is engaged. Read by the
+# backend TELEMETRY builder to report the software stop latch.
+ESTOP_RULE = "estop"
+
+
 @dataclass(frozen=True)
 class RangeReading:
     """One forward-range observation, from whatever sensor produced it."""
@@ -291,7 +296,7 @@ class SafetyGate:
 
         estop = self.estop_reason
         if estop is not None:
-            return self._veto("estop", f"emergency stop engaged: {estop}")
+            return self._veto(ESTOP_RULE, f"emergency stop engaged: {estop}")
 
         # A request to stop is always safe to forward, and must be forwarded:
         # the ESP32 cannot act on a stop the gate swallowed. Checked ahead of

@@ -223,6 +223,28 @@ async def clear_emergency_stop() -> Dict[str, Any]:
     }
 
 
+@app.post("/mission/custody")
+async def confirm_custody(body: Dict[str, Any]) -> Dict[str, Any]:
+    """An operator at the stop confirms a parcel handover: {"kind": ACQUIRED|RELEASED}.
+
+    Only with ROBOTX_CUSTODY_CONFIRMATION=operator. Recorded as
+    OPERATOR_CONFIRMED -- a person's statement, not a sensor reading -- and
+    refused (409) unless the Rover is at the stop that handover belongs to.
+    """
+
+    agent = get_agent()
+    if not agent.custody_sensing_available():
+        raise HTTPException(status_code=409, detail="operator custody confirmation is not enabled on this Rover")
+    kind = str((body or {}).get("kind", "")).upper()
+    if kind not in ("ACQUIRED", "RELEASED"):
+        raise HTTPException(status_code=422, detail='kind must be "ACQUIRED" or "RELEASED"')
+    try:
+        active = agent.record_custody(kind, source="OPERATOR_CONFIRMED")
+    except MissionRefused as e:
+        raise HTTPException(status_code=409, detail=str(e)) from None
+    return {"kind": kind, "mission": None if active is None else active.to_dict()}
+
+
 @app.post("/mission/idle")
 async def resume_idle() -> Dict[str, Any]:
     agent = get_agent()

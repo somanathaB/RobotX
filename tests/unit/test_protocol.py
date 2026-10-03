@@ -104,7 +104,12 @@ class TestProtocolBinding(unittest.TestCase):
         self.assertEqual(binding.auth, "AUTH")
         self.assertEqual(binding.auth_success, "AUTH_SUCCESS")
         self.assertEqual(binding.command, "COMMAND")
-        self.assertEqual(binding.engine_command, "command")
+        # Engine envelopes arrive under their own command names (OFFER, ...).
+        self.assertEqual(binding.engine_command, "")
+        self.assertIn("OFFER", binding.engine_command_events())
+        self.assertIn("WITHDRAW", binding.engine_command_events())
+        self.assertNotIn("command", binding.engine_command_events())
+        self.assertEqual((binding.probe, binding.probe_result), ("PROBE", "PROBE_RESULT"))
         self.assertEqual(binding.stop, "STOP")
         self.assertEqual(
             (binding.offer_accept, binding.offer_reject, binding.offer_defer, binding.custody_event),

@@ -144,7 +144,7 @@ def read_memory() -> Tuple[Optional[float], Optional[float]]:
 def read_load_avg() -> Optional[float]:
     try:
         return os.getloadavg()[0]
-    except OSError:
+    except (OSError, AttributeError):  # AttributeError: no getloadavg on this platform
         return None
 
 
@@ -158,7 +158,7 @@ def read_uptime_s() -> Optional[float]:
 def read_disk_used_percent(path: str = "/") -> Optional[float]:
     try:
         stat = os.statvfs(path)
-    except OSError:
+    except (OSError, AttributeError):  # AttributeError: no statvfs on this platform
         return None
     total = stat.f_blocks * stat.f_frsize
     if total <= 0:

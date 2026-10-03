@@ -43,6 +43,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Tuple
 
+from robotx.communication.engine import ENGINE_COMMANDS
+from robotx.control.safety import ESTOP_RULE
 from robotx.diagnostics.health import HealthStatus
 from robotx.mission.mission import (
     MAX_PATH_POINTS,
@@ -172,6 +174,9 @@ class ProtocolBinding:
     offer_reject: str = "OFFER_REJECT"
     offer_defer: str = "OFFER_DEFER"
     custody_event: str = "CUSTODY_EVENT"
+    # The answer to a server-initiated PROBE, on the same socket (F14's proof
+    # of a commandable link; the backend's agentProbe.service).
+    probe_result: str = "PROBE_RESULT"
 
     # Not part of the robot contract. Empty means "never emitted"; an operator
     # may bind them if the backend turns out to accept them.
@@ -189,9 +194,16 @@ class ProtocolBinding:
     auth_failed: str = "AUTH_FAILED"
     # Operator commands: {commandId, type, timestamp}.
     command: str = "COMMAND"
-    # Signed Assignment Engine envelopes (OFFER, WITHDRAW, ...). Lower-case,
-    # and a different event from the operator `COMMAND` above.
-    engine_command: str = "command"
+    # Signed Assignment Engine envelopes. The backend emits each one under its
+    # OWN command name as the Socket.IO event (`io.to(room).emit(envelope.command,
+    # envelope)` in commandDispatcher.service.js): OFFER, WITHDRAW, RECALL, ...
+    # Those names are always bound (`engine_command_events`). This field is only
+    # an optional extra event name an operator may add; empty by default.
+    # It used to be "command" -- an event the backend never sends -- so every
+    # real OFFER fell through to the unexpected-event handler and was dropped.
+    engine_command: str = ""
+    # Server-initiated liveness probe (backend agentProbe.service).
+    probe: str = "PROBE"
     # A bare STOP, distinct from COMMAND{type:STOP}: task cancellation. It
     # expects no acknowledgement.
     stop: str = "STOP"
@@ -216,15 +228,23 @@ class ProtocolBinding:
     def outbound_events(self) -> Tuple[str, ...]:
         names = (self.auth, self.telemetry, self.heartbeat, self.command_ack,
                  self.offer_accept, self.offer_reject, self.offer_defer,
-                 self.custody_event, self.task_complete, self.register,
-                 self.status, self.event)
+                 self.custody_event, self.task_complete, self.probe_result,
+                 self.register, self.status, self.event)
         return tuple(name for name in names if name)
 
     def inbound_events(self) -> Tuple[str, ...]:
         names = (self.auth_success, self.auth_ok, self.auth_failed,
-                 self.command, self.engine_command, self.stop, self.task_assign,
-                 self.task_complete_ack)
+                 self.command, *self.engine_command_events(), self.stop, self.task_assign,
+                 self.task_complete_ack, self.probe)
         return tuple(name for name in names if name)
+
+    def engine_command_events(self) -> Tuple[str, ...]:
+        """Every event name a signed engine envelope can arrive under."""
+
+        names = sorted(ENGINE_COMMANDS)
+        if self.engine_command and self.engine_command not in names:
+            names.append(self.engine_command)
+        return tuple(names)
 
     def auth_success_events(self) -> Tuple[str, ...]:
         """Every event that means "you are authenticated", deduplicated.
@@ -255,6 +275,7 @@ class ProtocolBinding:
                 "offer_defer": self.offer_defer,
                 "custody_event": self.custody_event,
                 "task_complete": self.task_complete,
+                "probe_result": self.probe_result,
                 "register": self.register,
                 "status": self.status,
                 "event": self.event,
@@ -268,6 +289,7 @@ class ProtocolBinding:
                 "stop": self.stop,
                 "task_assign": self.task_assign,
                 "task_complete_ack": self.task_complete_ack,
+                "probe": self.probe,
             },
         }
 
@@ -290,7 +312,7 @@ class ProtocolBinding:
                  "offer_accept", "offer_reject", "offer_defer", "custody_event",
                  "task_complete", "register", "status", "event", "auth_success",
                  "auth_ok", "auth_failed", "command", "engine_command", "stop",
-                 "task_assign", "task_complete_ack"}
+                 "task_assign", "task_complete_ack", "probe", "probe_result"}
         kwargs = {k: str(v) for k, v in flat.items() if k in known and v is not None}
         return replace(cls(source=source), source=source, **kwargs)
 
@@ -353,6 +375,30 @@ def _position_age_s(snapshot: RobotSnapshot, now: float) -> Optional[float]:
     return max(0.0, now - snapshot.position.timestamp)
 
 
+def _stop_latch_block(snapshot: RobotSnapshot, controller_max_age_s: float) -> Optional[Dict[str, Any]]:
+    """The rover's software stop latch (`safety.stopLatch`), or None when unknown.
+
+    Engaged while the rover is latched in a stop that needs operator action: the
+    Pi's own e-stop latch, or the ESP32's `safety_stop` latch. Reported only
+    while the ESP32's TELEMETRY is fresh -- without it the Pi does not know the
+    ESP32's latch, so the block is omitted and the backend's F7 denies, rather
+    than an unknown latch being reported as released. This is a SOFTWARE stop
+    latch, not a hardware e-stop circuit (the rover has none); the backend
+    records it as such.
+    """
+
+    controller = snapshot.controller
+    telemetry = controller.telemetry if controller is not None else None
+    age = controller.telemetry_age_s if controller is not None else None
+    if telemetry is None or age is None or age > controller_max_age_s:
+        return None
+    pi_latched = snapshot.safety.rule == ESTOP_RULE
+    return {
+        "engaged": bool(pi_latched or telemetry.safety_stop),
+        "components": {"piEmergencyStop": bool(pi_latched), "esp32SafetyStop": bool(telemetry.safety_stop)},
+    }
+
+
 def build_telemetry_payload(
     snapshot: RobotSnapshot,
     *,
@@ -360,6 +406,7 @@ def build_telemetry_payload(
     max_position_age_s: float,
     last_position_timestamp: Optional[float] = None,
     now: Optional[float] = None,
+    controller_max_age_s: float = 1.0,
 ) -> TelemetryFrame:
     """`TELEMETRY` to the handoff (§5, §16): measured fields only, the rest omitted.
 
@@ -389,6 +436,9 @@ def build_telemetry_payload(
         "sequence": int(sequence),
         "status": BACKEND_STATUS_FOR_MODE.get(snapshot.mode, "ERROR"),
     }
+    stop_latch = _stop_latch_block(snapshot, controller_max_age_s)
+    if stop_latch is not None:
+        payload["safety"] = {"stopLatch": stop_latch}
 
     position = snapshot.position
     omitted: Optional[str] = None
@@ -412,6 +462,10 @@ def build_telemetry_payload(
         # Speed over ground from the receiver, when it reported one.
         if position.speed_mps is not None:
             payload["speed"] = round(position.speed_mps, 3)
+        # The receiver's own fix quality, only when it stated both (the ESP32's
+        # u-blox does; NMEA does not). Never inferred from HDOP or defaulted.
+        if position.fix_type is not None and position.h_acc_m is not None:
+            payload["position"] = {"fixType": position.fix_type, "hAccM": round(position.h_acc_m, 3)}
         return TelemetryFrame(payload, position_timestamp=position.timestamp)
 
     payload["timestamp"] = now_ms(now)

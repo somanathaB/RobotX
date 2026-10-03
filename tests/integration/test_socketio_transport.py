@@ -154,9 +154,11 @@ class ContractServer:
             "COMMAND", payload, to=sid or self.authenticated_sids[-1], namespace=NAMESPACE
         )
 
-    async def send_engine(self, envelope, *, sid=None):
+    async def send_engine(self, envelope, *, sid=None, event=None):
+        # As the backend does (commandDispatcher.service.js): the event name IS the
+        # envelope's command -- OFFER, WITHDRAW, ... -- never a generic "command".
         await self.sio.emit(
-            "command", envelope, to=sid or self.authenticated_sids[-1], namespace=NAMESPACE
+            event or envelope["command"], envelope, to=sid or self.authenticated_sids[-1], namespace=NAMESPACE
         )
 
     async def send_task_assign(self, payload, *, sid=None):
@@ -799,7 +801,7 @@ class TestCommandsOverTheWire(ContractTestCase):
 class TestEngineOverTheWire(ContractTestCase):
     """SIMULATED signed envelopes (tests.fixtures.engine) over a real socket."""
 
-    def test_offer_on_the_lowercase_command_event_is_acked_then_answered_once(self):
+    def test_offer_on_its_own_event_name_is_acked_then_answered_once(self):
         from tests.fixtures import engine as fx
 
         async def scenario(server, token_path):
@@ -819,10 +821,30 @@ class TestEngineOverTheWire(ContractTestCase):
         server, agent = self.run_async(scenario)
         self.assertEqual(server.received["COMMAND_ACK"][0],
                          {"outboxId": "ob-19", "fence": "42", "authorityEpoch": None})
+        # (The first test above this used to send OFFER on an event called "command",
+        # which the backend never emits; the Pi bound only that name and so dropped
+        # every real OFFER. See test_an_envelope_on_a_generic_command_event_is_not_an_offer.)
         # The FakeAgent declines, exactly once; never an automatic accept.
         self.assertEqual(server.received["OFFER_REJECT"],
                          [{"commitmentId": "c-7f3a", "fence": "42", "reason": "NO_MOTOR_LINK"}])
         self.assertEqual(server.received["OFFER_ACCEPT"], [])
+
+    def test_an_envelope_on_a_generic_command_event_is_not_an_offer(self):
+        from tests.fixtures import engine as fx
+
+        async def scenario(server, token_path):
+            link = self.make_link(server, token_path, agent=FakeAgent(),
+                                  command_signing_key=fx.TEST_SIGNING_KEY)
+            await link.start()
+            await link.wait_connected(timeout_s=5.0)
+            await server.send_engine(fx.envelope(agent_id=ROBOT_ID), event="command")
+            await asyncio.sleep(0.5)
+            await link.stop()
+            return server, link
+
+        server, link = self.run_async(scenario)
+        self.assertEqual(server.received["COMMAND_ACK"], [])
+        self.assertEqual(link.stats["engine_commands_received"], 0)
 
     def test_task_assign_over_the_wire_gets_no_reply_and_starts_nothing(self):
         from tests.fixtures.task_assign import task_assign_payload

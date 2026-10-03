@@ -48,9 +48,13 @@ INBOUND_LINE_MAX = 4096
 # Section 12: a lone LF clears any partial line in the ESP32's buffer.
 RESYNC = b"\n"
 
-MESSAGE_TYPES = frozenset({"ACK", "ERROR", "EVENT", "TELEMETRY", "DIAG"})
+# GPS (PROTOCOL.md section 11): the u-blox solution the ESP32 polls on I2C 0x42, once
+# a second. Firmware since 4633656 sends it; before this the Pi counted every one
+# as a rejected line and had no position source on the rover at all.
+MESSAGE_TYPES = frozenset({"ACK", "ERROR", "EVENT", "TELEMETRY", "DIAG", "GPS"})
 ACK_RESULTS = frozenset({"ACCEPTED", "GATED", "REJECTED", "DUPLICATE"})
 DIAG_SECTIONS = frozenset({"FRONT", "REAR", "SYSTEM"})
+GPS_STATUSES = frozenset({"NOT_STARTED", "BACKOFF", "NOT_DETECTED", "STALE", "NO_FIX", "OK"})
 
 
 # ---------------------------------------------------------------------------
@@ -127,6 +131,7 @@ def _no_constants(name: str) -> Any:
 # reference suite's required-field list) says are always present are required;
 # optional documented fields are type-checked when present.
 _INT, _OPT_INT, _STR, _BOOL, _OPT_NUM, _LIST = "int", "int?", "str", "bool", "num?", "list"
+_OPT_BOOL = "bool?"
 
 _REQUIRED: Dict[str, Tuple[Tuple[str, str], ...]] = {
     "ACK": (("seq", _INT), ("cmd", _STR), ("result", _STR), ("reason", _STR)),
@@ -149,6 +154,8 @@ _REQUIRED: Dict[str, Tuple[Tuple[str, str], ...]] = {
         ("motor_drive_available", _BOOL),
     ),
     "DIAG": (("section", _STR), ("uptime_ms", _INT)),
+    # Section 11: sent every GPS_FRAME_INTERVAL_MS whatever the GPS state.
+    "GPS": (("gps_status", _STR), ("uptime_ms", _INT)),
 }
 
 _OPTIONAL: Dict[str, Tuple[Tuple[str, str], ...]] = {
@@ -156,6 +163,13 @@ _OPTIONAL: Dict[str, Tuple[Tuple[str, str], ...]] = {
     "TELEMETRY": (
         ("front_warning", _BOOL), ("rear_available", _BOOL),
         ("rear_obstacle", _BOOL), ("rear_sensor_fault", _BOOL),
+    ),
+    # Every value is an integer or null (section 11); lat/lon/hacc are null
+    # unless gps_status is OK.
+    "GPS": (
+        ("fix_type", _OPT_INT), ("fix_ok", _OPT_BOOL), ("siv", _OPT_INT),
+        ("lat_e7", _OPT_INT), ("lon_e7", _OPT_INT), ("hacc_mm", _OPT_INT),
+        ("speed_mm_s", _OPT_INT), ("head_mot_e5", _OPT_INT), ("age_ms", _OPT_INT),
     ),
 }
 
@@ -174,6 +188,8 @@ def _kind_ok(kind: str, v: Any) -> bool:
         return isinstance(v, str)
     if kind == _BOOL:
         return isinstance(v, bool)
+    if kind == _OPT_BOOL:
+        return v is None or isinstance(v, bool)
     if kind == _OPT_NUM:
         return v is None or (isinstance(v, (int, float)) and not isinstance(v, bool))
     if kind == _LIST:
@@ -192,6 +208,8 @@ def _schema_problem(ftype: str, obj: Mapping[str, Any]) -> Optional[str]:
             return f"{ftype} {key} is not {kind}: {obj[key]!r}"
     if ftype == "ACK" and obj["result"] not in ACK_RESULTS:
         return f"ACK result {obj['result']!r} is not documented"
+    if ftype == "GPS" and obj["gps_status"] not in GPS_STATUSES:
+        return f"GPS gps_status {obj['gps_status']!r} is not documented"
     if ftype == "DIAG" and obj["section"] not in DIAG_SECTIONS:
         return f"DIAG section {obj['section']!r} is not documented"
     return None

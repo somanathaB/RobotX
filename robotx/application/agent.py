@@ -40,7 +40,9 @@ from robotx.diagnostics.health import (
     HealthMonitor,
     HealthStatus,
 )
+from robotx.localization.esp32_gps import Esp32GpsReader
 from robotx.esp32.link import Esp32Config, Esp32Link, Esp32Status
+from robotx.esp32.sim_transport import HostSimulatorPort
 from robotx.hardware.camera import CameraConfig, CameraError, CameraStatus, CameraStream
 from robotx.hardware.gps import GPSConfig, GPSReader, GpsReading, GPSStatus
 from robotx.mission.manager import MissionAssignment, MissionManager
@@ -332,6 +334,17 @@ class RobotAgent:
         if not self.settings.gps_enabled:
             log_event(logger, "gps.disabled", "disabled by configuration")
             return
+        if self.settings.gps_source == "esp32":
+            # The receiver is on the ESP32's I2C bus; its frames arrive on the
+            # ESP32 link, so there is no Pi serial port to open at all.
+            if self.esp32 is None:
+                log_event(logger, "gps.no_esp32_link",
+                          "ROBOTX_GPS_SOURCE=esp32 but the ESP32 link is not running; no position source",
+                          level=logging.ERROR)
+                return
+            self.gps = Esp32GpsReader(self.esp32, stale_after_s=self.settings.gps_stale_after_s)
+            log_event(logger, "gps.source", "position from the ESP32's GPS frames", source="esp32")
+            return
         if _same_device(self.settings.gps_port, self.settings.esp32_port):
             # The ESP32 UART is reserved whether or not the link is enabled:
             # the ESP32 is wired there either way. A GPS reader on it would
@@ -364,7 +377,16 @@ class RobotAgent:
             log_event(logger, "esp32.config_invalid", "ESP32 link not started",
                       level=logging.ERROR, error=str(e))
             return
-        self.esp32 = Esp32Link(cfg)
+        exe = self.settings.esp32_simulator_exe
+        if exe:
+            # Software-only: the ESP32 repository's host simulator stands in for
+            # the UART. No serial device is opened and nothing can reach a motor.
+            log_event(logger, "esp32.simulated",
+                      "ESP32 HOST SIMULATOR in place of the UART -- no serial device is opened",
+                      level=logging.WARNING, exe=exe)
+            self.esp32 = Esp32Link(cfg, port_factory=lambda: HostSimulatorPort(exe, read_timeout_s=cfg.read_timeout_s))
+        else:
+            self.esp32 = Esp32Link(cfg)
         self.esp32.start()
 
     def _update_esp32(self) -> Optional[Esp32Status]:
@@ -504,15 +526,16 @@ class RobotAgent:
         return OfferDecision.accept(mission)
 
     def custody_sensing_available(self) -> bool:
-        """Whether anything on this Rover can observe a parcel handover.
+        """Whether a parcel handover on this Rover can be truthfully reported.
 
-        False: there is no load sensor, no compartment switch and no agreed
-        operator-confirmation path. Without one the Rover could never truthfully
-        report ACQUIRED or RELEASED, so it must not accept a mission that
-        requires them.
+        There is no load sensor and no compartment switch. The one truthful
+        source is a person at the stop confirming it, and only when the
+        deployment says that confirmation path is staffed
+        (`ROBOTX_CUSTODY_CONFIRMATION=operator`). Otherwise the Rover must not
+        accept a mission that requires ACQUIRED / RELEASED.
         """
 
-        return False
+        return self.settings.custody_confirmation == "operator"
 
     def record_custody(self, kind: str, *, source: str) -> Any:
         """Record a genuine handover. Raises `MissionRefused` when not at that stop.

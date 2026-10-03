@@ -117,6 +117,9 @@ class Position:
     # which is the right way round: inferring a coordinate is the unusual act,
     # and the unusual act is the one that should require a deliberate statement.
     source: PositionSource = PositionSource.GPS
+    # The receiver's own fix quality, carried through unchanged (see GpsFix).
+    fix_type: Optional[str] = None
+    h_acc_m: Optional[float] = None
 
     @property
     def lat_lon(self) -> LatLon:
@@ -136,6 +139,8 @@ class Position:
             "heading_source": self.heading_source.value,
             "satellites": self.satellites,
             "source": self.source.value,
+            "fix_type": self.fix_type,
+            "h_acc_m": self.h_acc_m,
             "timestamp": self.timestamp,
         }
 
@@ -187,6 +192,8 @@ class PositionEstimator:
             heading_deg=heading,
             heading_source=source,
             satellites=fix.satellites,
+            fix_type=fix.fix_type,
+            h_acc_m=fix.h_acc_m,
         )
 
     def _estimate_heading(

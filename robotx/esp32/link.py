@@ -201,6 +201,9 @@ class Esp32Link:
         self._telemetry_this_connection = False
         self._diag: Dict[str, Dict[str, Any]] = {}
         self._diag_at: Dict[str, float] = {}
+        # The latest GPS frame and the wall time it was parsed (section 11).
+        self._gps: Optional[Dict[str, Any]] = None
+        self._gps_at: Optional[float] = None
 
         self._proto: Optional[int] = None
         self._proto_problem: Optional[str] = None
@@ -456,6 +459,10 @@ class Esp32Link:
                 self._diag_at[data["section"]] = wall
                 if data["section"] == "SYSTEM":
                     self._note_proto(data.get("proto"), "DIAG SYSTEM")
+            elif result.type == "GPS":
+                self._counters["gps"] += 1
+                self._gps = dict(data)
+                self._gps_at = wall
             elif result.type == "EVENT":
                 self._on_event(data, wall)
             elif result.type == "ACK":
@@ -686,6 +693,12 @@ class Esp32Link:
                 controller=controller,
                 diag=diag,
             )
+
+    def gps_frame(self) -> Tuple[Optional[Dict[str, Any]], Optional[float]]:
+        """The latest GPS frame from the ESP32 and the wall time it was parsed."""
+
+        with self._lock:
+            return (None if self._gps is None else dict(self._gps)), self._gps_at
 
     def events(self) -> Tuple[Tuple[float, Dict[str, Any]], ...]:
         """The most recent EVENT frames (bounded), oldest first."""

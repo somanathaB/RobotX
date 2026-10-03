@@ -59,6 +59,12 @@ class GpsFix:
     fix_quality: Optional[int] = None      # GGA, 0=invalid 1=GPS 2=DGPS ...
     speed_mps: Optional[float] = None      # RMC speed over ground
     track_deg: Optional[float] = None      # RMC course over ground (true)
+    # Receiver-reported fix quality, when the source states it (the ESP32's
+    # u-blox NAV-PVT does; NMEA GGA does not). `fix_type` is the backend's
+    # vocabulary ("2D", "3D"); `h_acc_m` the receiver's own horizontal accuracy
+    # estimate. None means "not stated", never "good".
+    fix_type: Optional[str] = None
+    h_acc_m: Optional[float] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -69,6 +75,8 @@ class GpsFix:
             "fix_quality": self.fix_quality,
             "speed_mps": None if self.speed_mps is None else round(self.speed_mps, 3),
             "track_deg": None if self.track_deg is None else round(self.track_deg, 1),
+            "fix_type": self.fix_type,
+            "h_acc_m": self.h_acc_m,
             "timestamp": self.timestamp,
         }
 

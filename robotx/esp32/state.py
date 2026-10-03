@@ -155,6 +155,7 @@ class LinkCounters:
     frames_ok: int = 0
     telemetry: int = 0
     diag: int = 0
+    gps: int = 0                  # GPS frames (section 11)
     events: int = 0
     acks: int = 0
     esp32_errors: int = 0         # ERROR frames: the ESP32 refused something we sent

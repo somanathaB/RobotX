@@ -96,6 +96,7 @@ from robotx.communication.engine import (
     verify_signature,
 )
 from robotx.communication.protocol import (
+    BACKEND_STATUS_FOR_MODE,
     AuthMethod,
     CommandRejection,
     CommandStatus,
@@ -758,10 +759,17 @@ class BackendLink:
             async def on_task_assign(data: Any = None) -> None:
                 await self._on_task_assign(data)
 
-        if self.cfg.binding.engine_command:
-            @sio.on(self.cfg.binding.engine_command, namespace=ns)
-            async def on_engine_command(data: Any = None) -> None:
-                await self._on_engine_command(data)
+        # Every engine command name, each its own event (see ProtocolBinding).
+        async def on_engine_command(data: Any = None) -> None:
+            await self._on_engine_command(data)
+
+        for engine_event in self.cfg.binding.engine_command_events():
+            sio.on(engine_event, namespace=ns)(on_engine_command)
+
+        if self.cfg.binding.probe:
+            @sio.on(self.cfg.binding.probe, namespace=ns)
+            async def on_probe(data: Any = None) -> None:
+                await self._on_probe(data)
 
         if self.cfg.binding.task_complete_ack:
             @sio.on(self.cfg.binding.task_complete_ack, namespace=ns)
@@ -1401,6 +1409,34 @@ class BackendLink:
             verdict=decision.verdict.value,
             reason=decision.reason,
         )
+
+    async def _on_probe(self, data: Any) -> None:
+        """Answer a server PROBE on this socket (backend agentProbe.service, F14/F15).
+
+        Answered only while authenticated and only while the agent loop is
+        alive: an answer from a stalled agent would prove a link to nothing.
+        The correlation id is echoed unchanged; nothing else is asserted.
+        """
+
+        self._note_recv()
+        correlation = data.get("correlationId") if isinstance(data, dict) else None
+        if not isinstance(correlation, str) or not correlation:
+            return
+        if not self._authenticated.is_set():
+            return
+        alive = getattr(self._target, "is_alive", None)
+        if callable(alive) and not alive():
+            self.stats["probes_unanswered_agent_stalled"] = self.stats.get("probes_unanswered_agent_stalled", 0) + 1
+            return
+        snapshot = self.state.snapshot()
+        payload = {
+            "command": "PROBE",
+            "correlationId": correlation,
+            "robotId": self.cfg.robot_id,
+            "status": BACKEND_STATUS_FOR_MODE.get(snapshot.mode, "ERROR"),
+        }
+        if await self._emit(self.cfg.binding.probe_result, payload):
+            self.stats["probes_answered"] = self.stats.get("probes_answered", 0) + 1
 
     async def _on_task_complete_ack(self, data: Any) -> None:
         """The backend's verdict on a TASK_COMPLETE. Never retried either way."""

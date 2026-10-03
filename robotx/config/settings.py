@@ -136,6 +136,11 @@ class Settings:
     gps_stale_after_s: float = 5.0
     # Seconds to wait before retrying a failed serial open.
     gps_reconnect_interval_s: float = 5.0
+    # Where the rover's position comes from. "pi_serial" (default): an NMEA
+    # receiver on the Pi's own UART. "esp32": the u-blox receiver on the ESP32's
+    # I2C bus, reported in the ESP32's GPS frames (PROTOCOL.md section 11) --
+    # the rover's current wiring. "esp32" needs the ESP32 link enabled.
+    gps_source: str = "pi_serial"
 
     # --- ESP32 link (robotx.esp32) --------------------------------------------
     # The UART to the ESP32 motor/sensor controller. Off by default, so the
@@ -156,6 +161,18 @@ class Settings:
     # At most 1.0 s (enforced), far inside the ESP32's own 2 s watchdog.
     esp32_command_max_age_s: float = 0.3
     esp32_reconnect_max_s: float = 10.0
+    # The ESP32 repository's host simulator executable. When set, the link
+    # talks to that process over stdin/stdout instead of opening any serial
+    # device: software-only runs (Gate 3) with no UART and no motors.
+    esp32_simulator_exe: str = ""
+
+    # --- Custody ------------------------------------------------------------
+    # How a parcel handover is known. "none" (default): nothing on this rover
+    # can observe one, so it accepts no mission that needs custody reports.
+    # "operator": the person at the stop confirms each handover through the
+    # local API (POST /mission/custody); reported as OPERATOR_CONFIRMED, never
+    # as a sensor reading.
+    custody_confirmation: str = "none"
 
     # --- Position estimation ------------------------------------------------
     # Minimum movement between two fixes before a GPS-track heading is derived.
@@ -379,6 +396,7 @@ class Settings:
             gps_timeout_s=_get_float(e, "ROBOTX_GPS_TIMEOUT_S", d.gps_timeout_s),
             gps_stale_after_s=_get_float(e, "ROBOTX_GPS_STALE_AFTER_S", d.gps_stale_after_s),
             gps_reconnect_interval_s=_get_float(e, "ROBOTX_GPS_RECONNECT_INTERVAL_S", d.gps_reconnect_interval_s),
+            gps_source=_get_str(e, "ROBOTX_GPS_SOURCE", d.gps_source),
             esp32_enabled=_get_bool(e, "ROBOTX_ESP32_ENABLED", d.esp32_enabled),
             esp32_port=_get_str(e, "ROBOTX_ESP32_PORT", d.esp32_port),
             esp32_baudrate=_get_int(e, "ROBOTX_ESP32_BAUDRATE", d.esp32_baudrate),
@@ -388,6 +406,8 @@ class Settings:
             esp32_ack_timeout_s=_get_float(e, "ROBOTX_ESP32_ACK_TIMEOUT_S", d.esp32_ack_timeout_s),
             esp32_command_max_age_s=_get_float(e, "ROBOTX_ESP32_COMMAND_MAX_AGE_S", d.esp32_command_max_age_s),
             esp32_reconnect_max_s=_get_float(e, "ROBOTX_ESP32_RECONNECT_MAX_S", d.esp32_reconnect_max_s),
+            esp32_simulator_exe=_get_str(e, "ROBOTX_ESP32_SIMULATOR_EXE", d.esp32_simulator_exe),
+            custody_confirmation=_get_str(e, "ROBOTX_CUSTODY_CONFIRMATION", d.custody_confirmation),
             position_heading_min_move_m=_get_float(e, "ROBOTX_HEADING_MIN_MOVE_M", d.position_heading_min_move_m),
             position_heading_min_speed_mps=_get_float(e, "ROBOTX_HEADING_MIN_SPEED_MPS", d.position_heading_min_speed_mps),
             nav_waypoint_arrival_m=_get_float(e, "ROBOTX_NAV_WAYPOINT_ARRIVAL_M", d.nav_waypoint_arrival_m),
