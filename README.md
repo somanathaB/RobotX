@@ -66,8 +66,16 @@ For the honest status of each piece, read **`ROBOTX_PI_CURRENT_STATE.md`**.
 
 ```bash
 cd /home/pi/Desktop/RobotX
-venv/bin/python -m uvicorn robotx.application.main:app --host 0.0.0.0 --port 8000
+venv/bin/python -m robotx.application
 ```
+
+This serves the local API on `ROBOTX_API_HOST`:`ROBOTX_API_PORT`, by default
+`127.0.0.1:8000` -- reachable from the Pi itself only. The API is
+unauthenticated, so exposing it to the network is an explicit choice: set
+`ROBOTX_API_HOST` to the interface to serve on (`0.0.0.0` for every interface),
+on a trusted network only. With `ROBOTX_SOCKET_ENABLED=1` RobotX admits
+missions: `POST /mission/start` and `POST /mission/resume` answer 409, and a
+paused mission is resumed from the dashboard.
 
 The agent starts even if the camera or GPS is missing — those subsystems report
 as unavailable and the decision layer refuses to request motion. That is what
@@ -83,10 +91,10 @@ makes the Pi testable on its own.
 | `GET /config` | Effective configuration (secrets shown as SET/UNSET) |
 | `GET /backend` | Backend link state, protocol binding, message counters |
 | `GET /camera` | MJPEG preview |
-| `POST /mission/start` | Load a waypoint route and switch to AUTO |
+| `POST /mission/start` | Load a waypoint route and switch to AUTO (bench mode only: 409 with `ROBOTX_SOCKET_ENABLED=1`) |
 | `POST /mission/stop` | Halt and clear the route |
 | `POST /mission/pause` | Suspend the mission, keeping the route |
-| `POST /mission/resume` | Resume a paused mission (409 if there is nothing to resume) |
+| `POST /mission/resume` | Resume a paused mission (409 if there is nothing to resume; bench mode only: 409 with `ROBOTX_SOCKET_ENABLED=1`) |
 | `POST /mission/idle` | Return to IDLE |
 
 ```bash
@@ -123,6 +131,8 @@ Everything is read from `ROBOTX_*` environment variables in
 |---|---|---|
 | `ROBOTX_ROBOT_ID` | `robotx-pi` | Identity in telemetry |
 | `ROBOTX_LOG_LEVEL` | `INFO` | Logging verbosity |
+| `ROBOTX_API_HOST` | `127.0.0.1` | Local API bind address; another interface is an explicit, network-exposing choice |
+| `ROBOTX_API_PORT` | `8000` | Local API port |
 | `ROBOTX_CAMERA_ENABLED` | `1` | Turn the camera off for headless testing |
 | `ROBOTX_CAMERA_WIDTH/HEIGHT/FPS` | 640/480/20 | Capture settings |
 | `ROBOTX_DETECTION_BACKEND` | `opencv` | `opencv`, `yolo`, or `auto` |

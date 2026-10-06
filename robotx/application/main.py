@@ -1,17 +1,26 @@
 """Entry point: a local HTTP surface over the Pi robot agent.
 
-    venv/bin/python -m uvicorn robotx.application.main:app --host 0.0.0.0 --port 8000
+    venv/bin/python -m robotx.application
+
+That serves on `ROBOTX_API_HOST`:`ROBOTX_API_PORT` (default 127.0.0.1:8000, this
+Pi only; see `run`). Reaching it from another machine is an explicit choice:
+set `ROBOTX_API_HOST` to the interface to expose.
 
 The HTTP layer is a thin window onto `RobotAgent`: it reads state and starts or
 stops a mission. All the logic lives in the agent. Nothing here drives motors,
 talks to an ESP32, or connects to a backend.
 
 Endpoints are unauthenticated and intended for a trusted local network only.
+With the backend link enabled RobotX admits missions, so the two routes that
+put the robot into AUTO -- `/mission/start` and `/mission/resume` -- refuse
+(409) and a RESUME comes only through the backend (see
+`refuse_local_admission_in_engine_mode`).
 """
 
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import logging
 from contextlib import asynccontextmanager
 from typing import Any, AsyncGenerator, Dict, List, Optional
@@ -22,7 +31,7 @@ from pydantic import BaseModel, Field
 
 from robotx.application.agent import RobotAgent
 from robotx.config.logging_setup import log_event, setup_logging
-from robotx.config.settings import SETTINGS
+from robotx.config.settings import SETTINGS, Settings
 from robotx.diagnostics.health import HealthStatus
 from robotx.state.robot_state import MissionRefused
 from robotx.state.telemetry import build_telemetry
@@ -156,15 +165,39 @@ class MissionRequest(BaseModel):
     waypoints: List[Waypoint] = Field(min_length=1)
 
 
+ENGINE_MODE_REFUSAL = "engine mode: missions come from RobotX; resume from the dashboard"
+
+
+def refuse_local_admission_in_engine_mode(agent: RobotAgent, route: str) -> None:
+    """409 before anything changes, whenever the backend link is enabled.
+
+    With `ROBOTX_SOCKET_ENABLED` RobotX is the authority on what this robot
+    drives: a mission arrives as a signed, fenced OFFER and a RESUME as an
+    authenticated backend command, which also proves the link is up. A local
+    start would replace the route of the engine mission it holds (whose lease
+    the heartbeat keeps renewing), and a local resume would undo the pause the
+    backend-loss policy took while RobotX may be reassigning the Leg. Decided
+    on configuration, not on the link's current state: a link that is down or
+    never started is exactly when a local AUTO must not happen. Bench mode
+    (link disabled) is unaffected.
+    """
+
+    if agent.settings.socket_enabled:
+        log_event(logger, "api.admission_refused", ENGINE_MODE_REFUSAL, level=logging.WARNING,
+                  route=route, mode=agent.state.mode.value)
+        raise HTTPException(status_code=409, detail=ENGINE_MODE_REFUSAL)
+
+
 @app.post("/mission/start")
 async def start_mission(request: MissionRequest) -> Dict[str, Any]:
-    """Load a local waypoint route and switch the agent to AUTO.
+    """Load a local waypoint route and switch the agent to AUTO. Bench mode only.
 
     The agent publishes motion intent only -- nothing moves until an ESP32 is
     connected and chooses to honour that intent.
     """
 
     agent = get_agent()
+    refuse_local_admission_in_engine_mode(agent, "/mission/start")
     agent.start_mission([(w.lat, w.lon) for w in request.waypoints])
     return {"mode": agent.state.mode.value, "waypoints": len(request.waypoints)}
 
@@ -187,9 +220,10 @@ async def pause_mission() -> Dict[str, Any]:
 
 @app.post("/mission/resume")
 async def resume_mission() -> Dict[str, Any]:
-    """Return a paused mission to AUTO, or 409 if there is nothing to resume."""
+    """Return a paused mission to AUTO, or 409 if there is nothing to resume. Bench mode only."""
 
     agent = get_agent()
+    refuse_local_admission_in_engine_mode(agent, "/mission/resume")
     try:
         agent.resume_mission("resumed via API")
     except MissionRefused as e:
@@ -304,3 +338,40 @@ async def camera_stream() -> StreamingResponse:
         _mjpeg_frames(agent),
         media_type=f"multipart/x-mixed-replace; boundary={MJPEG_BOUNDARY}",
     )
+
+
+# --- launch -------------------------------------------------------------------
+
+
+def _is_loopback(host: str) -> bool:
+    if host.strip().lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host.strip()).is_loopback
+    except ValueError:
+        return False
+
+
+def run(settings: Settings = SETTINGS) -> None:
+    """Serve the API on `ROBOTX_API_HOST`:`ROBOTX_API_PORT`, the one launch path.
+
+    The default host is loopback: the routes are unauthenticated, so being
+    reachable from the network is something the deployment states (for
+    example the interface an operator's custody confirmation arrives on), never
+    something it gets by default. Anything else is served as configured, and
+    said so in the log.
+    """
+
+    import uvicorn
+
+    setup_logging(settings.log_level)
+    if not _is_loopback(settings.api_host):
+        log_event(
+            logger,
+            "api.network_exposed",
+            "local API is reachable from other machines; its routes are unauthenticated",
+            level=logging.WARNING,
+            host=settings.api_host,
+            port=settings.api_port,
+        )
+    uvicorn.run(app, host=settings.api_host, port=settings.api_port)

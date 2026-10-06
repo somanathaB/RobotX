@@ -636,17 +636,24 @@ class Test14NoHardcodedBackendAddress(unittest.TestCase):
         for name in self.FILES:
             text = (REPO / name).read_text()
             self.assertNotRegex(text, r"(?i)localhost", name)
-            for match in address.findall(text):
-                try:
-                    ip = ipaddress.ip_address(match)
-                except ValueError:
-                    continue
-                if ip.is_unspecified:
-                    continue  # 0.0.0.0: the local API's bind address, not a host
-                self.assertFalse(
-                    ip.is_private or ip.is_loopback,
-                    f"{name} contains a hardcoded address {match}",
-                )
+            for line in text.splitlines():
+                # H2: the local API's own bind address (loopback by default) is
+                # where this Pi listens, not a backend host -- exempt on exactly
+                # that setting's line and nowhere else.
+                api_bind = re.search(r"\bapi_host\b|\bROBOTX_API_HOST=", line) is not None
+                for match in address.findall(line):
+                    try:
+                        ip = ipaddress.ip_address(match)
+                    except ValueError:
+                        continue
+                    if ip.is_unspecified:
+                        continue  # 0.0.0.0: a bind address (every interface), not a host
+                    if api_bind and ip.is_loopback:
+                        continue
+                    self.assertFalse(
+                        ip.is_private or ip.is_loopback,
+                        f"{name} contains a hardcoded address {match}",
+                    )
 
 
 if __name__ == "__main__":

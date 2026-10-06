@@ -87,7 +87,10 @@ class Settings:
     log_level: str = "INFO"
 
     # --- Local HTTP API -----------------------------------------------------
-    api_host: str = "0.0.0.0"
+    # What `python -m robotx.application` binds (`main.run`). Loopback by
+    # default: the routes are unauthenticated, so exposing them to the network
+    # is an explicit deployment choice, never the default.
+    api_host: str = "127.0.0.1"
     api_port: int = 8000
 
     # --- Agent loop ---------------------------------------------------------

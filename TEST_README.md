@@ -161,13 +161,16 @@ stop/forward rule over real sensors, kept for drivetrain bench work.
 #### 7. Full agent on real hardware
 
 ```bash
-venv/bin/python -m uvicorn robotx.application.main:app --host 0.0.0.0 --port 8000
+venv/bin/python -m robotx.application
 ```
+
+(Serves on `ROBOTX_API_HOST`:`ROBOTX_API_PORT`, default `127.0.0.1:8000`; the
+`curl` checks below run on the Pi itself.)
 
 - [ ] Startup logs show camera connected, perception started, GPS starting
 - [ ] `curl localhost:8000/health` — camera and perception `HEALTHY`
 - [ ] `curl localhost:8000/state` — perception status `OK`, detections update
-- [ ] `http://<pi-ip>:8000/camera` shows live video in a browser
+- [ ] `http://<pi-ip>:8000/camera` shows live video in a browser (from another machine only with `ROBOTX_API_HOST` set to an interface it can reach; the default serves the Pi itself)
 - [ ] `curl localhost:8000/telemetry` — battery is `UNAVAILABLE`/`null`
 - [ ] With no GPS fix, starting a mission yields intent `STOP — no GPS position`
 - [ ] Ctrl+C shuts down cleanly: perception stopped, GPS stopped, camera released
