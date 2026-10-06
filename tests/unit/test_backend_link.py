@@ -55,9 +55,14 @@ class FakeSio:
         #   no_token          -> AUTH_SUCCESS with nothing usable in it
         #   silent_disconnect -> disconnect(true), which is what FalconAut does
         #   failed            -> an explicit AUTH_FAILED event
+        #   rejected          -> R1: AUTH_FAILED `rejected_payload`, then disconnect(true) --
+        #                        the backend's credential refusal, by default exactly
+        #                        {"reason": "INVALID_CREDENTIAL"}
+        #   explode           -> the AUTH emit itself raises (an unexpected exception)
         #   none              -> no answer at all (drives the auth timeout)
         self.auth_mode = auth_mode
         self.auth_token = auth_token
+        self.rejected_payload = {"reason": "INVALID_CREDENTIAL"}
         self.registration_count = 0
 
     # --- handler registration (mirrors python-socketio's API) ---------------
@@ -112,6 +117,11 @@ class FakeSio:
             await self.fire("AUTH_SUCCESS", {"ok": True})
         elif self.auth_mode == "failed":
             await self.fire("AUTH_FAILED", {"reason": "invalid pairing code"})
+        elif self.auth_mode == "rejected":
+            await self.fire("AUTH_FAILED", self.rejected_payload)
+            await self.drop()
+        elif self.auth_mode == "explode":
+            raise RuntimeError("unexpected failure while handling AUTH")
         elif self.auth_mode == "silent_disconnect":
             # What FalconAut actually does: disconnect(true), no error event.
             await self.drop()
@@ -367,7 +377,8 @@ class TestConnectionAndAuth(AsyncTestCase):
         self.assertEqual([event for event, _ in sio.emitted], ["AUTH"])
 
     def test_silent_disconnect_during_auth_is_an_auth_failure(self):
-        """FalconAut refuses by calling disconnect(true) with no error event."""
+        """A disconnect during AUTH fails the attempt -- but, since R1, it is not a
+        verdict on the credential: the backend says that with AUTH_FAILED."""
 
         async def scenario():
             link, sio = make_link(sio=FakeSio(auth_mode="silent_disconnect"))
@@ -376,7 +387,8 @@ class TestConnectionAndAuth(AsyncTestCase):
 
         link, ok = self.run_async(scenario())
         self.assertFalse(ok)
-        self.assertIn("refused", link._auth_failure_detail)
+        self.assertIn("no credential verdict", link._auth_failure_detail)
+        self.assertFalse(link._credential_rejected)
 
     def test_explicit_auth_failed_event_is_honoured(self):
         async def scenario():
@@ -399,16 +411,20 @@ class TestConnectionAndAuth(AsyncTestCase):
         self.assertIn("no AUTH_SUCCESS", link._auth_failure_detail)
 
     def test_refused_token_is_discarded_so_the_pairing_code_is_tried_next(self):
+        """Refused = the backend's explicit AUTH_FAILED {reason: INVALID_CREDENTIAL}
+        (R1), sent before its disconnect -- not a bare disconnect."""
+
         async def scenario():
             tokens = MemoryTokenStore(token="stale-tok")
-            link, _ = make_link(tokens=tokens, sio=FakeSio(auth_mode="silent_disconnect"))
+            link, _ = make_link(tokens=tokens, sio=FakeSio(auth_mode="rejected"))
             await connect_and_auth(link)
             await link._handle_auth_failure()
-            return tokens
+            return link, tokens
 
-        tokens = self.run_async(scenario())
+        link, tokens = self.run_async(scenario())
         self.assertEqual(tokens.clears, 1)
         self.assertIsNone(tokens.token)
+        self.assertEqual(link._available_credential(), (None, "123456"))
 
     def test_refused_pairing_code_is_kept(self):
         """A 300 s TTL makes expiry far likelier than a wrong code."""
@@ -678,6 +694,263 @@ class TestBackoff(AsyncTestCase):
 
         link = self.run_async(scenario())
         self.assertGreater(link.stats["auth_successes"], 0)
+
+
+class SequencedSio(FakeSio):
+    """A FakeSio that answers successive AUTHs with successive modes."""
+
+    def __init__(self, modes, **kwargs):
+        super().__init__(**kwargs)
+        self.modes = list(modes)
+
+    async def _answer_auth(self):
+        if self.modes:
+            self.auth_mode = self.modes.pop(0)
+        await super()._answer_auth()
+
+
+class RaisingSaveStore(MemoryTokenStore):
+    """A token store whose write raises something unexpected."""
+
+    def save(self, *, robot_id, token):
+        raise RuntimeError("unexpected failure persisting the token")
+
+
+class TestR1CredentialRetention(AsyncTestCase):
+    """R1 -- the stored session token is discarded ONLY on the backend's explicit
+    `AUTH_FAILED {"reason": "INVALID_CREDENTIAL"}`. A timeout, a disconnect, a
+    transport error, an exception or any other reason keeps it."""
+
+    async def _attempt(self, link):
+        """One attempt as `_run` makes it: connect, await the outcome, react."""
+
+        ok = await connect_and_auth(link)
+        if not ok:
+            await link._handle_auth_failure()
+        return ok
+
+    def _assert_kept(self, link, tokens, token="stored-tok"):
+        self.assertEqual(tokens.clears, 0)
+        self.assertEqual(tokens.token, token)
+        # The next attempt presents the very same token, not the pairing code.
+        self.assertEqual(link._available_credential(), (token, None))
+
+    def test_A_invalid_credential_deletes_the_token_and_falls_back_to_pairing(self):
+        async def scenario():
+            tokens = MemoryTokenStore(token="stored-tok")
+            sio = SequencedSio(["rejected", "success"], auth_token="fresh-tok")
+            link, _ = make_link(tokens=tokens, sio=sio, pairing_code="654321")
+            first = await self._attempt(link)
+            cleared_after_first = (tokens.clears, tokens.token)
+            second = await self._attempt(link)  # the existing fallback: the pairing code
+            return link, sio, tokens, first, cleared_after_first, second
+
+        link, sio, tokens, first, cleared_after_first, second = self.run_async(scenario())
+        self.assertFalse(first)
+        self.assertEqual(cleared_after_first, (1, None))
+        auths = sio.events_named("AUTH")
+        self.assertEqual(auths[0], {"robotId": "robotx-pi", "token": "stored-tok"})
+        self.assertEqual(auths[1], {"robotId": "robotx-pi", "pairingCode": "654321"})
+        self.assertTrue(second)
+        self.assertEqual(tokens.saves, [("robotx-pi", "fresh-tok")])
+        self.assertEqual(link.cfg.pairing_code, "654321")  # the code itself untouched
+        self.assertEqual(link.cfg.robot_id, "robotx-pi")
+
+    def test_A_the_explicit_refusal_keeps_its_own_detail_through_the_disconnect_that_follows(self):
+        async def scenario():
+            link, _ = make_link(tokens=MemoryTokenStore(token="stored-tok"), sio=FakeSio(auth_mode="rejected"))
+            await connect_and_auth(link)
+            return link
+
+        link = self.run_async(scenario())
+        self.assertTrue(link._credential_rejected)
+        self.assertIn("INVALID_CREDENTIAL", link._auth_failure_detail)
+
+    def test_B_auth_timeout_keeps_the_token_and_the_next_attempt_reuses_it(self):
+        async def scenario():
+            tokens = MemoryTokenStore(token="stored-tok")
+            sio = SequencedSio(["none", "success"], auth_token="stored-tok")
+            link, _ = make_link(tokens=tokens, sio=sio, auth_timeout_s=0.05)
+            first = await self._attempt(link)
+            kept = (tokens.clears, tokens.token)
+            second = await self._attempt(link)
+            return link, sio, tokens, first, kept, second
+
+        link, sio, tokens, first, kept, second = self.run_async(scenario())
+        self.assertFalse(first)
+        self.assertEqual(kept, (0, "stored-tok"))
+        self.assertTrue(second)
+        self.assertEqual([p.get("token") for p in sio.events_named("AUTH")], ["stored-tok", "stored-tok"])
+        self._assert_kept(link, tokens)
+
+    def test_C_disconnect_during_auth_keeps_the_token_and_the_next_attempt_reuses_it(self):
+        async def scenario():
+            tokens = MemoryTokenStore(token="stored-tok")
+            sio = SequencedSio(["silent_disconnect", "success"], auth_token="stored-tok")
+            link, _ = make_link(tokens=tokens, sio=sio)
+            first = await self._attempt(link)
+            second = await self._attempt(link)
+            return link, sio, tokens, first, second
+
+        link, sio, tokens, first, second = self.run_async(scenario())
+        self.assertFalse(first)
+        self.assertTrue(second)
+        auths = sio.events_named("AUTH")
+        self.assertEqual([p.get("token") for p in auths], ["stored-tok", "stored-tok"])
+        self.assertTrue(all("pairingCode" not in p for p in auths))
+        self._assert_kept(link, tokens)
+
+    def test_D_connection_errors_keep_the_token(self):
+        async def scenario():
+            tokens = MemoryTokenStore(token="stored-tok")
+            sio = FakeSio(fail_connect=ConnectionError("Connection reset by peer"))
+            link, _ = make_link(tokens=tokens, sio=sio, backoff_initial_s=0.01, backoff_max_s=0.02)
+            link._running = True
+            task = asyncio.create_task(link._run())
+            await asyncio.sleep(0.1)
+            link._running = False
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            return link, tokens
+
+        link, tokens = self.run_async(scenario())
+        self.assertGreater(link.stats["connect_failures"], 1)
+        self._assert_kept(link, tokens)
+
+    def test_E_an_unexpected_exception_during_auth_keeps_the_token(self):
+        for name, factory in (
+            ("the AUTH emit raises", lambda: (MemoryTokenStore(token="stored-tok"), FakeSio(auth_mode="explode"))),
+            ("persisting AUTH_SUCCESS raises", lambda: (RaisingSaveStore(token="stored-tok"), FakeSio(auth_token="stored-tok"))),
+        ):
+            with self.subTest(name):
+                async def scenario():
+                    tokens, sio = factory()
+                    link, _ = make_link(tokens=tokens, sio=sio, auth_timeout_s=0.05)
+                    ok = await self._attempt(link)
+                    return link, tokens, ok
+
+                link, tokens, ok = self.run_async(scenario())
+                self.assertFalse(ok)
+                self.assertFalse(link._credential_rejected)
+                self._assert_kept(link, tokens)
+
+    def test_F_any_other_or_malformed_auth_failed_keeps_the_token(self):
+        for payload in (
+            {}, {"reason": None}, {"reason": "SOMETHING_ELSE"}, None, "INVALID_CREDENTIAL",
+            {"reason": "invalid_credential"}, {"reason": " INVALID_CREDENTIAL"}, {"reason": ["INVALID_CREDENTIAL"]},
+            {"error": "INVALID_CREDENTIAL"},
+            {"reason": "INVALID_TOKEN"}, {"reason": "AUTH_ERROR"}, {"reason": "AUTH_REJECTED"},
+            {"reason": "BAD_TOKEN"}, {"reason": "TOKEN_EXPIRED"},
+        ):
+            with self.subTest(payload=payload):
+                async def scenario():
+                    tokens = MemoryTokenStore(token="stored-tok")
+                    sio = FakeSio(auth_mode="rejected")
+                    sio.rejected_payload = payload
+                    link, _ = make_link(tokens=tokens, sio=sio)
+                    ok = await self._attempt(link)
+                    return link, tokens, ok
+
+                link, tokens, ok = self.run_async(scenario())
+                self.assertFalse(ok)
+                self.assertFalse(link._credential_rejected)
+                self._assert_kept(link, tokens)
+
+    def test_G_a_successful_token_auth_keeps_the_token_and_never_pairs(self):
+        async def scenario():
+            tokens = MemoryTokenStore(token="stored-tok")
+            link, sio = make_link(tokens=tokens, sio=FakeSio(auth_token="stored-tok"))
+            ok = await self._attempt(link)
+            return link, sio, tokens, ok
+
+        link, sio, tokens, ok = self.run_async(scenario())
+        self.assertTrue(ok)
+        self.assertIs(link.status, LinkStatus.AUTHENTICATED)
+        self.assertEqual(link.describe()["auth_method"], "TOKEN")
+        self.assertEqual(sio.events_named("AUTH"), [{"robotId": "robotx-pi", "token": "stored-tok"}])
+        self.assertEqual(tokens.clears, 0)
+        self.assertEqual(tokens.saves, [("robotx-pi", "stored-tok")])
+
+    def test_H_pairing_authentication_persists_the_new_token(self):
+        async def scenario():
+            tokens = MemoryTokenStore(token=None)
+            link, sio = make_link(tokens=tokens, sio=FakeSio(auth_token="issued-tok"), pairing_code="654321")
+            ok = await self._attempt(link)
+            return link, sio, tokens, ok
+
+        link, sio, tokens, ok = self.run_async(scenario())
+        self.assertTrue(ok)
+        self.assertTrue(link.connected)
+        self.assertEqual(link.describe()["auth_method"], "PAIRING_CODE")
+        self.assertEqual(sio.events_named("AUTH"), [{"robotId": "robotx-pi", "pairingCode": "654321"}])
+        self.assertEqual(tokens.saves, [("robotx-pi", "issued-tok")])
+        self.assertEqual(tokens.clears, 0)
+
+    def test_a_verdict_never_carries_over_to_the_next_attempt(self):
+        """A rejection of one attempt must not discard the token on a later,
+        ambiguous one."""
+
+        async def scenario():
+            tokens = MemoryTokenStore(token=None)
+            sio = SequencedSio(["rejected", "silent_disconnect"])
+            link, _ = make_link(tokens=tokens, sio=sio)
+            await self._attempt(link)  # pairing code rejected: nothing stored to discard
+            tokens.token = "stored-tok"  # a token is stored before the next attempt
+            await self._attempt(link)  # that attempt only loses its connection
+            return link, tokens
+
+        link, tokens = self.run_async(scenario())
+        self._assert_kept(link, tokens)
+
+    def test_an_operator_configured_token_is_never_discarded(self):
+        async def scenario():
+            tokens = MemoryTokenStore(token="stored-tok")
+            link, _ = make_link(tokens=tokens, sio=FakeSio(auth_mode="rejected"), robot_token="operator-tok")
+            await self._attempt(link)
+            return link, tokens
+
+        link, tokens = self.run_async(scenario())
+        self.assertTrue(link._credential_rejected)
+        self.assertEqual(tokens.clears, 0)
+
+    def test_a_rejected_pairing_code_is_kept(self):
+        async def scenario():
+            tokens = MemoryTokenStore(token=None)
+            link, _ = make_link(tokens=tokens, sio=FakeSio(auth_mode="rejected"), pairing_code="654321")
+            await self._attempt(link)
+            return link, tokens
+
+        link, tokens = self.run_async(scenario())
+        self.assertEqual(tokens.clears, 0)
+        self.assertEqual(link._available_credential(), (None, "654321"))
+
+    def test_the_run_loop_reconnects_after_a_dropped_auth_with_the_same_token(self):
+        async def scenario():
+            tokens = MemoryTokenStore(token="stored-tok")
+            sio = SequencedSio(["silent_disconnect", "none", "success"], auth_token="stored-tok")
+            link, _ = make_link(tokens=tokens, sio=sio, auth_timeout_s=0.05, backoff_auth_failed_s=0.01)
+            link._running = True
+            task = asyncio.create_task(link._run())
+            for _ in range(200):
+                if link.stats["auth_successes"]:
+                    break
+                await asyncio.sleep(0.01)
+            link._running = False
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            return link, sio, tokens
+
+        link, sio, tokens = self.run_async(scenario())
+        self.assertEqual(link.stats["auth_failures"], 2)
+        self.assertEqual(link.stats["auth_successes"], 1)
+        self.assertEqual([p.get("token") for p in sio.events_named("AUTH")], ["stored-tok"] * 3)
+        self.assertEqual(tokens.clears, 0)
 
 
 class TestTelemetryPublishing(AsyncTestCase):

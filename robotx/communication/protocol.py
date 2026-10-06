@@ -14,7 +14,9 @@ Summary of the wire
 -------------------
 - Socket.IO v4, namespace `/`, anonymous connect, then `AUTH {robotId, token |
   pairingCode}` -> `AUTH_SUCCESS` and `AUTH_OK` (both arrive; one is handled).
-  Refusal is a silent disconnect.
+  A rejected credential is `AUTH_FAILED {reason: "INVALID_CREDENTIAL"}` then a
+  disconnect; any other failure is a silent disconnect and says nothing about
+  the credential.
 - `HEARTBEAT {}` every ~2 s, or `{commitmentId, fence}` while carrying out an
   accepted mission.
 - `TELEMETRY {timestamp, sequence, status, lat?, lon?, speed?}`. Anything not
@@ -689,6 +691,14 @@ def agent_capabilities() -> Dict[str, Any]:
 
 
 # --- authentication -----------------------------------------------------------
+
+
+# R1 -- the one `AUTH_FAILED` reason that is the backend's verdict on the
+# credential this robot presented (robot.handler.js `AUTH_FAILURE_REASON`). It is
+# the only thing that may cost the robot its stored session token. A timeout, a
+# disconnect, a transport error or any other reason is not a verdict: the backend
+# sends no AUTH_FAILED when it merely failed (a database error, an exception).
+AUTH_FAILURE_INVALID_CREDENTIAL = "INVALID_CREDENTIAL"
 
 
 class AuthMethod(str, Enum):

@@ -96,6 +96,7 @@ from robotx.communication.engine import (
     verify_signature,
 )
 from robotx.communication.protocol import (
+    AUTH_FAILURE_INVALID_CREDENTIAL,
     BACKEND_STATUS_FOR_MODE,
     AuthMethod,
     CommandRejection,
@@ -371,6 +372,10 @@ class BackendLink:
         self._last_connect_error: str = ""
         self._auth_method: Optional[AuthMethod] = None
         self._auth_failure_detail: str = ""
+        # R1 -- set, for this attempt only, when the backend answered AUTH with
+        # AUTH_FAILED {reason: INVALID_CREDENTIAL}: the one verdict that may cost
+        # the stored session token. Reset on every connect.
+        self._credential_rejected = False
         # Incremented once per set of handler registrations. Must stay at 1 for
         # the life of the process; asserted by test.
         self.handler_registrations = 0
@@ -656,6 +661,7 @@ class BackendLink:
         self._authenticated.clear()
         self._auth_failed.clear()
         self._auth_failure_detail = ""
+        self._credential_rejected = False
 
         sio = self._ensure_client()
 
@@ -706,15 +712,18 @@ class BackendLink:
             self._authenticated.clear()
             self._disconnected_since = time.monotonic()
 
-            # A disconnect while we were waiting for AUTH_SUCCESS *is* the
-            # authentication failure: FalconAut refuses by calling
-            # disconnect(true) with no error event. Nothing else distinguishes
-            # it from the backend going away.
+            # A disconnect while we were waiting for AUTH_SUCCESS ends this
+            # attempt. On its own it is NOT a verdict on the credential (R1): the
+            # backend says so explicitly with AUTH_FAILED before it disconnects,
+            # and closes the socket silently when it merely failed -- a database
+            # error, an exception, a restart. An explicit refusal that already
+            # arrived keeps its own detail.
             if was in (BackendLinkStatus.CONNECTED, BackendLinkStatus.AUTHENTICATING):
-                self._auth_failure_detail = (
-                    "backend closed the connection while authenticating: the "
-                    "credential was refused"
-                )
+                if not self._auth_failed.is_set():
+                    self._auth_failure_detail = (
+                        "backend closed the connection while authenticating, with no "
+                        "AUTH_FAILED: no credential verdict"
+                    )
                 self._auth_failed.set()
                 return
 
@@ -742,6 +751,12 @@ class BackendLink:
             @sio.on(self.cfg.binding.auth_failed, namespace=ns)
             async def on_auth_failed(data: Any = None) -> None:
                 self._note_recv()
+                # R1 -- only the exact contract reason is a verdict on the
+                # credential; any other or missing reason is treated like a
+                # silent disconnect. Recorded before the event is set, so the
+                # failure handler always sees it.
+                reason = data.get("reason") if isinstance(data, dict) else None
+                self._credential_rejected = reason == AUTH_FAILURE_INVALID_CREDENTIAL
                 self._auth_failure_detail = f"backend refused AUTH: {str(redact(data))[:160]}"
                 self._auth_failed.set()
 
@@ -868,12 +883,18 @@ class BackendLink:
         self._set_status(BackendLinkStatus.AUTHENTICATED, "authenticated by the backend")
 
     async def _handle_auth_failure(self) -> None:
-        """React to a refused credential.
+        """React to an authentication attempt that did not succeed.
 
-        A refused *token* is discarded, so the next attempt falls back to the
-        pairing code if one is configured. A token the backend has revoked will
-        never start working again, and keeping it would leave the robot
-        retrying the same rejected credential until someone logged in.
+        A stored *token* is discarded only on the backend's explicit verdict,
+        `AUTH_FAILED {reason: INVALID_CREDENTIAL}` (R1): the next attempt then
+        falls back to the pairing code if one is configured. A token the backend
+        has rejected will never start working again.
+
+        Anything else -- the AUTH timeout, a disconnect during AUTH, any other
+        AUTH_FAILED reason -- is not a verdict: the backend closes the socket
+        silently when it merely failed (a database error, an exception, a
+        restart). Discarding a valid token there would strand the robot until a
+        person issued a fresh pairing code, so it is kept and retried.
 
         A refused *pairing code* is kept: it is far more likely to have expired
         (300 s TTL) than to be wrong, and the operator needs to see which code
@@ -888,14 +909,24 @@ class BackendLink:
             auth_method=None if self._auth_method is None else self._auth_method.value,
         )
         if self._auth_method is AuthMethod.TOKEN and not self.cfg.robot_token:
-            self.tokens.clear()
-            log_event(
-                logger,
-                "backend.token_discarded",
-                "discarded the stored session token after it was refused; the next "
-                "attempt will use ROBOTX_PAIRING_CODE if one is set",
-                level=logging.WARNING,
-            )
+            if self._credential_rejected:
+                self.tokens.clear()
+                log_event(
+                    logger,
+                    "backend.token_discarded",
+                    "discarded the stored session token: the backend rejected it "
+                    "(AUTH_FAILED INVALID_CREDENTIAL); the next attempt will use "
+                    "ROBOTX_PAIRING_CODE if one is set",
+                    level=logging.WARNING,
+                )
+            else:
+                log_event(
+                    logger,
+                    "backend.token_kept",
+                    "no credential verdict (timeout, disconnect or backend failure); "
+                    "the stored session token is kept and retried",
+                    level=logging.WARNING,
+                )
 
         sio = self._sio
         if sio is not None:

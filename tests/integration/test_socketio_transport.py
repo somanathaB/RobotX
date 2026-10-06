@@ -65,7 +65,7 @@ class ContractServer:
 
     def __init__(self, *, accept_pairing_code=VALID_PAIRING_CODE, accept_token=None,
                  issue_token=ISSUED_TOKEN, refuse_everything=False,
-                 success_event="both"):
+                 success_event="both", auth_failed_reason=None, refuse_first=0, ignore_first=0):
         # The real backend emits BOTH AUTH_SUCCESS and AUTH_OK for one AUTH
         # (handoff §3); "both" is therefore the default here.
         self.success_event = success_event
@@ -73,6 +73,16 @@ class ContractServer:
         self.accept_token = accept_token
         self.issue_token = issue_token
         self.refuse_everything = refuse_everything
+        # R1 -- when set, a refusal is the backend's explicit `AUTH_FAILED {reason}`
+        # sent before the disconnect (what robot.handler.js does for a rejected
+        # credential). Unset keeps the silent disconnect, which is also what the
+        # backend does when it merely fails.
+        self.auth_failed_reason = auth_failed_reason
+        # Refuse, or leave unanswered (drives the client's AUTH timeout), the
+        # first N AUTHs whatever they carry -- a backend having a bad moment.
+        self.refuse_first = refuse_first
+        self.ignore_first = ignore_first
+        self.auth_count = 0
 
         self.sio = socketio.AsyncServer(async_mode="aiohttp")
         self.app = web.Application()
@@ -103,16 +113,22 @@ class ContractServer:
         @self.sio.on("AUTH", namespace=NAMESPACE)
         async def on_auth(sid, data=None):
             self.auth_payloads.append(data)
+            self.auth_count += 1
             payload = data if isinstance(data, dict) else {}
             code = payload.get("pairingCode")
             token = payload.get("token")
 
-            ok = not self.refuse_everything and (
+            if self.auth_count <= self.ignore_first:
+                return  # no answer at all
+
+            ok = not self.refuse_everything and self.auth_count > self.refuse_first and (
                 (code is not None and code == self.accept_pairing_code)
                 or (token is not None and token == self.accept_token)
             )
             if not ok:
                 self.refusals.append(payload)
+                if self.auth_failed_reason is not None:
+                    await self.sio.emit("AUTH_FAILED", {"reason": self.auth_failed_reason}, to=sid, namespace=NAMESPACE)
                 # The contract's refusal: disconnect, no reason given.
                 await self.sio.disconnect(sid, namespace=NAMESPACE)
                 return
@@ -415,6 +431,73 @@ class TestConnectionAndAuthentication(ContractTestCase):
         described = self.run_async(scenario)
         self.assertTrue(described["streaming"])
         self.assertEqual(described["stats"]["auth_successes"], 1)
+
+
+class TestR1CredentialRetentionOverTheWire(ContractTestCase):
+    """R1 over a real Socket.IO transport, with the real client and the real
+    on-disk TokenStore: the stored token is discarded only on the backend's
+    `AUTH_FAILED {"reason": "INVALID_CREDENTIAL"}`; a silent disconnect, an
+    unanswered AUTH or any other reason keeps it for the next reconnect."""
+
+    STORED = "stored-session-token"
+
+    async def _run_until_connected(self, server, token_path, **cfg_kwargs):
+        TokenStore(token_path).save(robot_id=ROBOT_ID, token=self.STORED)
+        cfg_kwargs.setdefault("backoff_auth_failed_s", 0.2)
+        link = self.make_link(server, token_path, **cfg_kwargs)
+        await link.start()
+        ok = await link.wait_connected(timeout_s=15.0)
+        described = link.describe()
+        await link.stop()
+        stored = TokenStore(token_path).load(robot_id=ROBOT_ID)
+        return ok, described, (stored.token if stored else None), server
+
+    def test_invalid_credential_deletes_the_token_and_the_pairing_code_is_used_next(self):
+        ok, described, stored, server = self.run_async(
+            lambda server, path: self._run_until_connected(server, path),
+            auth_failed_reason="INVALID_CREDENTIAL",  # the stored token is not accepted
+        )
+        self.assertTrue(ok)
+        self.assertEqual(server.auth_payloads[0], {"robotId": ROBOT_ID, "token": self.STORED})
+        self.assertEqual(server.auth_payloads[1], {"robotId": ROBOT_ID, "pairingCode": VALID_PAIRING_CODE})
+        self.assertEqual(described["auth_method"], "PAIRING_CODE")
+        self.assertEqual(stored, ISSUED_TOKEN)  # the rejected token is gone; the new one persisted
+
+    def test_a_silent_disconnect_during_auth_keeps_the_token_and_the_reconnect_reuses_it(self):
+        def scenario(server, path):
+            server.accept_token = self.STORED
+            server.issue_token = self.STORED
+            return self._run_until_connected(server, path)
+
+        ok, described, stored, server = self.run_async(scenario, refuse_first=1)  # silent: no AUTH_FAILED
+        self.assertTrue(ok)
+        self.assertEqual([p.get("token") for p in server.auth_payloads], [self.STORED, self.STORED])
+        self.assertTrue(all("pairingCode" not in p for p in server.auth_payloads))
+        self.assertEqual(described["auth_method"], "TOKEN")
+        self.assertEqual(described["stats"]["auth_failures"], 1)
+        self.assertEqual(stored, self.STORED)
+
+    def test_an_unanswered_auth_times_out_keeps_the_token_and_the_reconnect_reuses_it(self):
+        def scenario(server, path):
+            server.accept_token = self.STORED
+            server.issue_token = self.STORED
+            return self._run_until_connected(server, path, auth_timeout_s=0.5)
+
+        ok, described, stored, server = self.run_async(scenario, ignore_first=1)
+        self.assertTrue(ok)
+        self.assertEqual([p.get("token") for p in server.auth_payloads], [self.STORED, self.STORED])
+        self.assertEqual(stored, self.STORED)
+
+    def test_auth_failed_with_any_other_reason_keeps_the_token(self):
+        def scenario(server, path):
+            server.accept_token = self.STORED
+            server.issue_token = self.STORED
+            return self._run_until_connected(server, path)
+
+        ok, described, stored, server = self.run_async(scenario, refuse_first=1, auth_failed_reason="SOMETHING_ELSE")
+        self.assertTrue(ok)
+        self.assertEqual([p.get("token") for p in server.auth_payloads], [self.STORED, self.STORED])
+        self.assertEqual(stored, self.STORED)
 
 
 class TestHeartbeatOverTheWire(ContractTestCase):
