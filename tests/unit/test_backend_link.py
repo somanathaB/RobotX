@@ -1407,5 +1407,370 @@ class TestHonestReporting(AsyncTestCase):
         self.assertTrue(secure.cfg.uses_tls)
 
 
+# --- Y4: link-loss timing -------------------------------------------------------
+
+
+class BlockableConnectSio(FakeSio):
+    """A FakeSio whose next `connect` can be made to hang -- a transport connect
+    that does not complete (a dead network, a SYN that is never answered)."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.block_connect = False
+
+    async def connect(self, url, namespaces=None, auth=None, headers=None):
+        if self.block_connect:
+            self.connect_calls.append({"url": url, "blocked": True})
+            await asyncio.Event().wait()  # never returns
+        return await super().connect(url, namespaces=namespaces, auth=auth, headers=headers)
+
+
+class TestY4LinkLoss(AsyncTestCase):
+    """Y4 -- after a silent backend loss the robot pauses `loss_grace_s` after the
+    loss is detected, on the agent's own control tick, whatever the reconnect loop
+    is doing; only a successful AUTH ends the loss; a paused mission stays paused.
+
+    These run the REAL `RobotAgent` loop (its 10 Hz `_loop` -> `tick`) mid-mission
+    on a FakeGPS fix, with a `BackendLink` attached. Nothing sets the loss timer:
+    a real disconnect starts it and real elapsed time runs it. Test A uses the
+    production grace (10 s); the others use 1.5 s to keep the suite fast -- the
+    mechanism under test does not depend on the value.
+    """
+
+    TICK_S = 0.1    # 1 / agent_hz, the production 10 Hz
+    SLACK_S = 0.3   # asyncio scheduling and timer resolution on this host
+
+    def running_agent(self):
+        from robotx.application.agent import RobotAgent
+        from tests.unit.test_agent import HERE, NORTH, FakeGPS, FakePerception, headless_settings
+
+        agent = RobotAgent(headless_settings())
+        agent.gps = FakeGPS()
+        agent.perception = FakePerception()
+        agent.gps.set_fix(*HERE, speed=1.0, track=0.0)
+        agent.perception.set_clear()
+        agent.start_mission([NORTH])
+        agent.tick()
+        return agent
+
+    def attach(self, agent, sio, **cfg):
+        cfg.setdefault("pairing_code", "123456")
+        link = BackendLink(
+            BackendConfig(enabled=True, robot_id="robotx-pi", **cfg),
+            agent.state,
+            agent,
+            client_factory=lambda _cfg: sio,
+            token_store=MemoryTokenStore(token="tok"),
+            agent_alive=agent.is_alive,
+        )
+        agent.backend = link
+        return link
+
+    @staticmethod
+    async def until_paused(agent, limit_s):
+        deadline = time.monotonic() + limit_s
+        while time.monotonic() < deadline:
+            if agent.state.snapshot().mode is OperatingMode.PAUSED:
+                return time.monotonic()
+            await asyncio.sleep(0.005)
+        return None
+
+    @staticmethod
+    async def stop(*tasks):
+        for task in tasks:
+            task.cancel()
+        for task in tasks:
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+    async def lose_link(self, link, sio, agent):
+        """Authenticated, mid-mission, the agent loop running -- then the link drops."""
+
+        assert await connect_and_auth(link)
+        agent._running = True
+        loop = asyncio.create_task(agent._loop())
+        await asyncio.sleep(0.15)
+        assert agent.state.snapshot().mode is OperatingMode.AUTO
+        await sio.drop()
+        origin = link._disconnected_since
+        assert origin is not None  # started by the disconnect, not by the test
+        return loop, origin
+
+    def assert_paused_on_time(self, paused_at, origin, grace, agent):
+        self.assertIsNotNone(paused_at, "the mission never paused")
+        elapsed = paused_at - origin
+        self.assertGreaterEqual(elapsed, grace)
+        self.assertLessEqual(elapsed, grace + self.TICK_S + self.SLACK_S)
+        snapshot = agent.state.snapshot()
+        self.assertIs(snapshot.mode, OperatingMode.PAUSED)
+        self.assertTrue(snapshot.motion_intent.is_stop)
+        return elapsed
+
+    def test_A_production_grace_pauses_10_s_after_the_loss_on_the_agent_tick_alone(self):
+        """Y4 TIMING (production values, ~10 s): no reconnect loop runs at all here,
+        so only the agent's own tick can apply the policy."""
+
+        async def scenario():
+            agent = self.running_agent()
+            sio = FakeSio()
+            link = self.attach(agent, sio)  # BackendConfig's default grace
+            self.assertEqual(link.cfg.loss_grace_s, 10.0)
+            loop, origin = await self.lose_link(link, sio, agent)
+            paused_at = await self.until_paused(agent, 12.0)
+            await self.stop(loop)
+            return agent, origin, paused_at
+
+        agent, origin, paused_at = self.run_async(scenario())
+        self.assert_paused_on_time(paused_at, origin, 10.0, agent)
+
+    def test_B_a_hanging_connect_attempt_does_not_hold_back_the_pause(self):
+        async def scenario():
+            agent = self.running_agent()
+            sio = BlockableConnectSio()
+            link = self.attach(agent, sio, loss_grace_s=1.5)
+            loop, origin = await self.lose_link(link, sio, agent)
+            sio.block_connect = True
+            link._running = True
+            run = asyncio.create_task(link._run())  # reconnects at once, and the connect hangs
+            paused_at = await self.until_paused(agent, 4.0)
+            state = (link.status, [c for c in sio.connect_calls if c.get("blocked")])
+            await self.stop(run, loop)
+            return agent, origin, paused_at, state
+
+        agent, origin, paused_at, (status, blocked) = self.run_async(scenario())
+        self.assert_paused_on_time(paused_at, origin, 1.5, agent)
+        self.assertEqual(len(blocked), 1)  # the attempt was still hanging at the pause
+        self.assertIs(status, LinkStatus.CONNECTING)
+
+    def test_C_a_long_auth_wait_does_not_hold_back_the_pause(self):
+        async def scenario():
+            agent = self.running_agent()
+            sio = FakeSio()
+            link = self.attach(agent, sio, loss_grace_s=1.5, auth_timeout_s=30.0)
+            loop, origin = await self.lose_link(link, sio, agent)
+            sio.auth_mode = "none"  # the transport reconnects; AUTH never completes
+            link._running = True
+            run = asyncio.create_task(link._run())
+            paused_at = await self.until_paused(agent, 4.0)
+            state = (link.status, link._disconnected_since)
+            await self.stop(run, loop)
+            return agent, origin, paused_at, state
+
+        agent, origin, paused_at, (status, since) = self.run_async(scenario())
+        self.assert_paused_on_time(paused_at, origin, 1.5, agent)
+        self.assertIs(status, LinkStatus.AUTHENTICATING)  # paused while still waiting on AUTH
+        self.assertEqual(since, origin)  # the new transport did not restart the timer
+
+    def test_D_a_successful_auth_before_the_deadline_ends_the_loss_without_a_pause(self):
+        async def scenario():
+            agent = self.running_agent()
+            sio = FakeSio()
+            link = self.attach(agent, sio, loss_grace_s=1.5)
+            loop, origin = await self.lose_link(link, sio, agent)
+            await asyncio.sleep(0.5)
+            restored = await connect_and_auth(link)
+            cleared = link._disconnected_since
+            paused_at = await self.until_paused(agent, 2.0)  # well past origin + grace
+            mode = agent.state.snapshot().mode
+            await self.stop(loop)
+            return restored, cleared, paused_at, mode
+
+        restored, cleared, paused_at, mode = self.run_async(scenario())
+        self.assertTrue(restored)
+        self.assertIsNone(cleared)
+        self.assertIsNone(paused_at)
+        self.assertIs(mode, OperatingMode.AUTO)
+
+    def test_D_a_mission_the_loss_paused_stays_paused_after_auth_succeeds(self):
+        async def scenario():
+            agent = self.running_agent()
+            sio = FakeSio()
+            link = self.attach(agent, sio, loss_grace_s=0.5)
+            loop, origin = await self.lose_link(link, sio, agent)
+            paused_at = await self.until_paused(agent, 2.0)
+            assert await connect_and_auth(link)  # the backend is back
+            await asyncio.sleep(0.5)  # several ticks
+            snapshot = agent.state.snapshot()
+            await self.stop(loop)
+            return paused_at, link._disconnected_since, snapshot
+
+        paused_at, since, snapshot = self.run_async(scenario())
+        self.assertIsNotNone(paused_at)
+        self.assertIsNone(since)
+        self.assertIs(snapshot.mode, OperatingMode.PAUSED)  # never auto-resumed
+        self.assertTrue(snapshot.motion_intent.is_stop)
+
+    def test_E_failed_reconnect_attempts_never_restart_the_loss_timer(self):
+        async def scenario():
+            agent = self.running_agent()
+            sio = SequencedSio(["silent_disconnect"] * 200)
+            link = self.attach(agent, sio, loss_grace_s=1.5, backoff_initial_s=0.05,
+                               backoff_max_s=0.05, backoff_auth_failed_s=0.05)
+            sio.modes = ["success"] + sio.modes  # the first AUTH, before the loss, succeeds
+            loop, origin = await self.lose_link(link, sio, agent)
+            link._running = True
+            run = asyncio.create_task(link._run())
+            paused_at = await self.until_paused(agent, 4.0)
+            seen = (link.stats["auth_failures"], link.stats["connects"], link._disconnected_since)
+            await self.stop(run, loop)
+            return agent, origin, paused_at, seen
+
+        agent, origin, paused_at, (auth_failures, connects, since) = self.run_async(scenario())
+        self.assert_paused_on_time(paused_at, origin, 1.5, agent)
+        self.assertGreaterEqual(auth_failures, 3)  # several attempts came and went
+        self.assertGreaterEqual(connects, 4)
+        self.assertEqual(since, origin)  # one continuous loss, from the first disconnect
+
+    def test_the_loss_timer_starts_only_when_an_authenticated_session_ends(self):
+        async def scenario():
+            link, sio = make_link(sio=FakeSio(auth_mode="silent_disconnect"))
+            await connect_and_auth(link)  # never authenticated: no loss to time
+            return link._disconnected_since
+
+        self.assertIsNone(self.run_async(scenario()))
+
+
+class TestY4LossConfiguration(unittest.TestCase):
+    """Y4 -- a policy or grace that would let the robot outlive its lease is
+    refused loudly at configuration time (the link is then not started, the
+    agent's existing fail-closed path), never silently clamped."""
+
+    def settings(self, **env):
+        from robotx.config.settings import Settings
+
+        base = {"ROBOTX_ROBOT_ID": "robotx-pi", "ROBOTX_SOCKET_ENABLED": "1",
+                "ROBOTX_SOCKET_SERVER_URL": "https://backend.example"}
+        base.update(env)
+        return Settings.from_env(base)
+
+    def test_the_defaults_are_pause_with_a_10_s_grace(self):
+        from robotx.communication.backend_link import MAX_DETECTION_S, MAX_LOSS_GRACE_S
+
+        cfg = BackendConfig.from_settings(self.settings())
+        self.assertIs(cfg.loss_policy, BackendLossPolicy.PAUSE)
+        self.assertEqual(cfg.loss_grace_s, 10.0)
+        self.assertEqual(BackendConfig().loss_grace_s, 10.0)
+        self.assertEqual((MAX_LOSS_GRACE_S, MAX_DETECTION_S), (10.0, 15.0))
+
+    def test_a_grace_within_the_bound_is_accepted(self):
+        for grace in ("0", "2.5", "10", "10.0"):
+            with self.subTest(grace=grace):
+                cfg = BackendConfig.from_settings(self.settings(ROBOTX_BACKEND_LOSS_GRACE_S=grace))
+                self.assertEqual(cfg.loss_grace_s, float(grace))
+
+    def test_a_grace_beyond_the_bound_or_invalid_is_refused(self):
+        for grace in ("10.01", "30", "60", "-1", "nan"):
+            with self.subTest(grace=grace):
+                with self.assertRaisesRegex(ValueError, "ROBOTX_BACKEND_LOSS_GRACE_S"):
+                    BackendConfig.from_settings(self.settings(ROBOTX_BACKEND_LOSS_GRACE_S=grace))
+
+    def test_the_continue_policy_is_refused_while_the_link_is_enabled(self):
+        with self.assertRaisesRegex(ValueError, "ROBOTX_BACKEND_LOSS_POLICY=continue"):
+            BackendConfig.from_settings(self.settings(ROBOTX_BACKEND_LOSS_POLICY="continue"))
+
+    def test_with_the_link_disabled_nothing_is_refused(self):
+        cfg = BackendConfig.from_settings(self.settings(ROBOTX_SOCKET_ENABLED="0", ROBOTX_BACKEND_LOSS_GRACE_S="30"))
+        self.assertFalse(cfg.enabled)
+
+    def test_an_agent_with_a_refused_grace_does_not_start_its_backend_link(self):
+        from robotx.application.agent import RobotAgent
+        from tests.unit.test_agent import headless_settings
+
+        async def scenario():
+            agent = RobotAgent(headless_settings(ROBOTX_SOCKET_ENABLED="1", ROBOTX_SOCKET_SERVER_URL="https://backend.example",
+                                                 ROBOTX_BACKEND_LOSS_GRACE_S="30"))
+            await agent._start_backend_link()
+            return agent.backend, agent.state.snapshot().communication.backend
+
+        backend, status = asyncio.run(scenario())
+        self.assertIsNone(backend)
+        self.assertIs(status, LinkStatus.DISABLED)
+
+
+class TestY41HeartbeatInterval(unittest.TestCase):
+    """Y4.1 -- the backend renews the lease only on a HEARTBEAT, so Y4's 28 s
+    window assumes one at least every 2 s. A slower (or never-firing) interval
+    is refused at configuration time like the grace, never clamped."""
+
+    settings = TestY4LossConfiguration.settings
+
+    def test_the_default_is_2_s(self):
+        from robotx.communication.backend_link import MAX_HEARTBEAT_INTERVAL_S
+        from robotx.config.settings import Settings
+
+        self.assertEqual(Settings().backend_heartbeat_interval_s, 2.0)
+        self.assertEqual(BackendConfig.from_settings(self.settings()).heartbeat_interval_s, 2.0)
+        self.assertEqual(MAX_HEARTBEAT_INTERVAL_S, 2.0)
+
+    def test_an_interval_within_the_bound_is_accepted(self):
+        for interval in ("2.0", "2", "1", "0.5", "0.05"):
+            with self.subTest(interval=interval):
+                cfg = BackendConfig.from_settings(self.settings(ROBOTX_BACKEND_HEARTBEAT_INTERVAL_S=interval))
+                self.assertEqual(cfg.heartbeat_interval_s, float(interval))
+
+    def test_an_interval_beyond_the_bound_is_refused_not_clamped(self):
+        for interval in ("2.001", "5.0", "10.0", "inf"):
+            with self.subTest(interval=interval):
+                with self.assertRaisesRegex(ValueError, "ROBOTX_BACKEND_HEARTBEAT_INTERVAL_S must be above 0 and at most 2 s"):
+                    BackendConfig.from_settings(self.settings(ROBOTX_BACKEND_HEARTBEAT_INTERVAL_S=interval))
+
+    def test_zero_negative_and_nan_are_refused(self):
+        # `nan` and `inf` would never satisfy `now - last >= interval`: no heartbeat at all.
+        for interval in ("0", "0.0", "-1", "-2.0", "nan"):
+            with self.subTest(interval=interval):
+                with self.assertRaisesRegex(ValueError, "ROBOTX_BACKEND_HEARTBEAT_INTERVAL_S must be above 0"):
+                    BackendConfig.from_settings(self.settings(ROBOTX_BACKEND_HEARTBEAT_INTERVAL_S=interval))
+
+    def test_a_non_numeric_interval_is_refused(self):
+        from robotx.communication.backend_link import validate_heartbeat_interval
+
+        for interval in ("two", "", "2s"):
+            with self.subTest(interval=interval):
+                with self.assertRaisesRegex(ValueError, "ROBOTX_BACKEND_HEARTBEAT_INTERVAL_S"):
+                    BackendConfig.from_settings(self.settings(ROBOTX_BACKEND_HEARTBEAT_INTERVAL_S=interval))
+        for value in (None, "two", object()):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "ROBOTX_BACKEND_HEARTBEAT_INTERVAL_S is not a number"):
+                    validate_heartbeat_interval(value)
+
+    def test_with_the_link_disabled_nothing_is_refused(self):
+        cfg = BackendConfig.from_settings(self.settings(ROBOTX_SOCKET_ENABLED="0", ROBOTX_BACKEND_HEARTBEAT_INTERVAL_S="5"))
+        self.assertFalse(cfg.enabled)
+
+    def test_an_agent_with_a_refused_interval_does_not_start_its_backend_link(self):
+        from robotx.application.agent import RobotAgent
+        from tests.unit.test_agent import headless_settings
+
+        async def scenario():
+            agent = RobotAgent(headless_settings(ROBOTX_SOCKET_ENABLED="1", ROBOTX_SOCKET_SERVER_URL="https://backend.example",
+                                                 ROBOTX_BACKEND_HEARTBEAT_INTERVAL_S="5.0"))
+            await agent._start_backend_link()
+            return agent.backend, agent.state.snapshot().communication.backend
+
+        backend, status = asyncio.run(scenario())
+        self.assertIsNone(backend)
+        self.assertIs(status, LinkStatus.DISABLED)
+
+    def test_no_admitted_interval_can_break_the_y4_invariant(self):
+        """detection + grace + tick < lease.duration/2 - heartbeat, for every
+        heartbeat `from_settings` admits: production 15 + 10 + 0.1 = 25.1 < 28,
+        and the worst admitted tick (agent_hz floor 0.5) 15 + 10 + 2 = 27 < 28."""
+        from robotx.communication.backend_link import MAX_DETECTION_S, MAX_HEARTBEAT_INTERVAL_S, MAX_LOSS_GRACE_S
+
+        lease_duration_s = 60.0  # Backend register `lease.duration`, asserted there too
+        settings = self.settings()
+        cfg = BackendConfig.from_settings(settings)
+        worst_window = lease_duration_s / 2 - MAX_HEARTBEAT_INTERVAL_S  # 28
+        self.assertLess(MAX_DETECTION_S + cfg.loss_grace_s + 1.0 / settings.agent_hz, worst_window)  # 25.1 < 28
+        self.assertLess(MAX_DETECTION_S + MAX_LOSS_GRACE_S + 1.0 / 0.5, worst_window)  # 27 < 28
+        # The largest admitted interval is exactly the one the invariant assumes; one step past it is refused.
+        at_bound = self.settings(ROBOTX_BACKEND_HEARTBEAT_INTERVAL_S=repr(MAX_HEARTBEAT_INTERVAL_S))
+        self.assertEqual(BackendConfig.from_settings(at_bound).heartbeat_interval_s, MAX_HEARTBEAT_INTERVAL_S)
+        with self.assertRaises(ValueError):
+            BackendConfig.from_settings(self.settings(ROBOTX_BACKEND_HEARTBEAT_INTERVAL_S="2.0000001"))
+
+
 if __name__ == "__main__":
     unittest.main()

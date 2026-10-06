@@ -799,6 +799,13 @@ class RobotAgent:
         ):
             self.pause_mission(f"ESP32 cannot carry motion: {esp32.link.value} ({esp32.detail})")
 
+        # 2c. Backend link (Y4): its loss policy runs on this loop's own cadence,
+        #     before anything decides, so neither a reconnect backoff nor a
+        #     connect or AUTH wait can hold back the pause -- and a mission it
+        #     pauses produces the hold on this same tick.
+        if self.backend is not None:
+            self.backend.apply_loss_policy()
+
         # 3. Navigation
         navigation = self.navigator.update(position)
         self.state.update_navigation(navigation)

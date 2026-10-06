@@ -134,7 +134,9 @@ Everything is read from `ROBOTX_*` environment variables in
 | `ROBOTX_SOCKET_SERVER_URL` | `http://localhost:3000` | Backend address |
 | `ROBOTX_ROBOT_TOKEN` | unset | Handshake credential (secret) |
 | `ROBOTX_PROTOCOL_FILE` | unset | JSON file giving the real backend event names |
-| `ROBOTX_BACKEND_LOSS_POLICY` | `pause` | `pause` or `continue` on link loss |
+| `ROBOTX_BACKEND_LOSS_POLICY` | `pause` | `pause` on link loss (Y4: `continue` is refused while the backend link is enabled) |
+| `ROBOTX_BACKEND_LOSS_GRACE_S` | `10.0` | seconds after a detected link loss before an active mission pauses (Y4: at most 10) |
+| `ROBOTX_BACKEND_HEARTBEAT_INTERVAL_S` | `2.0` | seconds between HEARTBEATs, which renew the mission's lease (Y4: above 0, at most 2) |
 
 See `.env.example` for the full list. Secrets are never given defaults and are
 never logged.

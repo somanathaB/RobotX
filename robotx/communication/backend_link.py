@@ -157,6 +157,62 @@ class BackendLossPolicy(str, Enum):
     CONTINUE = "continue"  # keep driving; the link is not a safety interlock
 
 
+# Y4 -- the robot must pause before the backend can hand its Leg to another.
+# The commitment lease (`lease.duration`, 60 s) is renewed once half of it has
+# run out and the heartbeat goes every 2 s, so a silent loss can leave as little
+# as 60/2 - 2 = 28 s before it expires and is recovered. The robot pauses after
+#     detection (<= pingInterval + pingTimeout, the backend's handshake; <= 15 s)
+#   + `loss_grace_s`                                                   (<= 10 s)
+#   + one agent tick (1 / agent_hz; agent_hz >= 0.5)                   (<=  2 s)
+#   = <= 27 s.
+# A configured grace above `MAX_LOSS_GRACE_S`, or the CONTINUE policy, would break
+# that, so `BackendConfig.from_settings` refuses either; a handshake promising
+# detection slower than `MAX_DETECTION_S` is reported at connect.
+# The 28 s assumes this heartbeat: it is the only thing the backend renews the
+# lease on, so a slower one shrinks that window below the 27 s above (Y4.1), and
+# `from_settings` refuses an interval above `MAX_HEARTBEAT_INTERVAL_S` too.
+MAX_LOSS_GRACE_S = 10.0
+MAX_DETECTION_S = 15.0
+MAX_HEARTBEAT_INTERVAL_S = 2.0
+
+
+def validate_loss_policy(policy: "BackendLossPolicy", grace_s: Any) -> float:
+    """The loss grace, or ValueError when this policy and grace break Y4's bound."""
+
+    if policy is not BackendLossPolicy.PAUSE:
+        raise ValueError(
+            "ROBOTX_BACKEND_LOSS_POLICY=continue keeps driving on a lost backend link; with the link enabled "
+            "the robot must pause before its lease can be reassigned (Y4), so only 'pause' is accepted"
+        )
+    try:
+        grace = float(grace_s)
+    except (TypeError, ValueError):
+        raise ValueError("ROBOTX_BACKEND_LOSS_GRACE_S is not a number") from None
+    if grace != grace or grace < 0 or grace > MAX_LOSS_GRACE_S:  # NaN, negative or too long
+        raise ValueError(
+            f"ROBOTX_BACKEND_LOSS_GRACE_S must be between 0 and {MAX_LOSS_GRACE_S:g} s: a longer grace lets the "
+            "robot keep driving after its lease can be reassigned (Y4)"
+        )
+    return grace
+
+
+def validate_heartbeat_interval(interval_s: Any) -> float:
+    """The heartbeat interval, or ValueError when it is outside (0, MAX_HEARTBEAT_INTERVAL_S]."""
+
+    try:
+        interval = float(interval_s)
+    except (TypeError, ValueError):
+        raise ValueError("ROBOTX_BACKEND_HEARTBEAT_INTERVAL_S is not a number") from None
+    # `not (0 < x <= max)` also refuses NaN, which would never send a heartbeat at all.
+    if not 0 < interval <= MAX_HEARTBEAT_INTERVAL_S:
+        raise ValueError(
+            f"ROBOTX_BACKEND_HEARTBEAT_INTERVAL_S must be above 0 and at most {MAX_HEARTBEAT_INTERVAL_S:g} s: "
+            "the backend renews the lease only on a heartbeat, so a slower one lets it be reassigned "
+            "before the robot pauses (Y4)"
+        )
+    return interval
+
+
 @dataclass(frozen=True)
 class BackendConfig:
     """Everything the link needs, resolved once at startup."""
@@ -214,7 +270,8 @@ class BackendConfig:
     tls_verify: bool = True
 
     loss_policy: BackendLossPolicy = BackendLossPolicy.PAUSE
-    loss_grace_s: float = 30.0
+    # Y4 -- at most MAX_LOSS_GRACE_S; see the bound above.
+    loss_grace_s: float = 10.0
 
     @classmethod
     def from_settings(cls, settings: Any, *, binding: Optional[ProtocolBinding] = None) -> "BackendConfig":
@@ -229,6 +286,10 @@ class BackendConfig:
             # backend config into a loud, non-fatal "link not started".
             validate_backend_url(settings.socket_server_url)
             validate_robot_id(settings.robot_id)
+            # Y4 -- never silently: a policy or grace that would let the robot
+            # outlive its lease is refused, not clamped.
+            validate_loss_policy(policy, settings.backend_loss_grace_s)
+            validate_heartbeat_interval(getattr(settings, "backend_heartbeat_interval_s", 2.0))
         return cls(
             enabled=settings.socket_enabled,
             server_url=settings.socket_server_url,
@@ -393,6 +454,8 @@ class BackendLink:
         self._recent_events: Dict[str, float] = {}
         self._disconnected_since: Optional[float] = None
         self._loss_action_taken = False
+        # Y4 -- pingInterval + pingTimeout from the backend's last handshake.
+        self._detection_bound_s: Optional[float] = None
 
         # Counters, reported over the local HTTP API and used by tests.
         self.stats: Dict[str, int] = {
@@ -706,8 +769,9 @@ class BackendLink:
         async def connect() -> None:  # noqa: D401
             self.stats["connects"] += 1
             self._connected.set()
-            self._disconnected_since = None
-            self._loss_action_taken = False
+            # Y4 -- an open transport is not a restored link: the loss timer is
+            # cleared only by a successful AUTH (`_on_auth_success`).
+            self._note_heartbeat_bound(sio)
             self._set_status(
                 BackendLinkStatus.CONNECTED, f"connected to {_safe_url(self.cfg.server_url)}"
             )
@@ -719,7 +783,11 @@ class BackendLink:
             was = self._status
             self._connected.clear()
             self._authenticated.clear()
-            self._disconnected_since = time.monotonic()
+            # Y4 -- the loss timer starts when an authenticated session ends, and
+            # runs on through every reconnect attempt until an AUTH succeeds: a
+            # failed attempt's own disconnect never restarts it.
+            if was.is_up and self._disconnected_since is None:
+                self._disconnected_since = time.monotonic()
 
             # A disconnect while we were waiting for AUTH_SUCCESS ends this
             # attempt. On its own it is NOT a verdict on the credential (R1): the
@@ -888,6 +956,10 @@ class BackendLink:
             )
 
         self.stats["auth_successes"] += 1
+        # Y4 -- the link is restored only now: the loss timer ends here. A mission
+        # the loss already paused stays paused; nothing here resumes it.
+        self._disconnected_since = None
+        self._loss_action_taken = False
         self._authenticated.set()
         self._set_status(BackendLinkStatus.AUTHENTICATED, "authenticated by the backend")
 
@@ -1769,6 +1841,40 @@ class BackendLink:
 
     # --- link-loss policy -----------------------------------------------------
 
+    def apply_loss_policy(self) -> None:
+        """Y4 -- the link-loss check, for the agent's own control tick.
+
+        The agent calls this every tick, so the pause never waits on this link's
+        reconnect backoff, a transport connect or an AUTH wait. The link's own
+        sleep calls it too, for a link driven without an agent.
+        """
+
+        self._apply_loss_policy()
+
+    def _note_heartbeat_bound(self, sio: Any) -> None:
+        """Y4 -- how long a silent link can go unnoticed on this connection.
+
+        python-engineio waits `pingInterval + pingTimeout` -- both from the
+        backend's handshake -- for any packet before it declares the link dead.
+        Recorded for `describe()`, and said out loud when it breaks the bound.
+        """
+
+        eio = getattr(sio, "eio", None)
+        interval, timeout = getattr(eio, "ping_interval", None), getattr(eio, "ping_timeout", None)
+        if not isinstance(interval, (int, float)) or not isinstance(timeout, (int, float)):
+            return
+        self._detection_bound_s = float(interval) + float(timeout)
+        if self._detection_bound_s > MAX_DETECTION_S:
+            log_event(
+                logger,
+                "backend.heartbeat_too_slow",
+                f"the backend's heartbeat takes {self._detection_bound_s:g} s to notice a silent link; Y4 needs "
+                f"<= {MAX_DETECTION_S:g} s for the robot to pause before its lease can be reassigned",
+                level=logging.CRITICAL,
+                ping_interval_s=interval,
+                ping_timeout_s=timeout,
+            )
+
     def _apply_loss_policy(self) -> None:
         """Suspend an active mission once the link has been down long enough.
 
@@ -1835,6 +1941,14 @@ class BackendLink:
             "handler_registrations": self.handler_registrations,
             "last_connect_error": self._last_connect_error,
             "loss_policy": self.cfg.loss_policy.value,
+            # Y4 -- the runtime values behind the link-loss bound.
+            "link_loss": {
+                "grace_s": self.cfg.loss_grace_s,
+                "detection_bound_s": self._detection_bound_s,
+                "lost_for_s": None if self._disconnected_since is None
+                else round(time.monotonic() - self._disconnected_since, 3),
+                "paused": self._loss_action_taken,
+            },
             "rates": {
                 "telemetry_interval_s": self.cfg.telemetry_interval_s,
                 "heartbeat_interval_s": self.cfg.heartbeat_interval_s,

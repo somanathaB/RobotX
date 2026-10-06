@@ -308,9 +308,11 @@ class Settings:
 
     # What an active mission does when the backend becomes unreachable:
     # "pause" (default) suspends it after the grace period; "continue" keeps
-    # driving. Neither can ever start motion.
+    # driving. Neither can ever start motion. Y4: with the backend link enabled,
+    # only "pause" with a grace of at most 10 s is accepted -- the robot must
+    # pause before its lease can be reassigned (backend_link.MAX_LOSS_GRACE_S).
     backend_loss_policy: str = "pause"
-    backend_loss_grace_s: float = 30.0
+    backend_loss_grace_s: float = 10.0
 
     # --- Home position -------------------------------------------------------
     # Where a backend RETURN command sends the robot. With neither this nor a

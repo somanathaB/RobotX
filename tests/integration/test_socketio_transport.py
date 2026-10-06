@@ -25,6 +25,7 @@ they are not pure unit tests, which is why they live outside `tests/unit`.
 import asyncio
 import logging
 import os
+from dataclasses import replace
 import tempfile
 import time
 import unittest
@@ -32,7 +33,7 @@ import unittest
 import socketio
 from aiohttp import web
 
-from robotx.communication.backend_link import BackendConfig, BackendLink
+from robotx.communication.backend_link import MAX_HEARTBEAT_INTERVAL_S, BackendConfig, BackendLink
 from robotx.communication.protocol import ProtocolBinding
 from robotx.communication.token_store import TokenStore
 from robotx.hardware.gps import GpsFix, GpsReading, GPSStatus
@@ -65,7 +66,8 @@ class ContractServer:
 
     def __init__(self, *, accept_pairing_code=VALID_PAIRING_CODE, accept_token=None,
                  issue_token=ISSUED_TOKEN, refuse_everything=False,
-                 success_event="both", auth_failed_reason=None, refuse_first=0, ignore_first=0):
+                 success_event="both", auth_failed_reason=None, refuse_first=0, ignore_first=0,
+                 ping_interval=None, ping_timeout=None):
         # The real backend emits BOTH AUTH_SUCCESS and AUTH_OK for one AUTH
         # (handoff §3); "both" is therefore the default here.
         self.success_event = success_event
@@ -91,7 +93,10 @@ class ContractServer:
         self.task_complete_drop_first = 0
         self.received_at = {}
 
-        self.sio = socketio.AsyncServer(async_mode="aiohttp")
+        # Y4 -- the Engine.IO heartbeat this server advertises in its handshake
+        # (seconds), when a test sets it; the library default otherwise.
+        heartbeat = {k: v for k, v in (("ping_interval", ping_interval), ("ping_timeout", ping_timeout)) if v is not None}
+        self.sio = socketio.AsyncServer(async_mode="aiohttp", **heartbeat)
         self.app = web.Application()
         self.sio.attach(self.app)
 
@@ -624,6 +629,194 @@ class TestY2ReportDeliveryOverTheWire(ContractTestCase):
         self.assertEqual(server.received["TASK_COMPLETE"], [])  # both claims were acknowledged
         self.assertEqual(stats["custody_events_resent"], 4)
         self.assertEqual(stats["offer_responses_resent"], 4)
+
+
+class SilentableRelay:
+    """A loopback TCP relay in front of the ContractServer that can go SILENT.
+
+    After `silent = True` it forwards nothing in either direction and closes
+    nothing: the client's socket stays open and simply stops hearing from the
+    server -- a link that died without a FIN or an RST (Wi-Fi gone), which only
+    the Engine.IO heartbeat can notice. New connections are accepted and never
+    answered. A server that *closes* the socket would be noticed at once and
+    would prove nothing about the heartbeat.
+    """
+
+    def __init__(self, target_port):
+        self.target_port = target_port
+        self.silent = False
+        self._held = []
+        self._server = None
+        self.port = None
+
+    async def start(self):
+        self._server = await asyncio.start_server(self._handle, "127.0.0.1", 0)
+        self.port = self._server.sockets[0].getsockname()[1]
+
+    async def _handle(self, client_reader, client_writer):
+        self._held.append(client_writer)
+        if self.silent:
+            return  # accepted, held open, never answered
+        try:
+            upstream_reader, upstream_writer = await asyncio.open_connection("127.0.0.1", self.target_port)
+        except OSError:
+            return
+        self._held.append(upstream_writer)
+        await asyncio.gather(self._pump(client_reader, upstream_writer), self._pump(upstream_reader, client_writer))
+
+    async def _pump(self, reader, writer):
+        try:
+            while True:
+                data = await reader.read(65536)
+                if not data:
+                    break
+                if self.silent:
+                    continue  # swallowed
+                writer.write(data)
+                await writer.drain()
+        except Exception:
+            pass
+        if not self.silent:  # a silent link never closes
+            try:
+                writer.close()
+            except Exception:
+                pass
+
+    async def stop(self):
+        if self._server is not None:
+            self._server.close()
+        for writer in self._held:
+            try:
+                writer.close()
+            except Exception:
+                pass
+
+
+class TestY4SilentLinkOverTheWire(ContractTestCase):
+    """Y4 over a real Socket.IO transport, with the real RobotAgent loop: a link
+    that goes silent is noticed within the server's `pingInterval + pingTimeout`,
+    and the mission pauses `loss_grace_s` after that on the agent's own tick --
+    while the link keeps trying (and failing) to reconnect through the silence."""
+
+    TICK_S = 0.1
+    SLACK_S = 0.5  # asyncio scheduling, socket and timer resolution on this host
+
+    def running_agent(self):
+        from robotx.application.agent import RobotAgent
+        from tests.unit.test_agent import HERE, NORTH, FakeGPS, FakePerception, headless_settings
+
+        agent = RobotAgent(headless_settings())
+        agent.gps = FakeGPS()
+        agent.perception = FakePerception()
+        agent.gps.set_fix(*HERE, speed=1.0, track=0.0)
+        agent.perception.set_clear()
+        agent.start_mission([NORTH])
+        agent.tick()
+        return agent
+
+    async def silence_and_measure(self, server, cfg, token_path, *, limit_s):
+        relay = SilentableRelay(server.port)
+        await relay.start()
+        cfg = replace(cfg, server_url=f"http://127.0.0.1:{relay.port}")
+        agent = self.running_agent()
+        link = BackendLink(cfg, agent.state, agent, token_store=TokenStore(token_path), agent_alive=agent.is_alive)
+        agent.backend = link
+        agent._running = True
+        loop = asyncio.create_task(agent._loop())
+        try:
+            await link.start()
+            assert await link.wait_connected(timeout_s=10.0)
+            await asyncio.sleep(0.5)
+            assert agent.state.snapshot().mode is OperatingMode.AUTO
+            bound = link.describe()["link_loss"]["detection_bound_s"]  # from the handshake, at runtime
+
+            silent_at = time.monotonic()
+            relay.silent = True
+            detected_at = paused_at = None
+            deadline = silent_at + limit_s
+            while time.monotonic() < deadline and paused_at is None:
+                if detected_at is None and link._disconnected_since is not None:
+                    detected_at = link._disconnected_since  # set by the disconnect itself
+                if agent.state.snapshot().mode is OperatingMode.PAUSED:
+                    paused_at = time.monotonic()
+                await asyncio.sleep(0.005)
+            snapshot = agent.state.snapshot()
+            return {"bound": bound, "silent_at": silent_at, "detected_at": detected_at,
+                    "paused_at": paused_at, "snapshot": snapshot, "connects": link.stats["connects"]}
+        finally:
+            loop.cancel()
+            try:
+                await loop
+            except (asyncio.CancelledError, Exception):
+                pass
+            await link.stop()
+            await relay.stop()
+
+    def check(self, result, *, ping_interval, ping_timeout, grace):
+        detection = result["detected_at"] - result["silent_at"]
+        pause = result["paused_at"] - result["detected_at"]
+        total = result["paused_at"] - result["silent_at"]
+        self.assertEqual(result["bound"], ping_interval + ping_timeout)
+        self.assertLessEqual(detection, ping_interval + ping_timeout + self.SLACK_S)
+        self.assertGreaterEqual(pause, grace)
+        self.assertLessEqual(pause, grace + self.TICK_S + self.SLACK_S)
+        self.assertLessEqual(total, ping_interval + ping_timeout + grace + self.TICK_S + self.SLACK_S)
+        self.assertIs(result["snapshot"].mode, OperatingMode.PAUSED)
+        self.assertTrue(result["snapshot"].motion_intent.is_stop)
+        return detection, pause, total
+
+    def test_F_silent_link_is_detected_by_the_heartbeat_and_the_mission_pauses_after_the_grace(self):
+        """Test-only heartbeat (1 s + 1 s) and grace (1 s): the same path, in ~3 s."""
+
+        async def scenario(server, token_path):
+            cfg = BackendConfig(enabled=True, server_url=server.url, robot_id=ROBOT_ID, binding=ProtocolBinding(),
+                                pairing_code=VALID_PAIRING_CODE, loss_grace_s=1.0, auth_timeout_s=3.0,
+                                backoff_initial_s=0.2, backoff_max_s=0.5)
+            return await self.silence_and_measure(server, cfg, token_path, limit_s=8.0)
+
+        result = self.run_async(scenario, ping_interval=1, ping_timeout=1)
+        self.assertIsNotNone(result["detected_at"], "the silent link was never detected")
+        self.assertIsNotNone(result["paused_at"], "the mission never paused")
+        self.check(result, ping_interval=1.0, ping_timeout=1.0, grace=1.0)
+
+    def test_G_PRODUCTION_TIMING_pause_lands_before_the_earliest_lease_expiry(self):
+        """Y4 PRODUCTION TIMING (~25 s). The backend's heartbeat (10 s + 5 s,
+        `Backend/src/config/socketTiming.js`) and the Pi's own defaults, read
+        from Settings: the robot pauses within detection + grace + one tick, and
+        that is under the earliest lease expiry, lease.duration (60 s, the
+        backend register) / 2 - the heartbeat interval."""
+
+        from robotx.config.settings import Settings
+
+        lease_duration_s = 60.0  # Backend register `lease.duration`, asserted there too
+
+        async def scenario(server, token_path):
+            tmp = os.path.dirname(token_path)
+            settings = Settings.from_env({
+                "ROBOTX_ROBOT_ID": ROBOT_ID, "ROBOTX_SOCKET_ENABLED": "1", "ROBOTX_SOCKET_SERVER_URL": server.url,
+                "ROBOTX_PAIRING_CODE": VALID_PAIRING_CODE, "ROBOTX_BACKEND_TOKEN_PATH": token_path,
+                "ROBOTX_COMMITMENT_STATE_PATH": os.path.join(tmp, "commitments.json"),
+            })
+            cfg = BackendConfig.from_settings(settings)  # production grace, validated
+            result = await self.silence_and_measure(server, cfg, token_path, limit_s=30.0)
+            result["settings"] = settings
+            result["grace"] = cfg.loss_grace_s
+            return result
+
+        result = self.run_async(scenario, ping_interval=10, ping_timeout=5)
+        self.assertIsNotNone(result["detected_at"], "the silent link was never detected")
+        self.assertIsNotNone(result["paused_at"], "the mission never paused")
+        settings, grace = result["settings"], result["grace"]
+        tick = 1.0 / settings.agent_hz
+        self.assertEqual((result["bound"], grace, tick), (15.0, 10.0, 0.1))
+        bound = result["bound"] + grace + tick
+        earliest_lease_expiry = lease_duration_s / 2 - settings.backend_heartbeat_interval_s
+        self.assertLess(bound, earliest_lease_expiry)  # 25.1 < 28
+        # Y4.1 -- and no heartbeat `from_settings` admits can shrink that window below the bound.
+        self.assertLessEqual(settings.backend_heartbeat_interval_s, MAX_HEARTBEAT_INTERVAL_S)
+        self.assertLess(bound, lease_duration_s / 2 - MAX_HEARTBEAT_INTERVAL_S)
+        _, _, total = self.check(result, ping_interval=10.0, ping_timeout=5.0, grace=grace)
+        self.assertLess(total, earliest_lease_expiry)  # and so is what actually happened
 
 
 class TestHeartbeatOverTheWire(ContractTestCase):
