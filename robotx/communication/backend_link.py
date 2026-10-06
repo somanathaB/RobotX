@@ -263,7 +263,9 @@ class BackendConfig:
     # Connect backoff.
     backoff_initial_s: float = 1.0
     backoff_max_s: float = 60.0
-    # Auth failures do not resolve themselves by retrying quickly.
+    # After a credential verdict, a pairing-code attempt or nothing to present:
+    # those do not resolve themselves by retrying quickly. A token AUTH with no
+    # verdict uses the connect backoff instead (`_auth_failure_backoff_s`).
     backoff_auth_failed_s: float = 60.0
 
     # Transport security.
@@ -443,6 +445,10 @@ class BackendLink:
         # AUTH_FAILED {reason: INVALID_CREDENTIAL}: the one verdict that may cost
         # the stored session token. Reset on every connect.
         self._credential_rejected = False
+        # R1 -- the credential this attempt's AUTH actually carried; None when no AUTH
+        # went out (nothing to present). Reset on every connect, unlike `_auth_method`,
+        # which reports the last method used.
+        self._attempt_auth_method: Optional[AuthMethod] = None
         # Incremented once per set of handler registrations. Must stay at 1 for
         # the life of the process; asserted by test.
         self.handler_registrations = 0
@@ -668,6 +674,27 @@ class BackendLink:
         base = min(self.cfg.backoff_max_s, self.cfg.backoff_initial_s * (2 ** max(0, attempt)))
         return base * (0.5 + random.random() * 0.5)
 
+    def _auth_failure_backoff_s(self) -> float:
+        """R1 -- how long to wait after an AUTH that did not succeed.
+
+        The long `backoff_auth_failed_s` is for an outcome that retrying will
+        only repeat: the backend's verdict on the credential (`AUTH_FAILED
+        {reason: INVALID_CREDENTIAL}`), an attempt with a pairing code (single
+        use, a 300 s TTL, and every refused attempt counts toward the backend's
+        pairing lockout), or no AUTH at all because there was nothing to present.
+
+        A *token* attempt that ended with no verdict -- the AUTH timeout, a
+        silent close, a backend exception or database error -- is the backend
+        failing, not refusing, so it is retried on the ordinary jittered connect
+        backoff, like a backend that is down. Against the real backend a 60 s
+        wait there outlasted the commitment lease (60 s): a robot whose mission
+        the loss paused stayed off the link long after the backend could answer.
+        """
+
+        if self._credential_rejected or self._attempt_auth_method is not AuthMethod.TOKEN:
+            return self.cfg.backoff_auth_failed_s
+        return self.next_backoff_s(self._attempt)
+
     # --- the connect/authenticate/publish loop --------------------------------
 
     async def _run(self) -> None:
@@ -701,7 +728,7 @@ class BackendLink:
                     self._auth_failure_detail or "authentication did not complete",
                 )
                 await self._handle_auth_failure()
-                await self._sleep_while_running(self.cfg.backoff_auth_failed_s)
+                await self._sleep_while_running(self._auth_failure_backoff_s())
                 self._attempt += 1
                 continue
 
@@ -734,6 +761,7 @@ class BackendLink:
         self._auth_failed.clear()
         self._auth_failure_detail = ""
         self._credential_rejected = False
+        self._attempt_auth_method = None
 
         sio = self._ensure_client()
 
@@ -898,6 +926,7 @@ class BackendLink:
             return
 
         self._auth_method = method
+        self._attempt_auth_method = method
         self.stats["auth_attempts"] += 1
         self._set_status(
             BackendLinkStatus.AUTHENTICATING, f"authenticating with {method.value.lower()}"

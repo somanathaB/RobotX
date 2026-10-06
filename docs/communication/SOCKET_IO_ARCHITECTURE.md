@@ -69,9 +69,14 @@ Exponential from `backoff_initial_s`, capped at `backoff_max_s`, multiplied by
 a random factor in `[0.5, 1.0]`. The jitter prevents a fleet from reconnecting
 in lockstep and re-crashing the backend it was waiting for.
 
-A refusal by the server uses `backoff_rejected_s` (60 s) instead: a rejected
-credential will be rejected again one second later, so retrying at network
-speed only loads a server that has already said no.
+An AUTH that did not succeed waits `backoff_auth_failed_s` (60 s) instead, but
+only when retrying would repeat the outcome: the backend's verdict on the
+credential (`AUTH_FAILED {reason: "INVALID_CREDENTIAL"}`), an attempt with a
+pairing code (single use, 300 s TTL, and every refused attempt counts toward the
+backend's pairing lockout), or an attempt with nothing to present. A *token*
+AUTH with no verdict -- the AUTH timeout, a silent close, a backend exception or
+database error -- is the backend failing, not refusing, and uses the normal
+backoff above (R1). A 60 s wait there would outlast the 60 s commitment lease.
 
 Classification is textual, because python-socketio gives no structured code.
 Measured against 5.11.4:

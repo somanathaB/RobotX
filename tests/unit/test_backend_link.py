@@ -931,7 +931,9 @@ class TestR1CredentialRetention(AsyncTestCase):
         async def scenario():
             tokens = MemoryTokenStore(token="stored-tok")
             sio = SequencedSio(["silent_disconnect", "none", "success"], auth_token="stored-tok")
-            link, _ = make_link(tokens=tokens, sio=sio, auth_timeout_s=0.05, backoff_auth_failed_s=0.01)
+            # Token attempts with no verdict retry on the connect backoff (R1).
+            link, _ = make_link(tokens=tokens, sio=sio, auth_timeout_s=0.05, backoff_auth_failed_s=0.01,
+                                backoff_initial_s=0.01, backoff_max_s=0.02)
             link._running = True
             task = asyncio.create_task(link._run())
             for _ in range(200):
@@ -951,6 +953,163 @@ class TestR1CredentialRetention(AsyncTestCase):
         self.assertEqual(link.stats["auth_successes"], 1)
         self.assertEqual([p.get("token") for p in sio.events_named("AUTH")], ["stored-tok"] * 3)
         self.assertEqual(tokens.clears, 0)
+
+
+class TestR1AuthFailureBackoff(AsyncTestCase):
+    """R1 -- how long the link waits after an AUTH that did not succeed.
+
+    A token AUTH with no verdict (timeout, silent close, backend exception) is
+    the backend failing, not refusing: it is retried on the ordinary connect
+    backoff. The long `backoff_auth_failed_s` stays for what retrying only
+    repeats -- the INVALID_CREDENTIAL verdict, a pairing-code attempt (single
+    use, and refused attempts count toward the backend's pairing lockout) and an
+    attempt with nothing to present."""
+
+    LONG_S = 60.0
+
+    async def _failed_attempt(self, link):
+        ok = await connect_and_auth(link)
+        assert not ok
+        await link._handle_auth_failure()
+        return link._auth_failure_backoff_s()
+
+    def _link(self, **kwargs):
+        kwargs.setdefault("backoff_initial_s", 1.0)
+        kwargs.setdefault("backoff_max_s", 30.0)
+        kwargs.setdefault("backoff_auth_failed_s", self.LONG_S)
+        kwargs.setdefault("auth_timeout_s", 0.05)
+        return make_link(**kwargs)[0]
+
+    def test_a_token_attempt_with_no_verdict_retries_on_the_connect_backoff(self):
+        for mode in ("none", "silent_disconnect", "explode"):
+            with self.subTest(mode=mode):
+                async def scenario():
+                    link = self._link(tokens=MemoryTokenStore(token="stored-tok"), sio=FakeSio(auth_mode=mode))
+                    return await self._failed_attempt(link)
+
+                delay = self.run_async(scenario())
+                self.assertGreater(delay, 0.0)
+                self.assertLessEqual(delay, 1.0)  # next_backoff_s(0): initial x [0.5, 1.0]
+
+    def test_any_other_or_malformed_auth_failed_on_a_token_is_no_verdict_either(self):
+        for payload in ({}, {"reason": "SOMETHING_ELSE"}, None, {"reason": "invalid_credential"}):
+            with self.subTest(payload=payload):
+                async def scenario():
+                    sio = FakeSio(auth_mode="rejected")
+                    sio.rejected_payload = payload
+                    link = self._link(tokens=MemoryTokenStore(token="stored-tok"), sio=sio)
+                    return await self._failed_attempt(link)
+
+                self.assertLessEqual(self.run_async(scenario()), 1.0)
+
+    def test_the_invalid_credential_verdict_keeps_the_long_backoff(self):
+        async def scenario():
+            link = self._link(tokens=MemoryTokenStore(token="stored-tok"), sio=FakeSio(auth_mode="rejected"))
+            return await self._failed_attempt(link)
+
+        self.assertEqual(self.run_async(scenario()), self.LONG_S)
+
+    def test_an_operator_configured_token_refused_by_verdict_keeps_the_long_backoff(self):
+        async def scenario():
+            link = self._link(tokens=MemoryTokenStore(token=None), sio=FakeSio(auth_mode="rejected"),
+                              robot_token="operator-tok")
+            return await self._failed_attempt(link)
+
+        self.assertEqual(self.run_async(scenario()), self.LONG_S)
+
+    def test_a_pairing_code_attempt_keeps_the_long_backoff_whatever_the_outcome(self):
+        for mode in ("none", "silent_disconnect", "rejected"):
+            with self.subTest(mode=mode):
+                async def scenario():
+                    link = self._link(tokens=MemoryTokenStore(token=None), sio=FakeSio(auth_mode=mode),
+                                      pairing_code="654321")
+                    return await self._failed_attempt(link)
+
+                self.assertEqual(self.run_async(scenario()), self.LONG_S)
+
+    def test_nothing_to_present_keeps_the_long_backoff_even_after_a_token_attempt(self):
+        """The method is per attempt: a previous TOKEN attempt does not make an
+        attempt with no credential at all look like a token retry."""
+
+        async def scenario():
+            tokens = MemoryTokenStore(token="stored-tok")
+            link = self._link(tokens=tokens, sio=FakeSio(auth_mode="silent_disconnect"), pairing_code=None)
+            first = await self._failed_attempt(link)
+            tokens.token = None  # nothing left to present
+            second = await self._failed_attempt(link)
+            return first, second, link
+
+        first, second, link = self.run_async(scenario())
+        self.assertLessEqual(first, 1.0)
+        self.assertEqual(second, self.LONG_S)
+        self.assertIsNone(link._attempt_auth_method)
+
+    def test_repeated_no_verdict_failures_grow_and_stay_capped(self):
+        async def scenario():
+            link = self._link(tokens=MemoryTokenStore(token="stored-tok"), sio=FakeSio(auth_mode="silent_disconnect"),
+                              backoff_max_s=8.0)
+            delays = []
+            for attempt in range(8):
+                link._attempt = attempt
+                delays.append(await self._failed_attempt(link))
+            return delays
+
+        delays = self.run_async(scenario())
+        self.assertTrue(all(0.0 < d <= 8.0 for d in delays))
+        self.assertGreater(max(delays[4:]), max(delays[:2]))
+
+    def test_the_run_loop_recovers_from_a_no_verdict_failure_without_the_long_wait(self):
+        """End to end through `_run`: with the long backoff at 30 s, a silent
+        close then a success completes in well under a second."""
+
+        async def scenario():
+            tokens = MemoryTokenStore(token="stored-tok")
+            sio = SequencedSio(["silent_disconnect", "success"], auth_token="stored-tok")
+            link, _ = make_link(tokens=tokens, sio=sio, backoff_initial_s=0.01, backoff_max_s=0.02,
+                                backoff_auth_failed_s=30.0)
+            link._running = True
+            started = time.monotonic()
+            task = asyncio.create_task(link._run())
+            for _ in range(200):
+                if link.stats["auth_successes"]:
+                    break
+                await asyncio.sleep(0.005)
+            took = time.monotonic() - started
+            link._running = False
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            return link, tokens, took
+
+        link, tokens, took = self.run_async(scenario())
+        self.assertEqual(link.stats["auth_failures"], 1)
+        self.assertEqual(link.stats["auth_successes"], 1)
+        self.assertLess(took, 1.0)
+        self.assertEqual(tokens.clears, 0)
+
+    def test_the_run_loop_still_waits_long_after_the_verdict(self):
+        async def scenario():
+            tokens = MemoryTokenStore(token="stored-tok")
+            sio = SequencedSio(["rejected", "success"], auth_token="fresh-tok")
+            link, _ = make_link(tokens=tokens, sio=sio, backoff_initial_s=0.01, backoff_max_s=0.02,
+                                backoff_auth_failed_s=30.0, pairing_code="654321")
+            link._running = True
+            task = asyncio.create_task(link._run())
+            await asyncio.sleep(0.5)
+            link._running = False
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            return link, tokens
+
+        link, tokens = self.run_async(scenario())
+        self.assertEqual(link.stats["auth_failures"], 1)
+        self.assertEqual(link.stats["auth_successes"], 0)  # still inside the 30 s wait
+        self.assertEqual(tokens.clears, 1)  # and the verdict discarded the token
 
 
 class TestTelemetryPublishing(AsyncTestCase):
