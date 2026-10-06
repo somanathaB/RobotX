@@ -19,7 +19,14 @@ Code: [protocol.py](../../robotx/communication/protocol.py) (plain events),
 | `ROBOTX_PAIRING_CODE` | first boot | 6-digit code, 300 s TTL. Secret |
 | `ROBOTX_BACKEND_TOKEN_PATH` | – | Where the `AUTH_SUCCESS` token is persisted (0600) |
 | `ROBOTX_COMMAND_SIGNING_KEY` | for OFFERs | The backend's `COMMAND_SIGNING_KEY`. Secret. Unset: no OFFER is ever admitted |
-| `ROBOTX_COMMITMENT_STATE_PATH` | – | Fence/sequence marks, tombstones and the respond-once record (0600) |
+| `ROBOTX_COMMITMENT_STATE_PATH` | – | Fence/sequence marks, tombstones and the respond-once record (0600). Never empty: empty keeps them in memory only |
+| `ROBOTX_CUSTODY_CONFIRMATION` | for OFFERs | `operator` to accept missions that need custody reports. Default `none`: every OFFER is rejected `NO_CUSTODY_SENSING` |
+| `ROBOTX_BACKEND_HEARTBEAT_INTERVAL_S` | – | Default 2.0; must be above 0 and at most 2.0, or the link is not started (Y4.1) |
+| `ROBOTX_BACKEND_LOSS_POLICY` / `ROBOTX_BACKEND_LOSS_GRACE_S` | – | `pause` / at most 10 s; `continue` or a longer grace and the link is not started (Y4) |
+
+A refused link setting does not stop the agent: it runs with the link disabled
+and logs `backend.config_invalid`. The V1 values and their verification are in
+[V1_PI_DEPLOYMENT.md](../operations/V1_PI_DEPLOYMENT.md).
 
 ## Outbound
 
@@ -29,9 +36,9 @@ Code: [protocol.py](../../robotx/communication/protocol.py) (plain events),
 | `HEARTBEAT` | `{}`, or `{commitmentId, fence}` while carrying out an accepted mission | Every 2 s, only while the agent loop is ticking |
 | `TELEMETRY` | `{timestamp, sequence, status}` plus `lat, lon, speed?` for a fresh measured fix | 1 Hz |
 | `COMMAND_ACK` | operator: `{commandId}`; engine: `{outboxId, fence, authorityEpoch}` | Operator: only once applied. Engine: once admitted |
-| `OFFER_ACCEPT` / `OFFER_REJECT` / `OFFER_DEFER` | `{commitmentId, fence, reason?, until?}` | Exactly once per commitment |
-| `CUSTODY_EVENT` | `{commitmentId, fence, kind}` | Once per genuine handover |
-| `TASK_COMPLETE` | `{taskId, lat, lon}` | Once, only on L1-sufficient measured evidence |
+| `OFFER_ACCEPT` / `OFFER_REJECT` / `OFFER_DEFER` | `{commitmentId, fence, reason?, until?}` | One verdict per commitment, persisted before it is sent; the same payload is resent after a later `AUTH` while the offer can still be answered (Y2) |
+| `CUSTODY_EVENT` | `{commitmentId, fence, kind}` | Once per genuine handover, persisted before it is sent; resent unchanged after each `AUTH` until the completion is settled (Y2) |
+| `TASK_COMPLETE` | `{taskId, lat, lon}` | Only on L1-sufficient measured evidence, persisted before it is sent; resent unchanged after each `AUTH` until `TASK_COMPLETE_ACK` (Y2) |
 
 **Missing data is omitted.** No `null`, `0`, `-1` or placeholder. The Pi never
 sends `battery`, `heading`, `distanceTravelled`, `safety`, `faults`,
@@ -82,16 +89,25 @@ missing capability:
 `NO_EXECUTABLE_PATH` → `UNSUPPORTED_MISSION` → `ESTOP_LATCHED` → `AGENT_ERROR`
 → `MISSION_IN_PROGRESS` → `NO_MOTOR_LINK` → `NO_POSITION_FIX` → `NO_CUSTODY_SENSING`.
 
-**Today every OFFER is rejected with `NO_MOTOR_LINK`**, because the Pi↔ESP32
-link does not exist. A DEFER is sent only with a valid future `until`; an
-invalid one becomes a REJECT.
+An OFFER is accepted only when every check passes: no e-stop, no agent error,
+no mission in progress, the ESP32 link `UP` with motion enabled
+(`ROBOTX_ESP32_MOTION_ENABLED=1`) and the ESP32 reporting its drive available, a
+measured GPS fix, and `ROBOTX_CUSTODY_CONFIRMATION=operator`. With motion
+disabled every OFFER is rejected `NO_MOTOR_LINK`, which the deployment uses to
+prove the signing key and admission path with no possibility of motion. A DEFER
+is sent only with a valid future `until`; an invalid one becomes a REJECT.
 
 ## Custody and completion
 
 An accepted mission holds at the pickup until `ACQUIRED` is recorded, and at
 the drop until `RELEASED` is recorded. The only way either is recorded is
 `MissionManager.record_custody`, at an arrival decided on a measured position.
-Nothing on this Rover calls it today, because there is no custody sensing.
+There is no custody sensor. With `ROBOTX_CUSTODY_CONFIRMATION=operator`, the
+person at the stop confirms each handover through the local API
+(`POST /mission/custody {"kind": "ACQUIRED" | "RELEASED"}`), recorded as
+`OPERATOR_CONFIRMED` — a person's statement, not a sensor reading — and refused
+unless the Rover is at that stop. After `ACQUIRED` the Rover drives on to the
+drop on the next tick.
 
 `TASK_COMPLETE` requires all of the following:
 
@@ -102,3 +118,15 @@ Nothing on this Rover calls it today, because there is no custody sensing.
   ([evidence.py](../../robotx/mission/evidence.py)).
 
 Otherwise it is withheld, never sent on weaker evidence.
+
+## Link loss (Y4)
+
+The backend renews a commitment's 60 s lease only from the commitment-scoped
+`HEARTBEAT`, once half of it has run out. When an authenticated link is lost
+during a mission, the agent's own control loop pauses the mission once the loss
+has lasted `ROBOTX_BACKEND_LOSS_GRACE_S` (detection takes at most the backend
+handshake's ping interval + timeout, which must be ≤ 15 s; a slower handshake is
+logged CRITICAL as `backend.heartbeat_too_slow`). The robot is therefore paused
+before the lease can be reassigned. A restored link never resumes a paused
+mission: a `RESUME` command does, after the operator checks in
+[V1_PI_OPERATOR_RUNBOOK.md](../operations/V1_PI_OPERATOR_RUNBOOK.md).

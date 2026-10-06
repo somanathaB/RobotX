@@ -1,5 +1,43 @@
 # RobotX Pi Agent — Remediation Plan
 
+> **V1 status (2026-10-06) — read this first.** Everything below this box is the
+> 2026-09-22 plan, kept as a historical record. Where it disagrees with this box,
+> this box is current.
+>
+> - **R-00:** the run command is `venv/bin/python -m robotx.application`. The
+>   `venv/bin/python -m uvicorn robotx.application.main:app ...` form in R-00's
+>   text below is superseded: it bypasses `main.run()`, which applies
+>   `ROBOTX_API_HOST`/`ROBOTX_API_PORT` (loopback by default).
+> - **R-01, R-03:** the retained legacy direct-drive loop they were applied to
+>   (`robotx/control/robot_controller.py`) has since been removed. Motion now
+>   reaches the motors only through the safety gate and the ESP32 UART link
+>   (`robotx/control/safety.py`, `robotx/esp32/`).
+> - **R-02:** superseded. `robotx/communication/socket_client.py` and its
+>   handshake-token design no longer exist. The backend link
+>   (`robotx/communication/backend_link.py`) connects anonymously and
+>   authenticates with an `AUTH` event — a one-time pairing code, then a
+>   persisted session token — and verifies every engine command's HMAC
+>   signature. The "R-02 backend integration requirement" section below is
+>   obsolete.
+> - **R-06, R-07:** implemented in their V1 form. Inbound backend commands are
+>   validated and age-checked (`robotx/communication/commands.py`,
+>   `protocol.py`); a lost backend link pauses an active mission before its lease
+>   can be reassigned (Y4/Y4.1); the local start/resume routes are refused while
+>   the backend link is enabled (H1); the local API binds loopback by default (H2).
+> - **R-08:** addressed by `deployment/robotx-agent.service` and
+>   `docs/operations/V1_PI_DEPLOYMENT.md`. The R-08 proposal below (`User=pi`,
+>   `.env` inside the checkout, `ExecStart=... -m uvicorn
+>   robotx.application.main:app --host ... --port ...`, `RestartSec=2`) is
+>   **superseded**. The unit starts the agent only as
+>   `venv/bin/python -m robotx.application`, which binds through `main.run()`;
+>   starting uvicorn directly bypasses it. Configuration is in
+>   `/etc/robotx/robotx-agent.env` (root-owned, mode 0600), outside the
+>   checkout.
+> - **R-10:** `.env.example` documents every setting's built-in default and the
+>   V1 values; it holds no secret values.
+> - Not yet done on the physical robot: any of the above. See
+>   `docs/operations/V1_PI_DEPLOYMENT.md`, section 26.
+
 **Date:** 2026-09-22
 **Status (updated 2026-09-22, after the standalone-agent restructuring):**
 - **R-00, R-01, R-02, R-03** — implemented and verified (see "Implementation status" below). R-01 and R-03 now live in the *retained legacy* direct-drive loop, which the application no longer starts; their rules are the reference for the ESP32.

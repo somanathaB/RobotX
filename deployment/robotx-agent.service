@@ -1,0 +1,85 @@
+# RobotX Pi agent -- systemd unit for the V1 deployment.
+#
+# A template to review and install, never installed automatically. Procedure,
+# file layout and verification: docs/operations/V1_PI_DEPLOYMENT.md.
+#
+#   sudo install -m 0644 deployment/robotx-agent.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#
+# Layout this unit assumes:
+#   /opt/robotx/RobotX-Pi        repository checkout (root-owned, read-only here)
+#   /opt/robotx/RobotX-Pi/venv   python3 -m venv --system-site-packages
+#   /etc/robotx/robotx-agent.env configuration and secrets (root:root 0600)
+#   /etc/robotx/pairing.env      first pairing only; delete after AUTH succeeds
+#   /var/lib/robotx              session token + commitment marks (StateDirectory)
+#
+# The agent starts ONLY through `python -m robotx.application` -> main.run(),
+# which binds ROBOTX_API_HOST:ROBOTX_API_PORT (loopback by default) and warns
+# when that is not loopback. Never start it as `uvicorn robotx.application.main:app`:
+# that bypasses main.run().
+
+[Unit]
+Description=RobotX Pi agent (loopback API + RobotX backend link)
+Documentation=file:///opt/robotx/RobotX-Pi/docs/operations/V1_PI_DEPLOYMENT.md
+# The backend link retries on its own backoff, so a network that comes up late
+# is not a failure; this ordering only shortens the first connect.
+Wants=network-online.target
+After=network-online.target
+# OFFER validity, COMMAND age, the TELEMETRY sequence seed and position
+# timestamps all use the wall clock. Reached only after synchronisation when
+# systemd-time-wait-sync.service (or chrony-wait.service) is enabled.
+Wants=time-sync.target
+After=time-sync.target
+# A crash loop stops here and stays failed until an operator looks:
+#   sudo systemctl reset-failed robotx-agent
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=exec
+User=robotx
+Group=robotx
+# /dev/ttyAMA0 (ESP32 UART) and the Pi camera device nodes.
+SupplementaryGroups=dialout video
+# Required, not cosmetic: the repository is not pip-installed, so
+# `-m robotx.application` resolves the package from this directory.
+WorkingDirectory=/opt/robotx/RobotX-Pi
+EnvironmentFile=/etc/robotx/robotx-agent.env
+# Optional ("-"): exists only during the first pairing.
+EnvironmentFile=-/etc/robotx/pairing.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/robotx/RobotX-Pi/venv/bin/python -m robotx.application
+
+Restart=on-failure
+RestartSec=5
+# An open /camera stream holds the HTTP server's graceful shutdown; after this
+# the process is killed and the agent's own shutdown (final ESP32 STOP) is
+# skipped. Close camera viewers before stopping.
+TimeoutStopSec=15
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=robotx-agent
+
+StateDirectory=robotx
+StateDirectoryMode=0700
+UMask=0077
+
+# Hardening. Deliberately absent: PrivateDevices, DeviceAllow, DevicePolicy and
+# ProtectClock (each can cut off /dev/ttyAMA0 or the camera), and
+# MemoryDenyWriteExecute, SystemCallFilter, RestrictAddressFamilies and
+# WatchdogSec (deferred until tested on the physical Pi).
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictRealtime=yes
+
+[Install]
+WantedBy=multi-user.target

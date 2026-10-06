@@ -1,5 +1,34 @@
 # RobotX Pi — Current State
 
+> **Historical snapshot (2026-09-22). Superseded for V1 — read this first.**
+> This page records the state of the Pi on 2026-09-22. Its physical evidence for
+> the camera and the vision pipeline (Steps 1, 2 and 5) remains valid. Much of
+> the rest no longer describes the software:
+>
+> - **ESP32 link** — implemented (`robotx/esp32/`): the gated motion intent goes
+>   to the ESP32 over the UART as STOP/DRIVE, only with
+>   `ROBOTX_ESP32_MOTION_ENABLED=1`. "It does not move the robot", "the ESP32
+>   link does not exist yet" and "the Pi cannot stop the robot" are out of date.
+> - **GPS** — the V1 rover's receiver is on the ESP32's I2C bus and reaches the
+>   Pi in the ESP32's GPS frames (`ROBOTX_GPS_SOURCE=esp32`). The Pi-serial GPS
+>   investigated in Step 3 below is not part of V1.
+> - **Backend integration** — implemented (`robotx/communication/`): `AUTH`
+>   with a pairing code then a persisted token, signed and fenced OFFERs,
+>   operator custody confirmation, `TASK_COMPLETE`, the link-loss pause (Y4), and
+>   the engine-mode lock on local start/resume (H1). The `socket_client.py` and
+>   `robot_controller.py` listed under "Retained but not production" have been
+>   removed. Verified end to end against the real backend with the ESP32 host
+>   simulator (Gate 3 / 3b), not on the physical robot.
+> - **Process supervision** — `deployment/robotx-agent.service`.
+> - **Tests** — 924 unit and 55 integration tests (Linux), not 201.
+> - **Still true:** the HTTP API is unauthenticated (loopback by default; V1
+>   operators use SSH); no battery sensing; no distance estimation; no heading
+>   while stationary; no physical emergency stop.
+>
+> Current documents: `docs/operations/V1_PI_DEPLOYMENT.md` (including what
+> remains unverified on hardware, section 26) and
+> `docs/operations/V1_PI_OPERATOR_RUNBOOK.md`.
+
 What actually works on the Raspberry Pi today, what half-works, and what does
 not exist. Scope is the Pi only; the ESP32 and the FalconAut backend are
 separate systems and are out of scope here.
