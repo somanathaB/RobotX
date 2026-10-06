@@ -55,6 +55,25 @@ class CommitmentRecord:
     custody_sent: List[str] = field(default_factory=list)
     # "SENT" | "WITHHELD" once completion has been decided.
     completion: Optional[str] = None
+    # Y2 -- the exact TASK_COMPLETE payload claimed (persisted before it is
+    # emitted), and whether the backend's TASK_COMPLETE_ACK for it has been seen.
+    # A claim that is SENT but not acked is resent, unchanged, after each
+    # successful AUTH until the ACK arrives -- including after a restart.
+    completion_claim: Optional[Dict[str, Any]] = None
+    completion_acked: bool = False
+    # Y2 -- what that TASK_COMPLETE_ACK said: "SETTLED" | "ALREADY_COMPLETED" |
+    # "VERIFYING", and its reason (e.g. CUSTODY_STILL_HELD). Only a settled answer
+    # ends the custody resends; a verifying one may mean RELEASED was lost.
+    completion_ack_result: Optional[str] = None
+    completion_ack_reason: Optional[str] = None
+    # Y2 -- the exact CUSTODY_EVENT payload sent for each kind, persisted before
+    # it is emitted, so a lost one can be resent unchanged after AUTH. The backend
+    # acknowledges neither custody nor OFFER_* responses; it ignores a duplicate.
+    custody_payloads: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    # Y2 -- the exact OFFER_* response payload (for `response`), persisted before
+    # it is emitted, and the offer's expiry (epoch s): after it, nothing answers.
+    response_payload: Optional[Dict[str, Any]] = None
+    offer_expiry: Optional[float] = None
     updated_at: float = 0.0
 
     @property
@@ -62,6 +81,19 @@ class CommitmentRecord:
         """An accepted commitment this Rover still owes work on."""
 
         return self.response == "ACCEPT" and not self.tombstoned and self.completion is None
+
+    @property
+    def completion_unacknowledged(self) -> bool:
+        """Y2 -- a completion claim was made and the backend has not acknowledged it."""
+
+        return self.completion == "SENT" and isinstance(self.completion_claim, dict) and not self.completion_acked
+
+    @property
+    def custody_settled(self) -> bool:
+        """Y2 -- the backend acknowledged the completion as settled: no custody
+        report for this commitment can matter any more."""
+
+        return self.completion_acked and self.completion_ack_result in ("SETTLED", "ALREADY_COMPLETED")
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "CommitmentRecord":

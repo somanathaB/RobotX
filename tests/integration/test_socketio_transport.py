@@ -83,6 +83,13 @@ class ContractServer:
         self.refuse_first = refuse_first
         self.ignore_first = ignore_first
         self.auth_count = 0
+        # Y2 -- answer TASK_COMPLETE with TASK_COMPLETE_ACK {taskId} as
+        # dtaro.handler does, after dropping the connection on the first N claims
+        # without answering (a socket that dies with the claim in flight). Off by
+        # default: the claim is only recorded.
+        self.ack_task_complete = False
+        self.task_complete_drop_first = 0
+        self.received_at = {}
 
         self.sio = socketio.AsyncServer(async_mode="aiohttp")
         self.app = web.Application()
@@ -145,9 +152,19 @@ class ContractServer:
             self._record(name)
 
     def _record(self, name):
+        self.received_at.setdefault(name, [])
+
         @self.sio.on(name, namespace=NAMESPACE)
         async def handler(sid, data, _name=name):
             self.received[_name].append(data)
+            self.received_at[_name].append(time.monotonic())  # Y2 -- spacing as the server saw it
+            if _name == "TASK_COMPLETE" and self.ack_task_complete:
+                if len(self.received["TASK_COMPLETE"]) <= self.task_complete_drop_first:
+                    await self.sio.disconnect(sid, namespace=NAMESPACE)  # gone before any ACK
+                else:
+                    task_id = data.get("taskId") if isinstance(data, dict) else None
+                    await self.sio.emit("TASK_COMPLETE_ACK", {"taskId": task_id, "timestamp": int(time.time() * 1000)},
+                                        to=sid, namespace=NAMESPACE)
 
     async def start(self):
         self.runner = web.AppRunner(self.app)
@@ -498,6 +515,115 @@ class TestR1CredentialRetentionOverTheWire(ContractTestCase):
         self.assertTrue(ok)
         self.assertEqual([p.get("token") for p in server.auth_payloads], [self.STORED, self.STORED])
         self.assertEqual(stored, self.STORED)
+
+
+class TestY2CompletionDeliveryOverTheWire(ContractTestCase):
+    """Y2 over a real Socket.IO transport, with the real client and the real
+    on-disk CommitmentStore: a completion claim whose socket died before the
+    TASK_COMPLETE_ACK is resent after the next AUTH, settled by the ACK, and
+    never sent again."""
+
+    CLAIM = {"taskId": "T-Y2", "lat": 12.9716, "lon": 77.5946}
+
+    def test_claim_lost_with_its_socket_is_resent_after_reconnect_acked_and_never_resent(self):
+        from robotx.communication.commitment_store import CommitmentStore
+
+        async def scenario(server, token_path):
+            server.ack_task_complete = True
+            server.task_complete_drop_first = 1  # the first claim dies with its socket
+            server.accept_token = ISSUED_TOKEN   # reconnects present the issued session token
+            marks = os.path.join(os.path.dirname(token_path), "commitments.json")
+            # The claim as `_publish_task_complete` persists it, before any ACK.
+            CommitmentStore(marks).update(
+                "c-y2", response="ACCEPT", task_id="T-Y2", highest_fence=1, fence_wire="1", highest_sequence=0,
+                completion="SENT", completion_claim=dict(self.CLAIM),
+            )
+            link = self.make_link(server, token_path, commitment_path=marks,
+                                  backoff_initial_s=0.05, backoff_max_s=0.1)
+            await link.start()
+            settled = await wait_for(lambda: CommitmentStore(marks).get("c-y2").completion_acked, timeout=15.0)
+            stats_at_ack = dict(link.describe()["stats"])
+            claims_at_ack = list(server.received["TASK_COMPLETE"])
+            await server.kick()  # one more reconnect after the ACK
+            reconnected = await wait_for(lambda: link.describe()["stats"]["auth_successes"] >= 3, timeout=15.0)
+            await asyncio.sleep(0.3)
+            final_claims = list(server.received["TASK_COMPLETE"])
+            await link.stop()
+            return settled, stats_at_ack, claims_at_ack, reconnected, final_claims, CommitmentStore(marks).get("c-y2")
+
+        settled, stats, claims_at_ack, reconnected, final_claims, record = self.run_async(scenario)
+        self.assertTrue(settled)
+        self.assertEqual(claims_at_ack, [self.CLAIM, self.CLAIM])  # sent, lost, resent unchanged
+        self.assertEqual(stats["auth_successes"], 2)                # resent only after a new AUTH
+        self.assertEqual(stats["task_completes_resent"], 2)
+        self.assertTrue(reconnected)
+        self.assertEqual(final_claims, [self.CLAIM, self.CLAIM])    # acked: not sent again
+        self.assertTrue(record.completion_acked)
+        self.assertEqual(record.completion_claim, self.CLAIM)
+
+
+class TestY2ReportDeliveryOverTheWire(ContractTestCase):
+    """Y2 over a real Socket.IO transport: persisted CUSTODY_EVENT and OFFER_*
+    responses are resent, unchanged, after each successful AUTH while they can
+    still matter -- and the ones that cannot are not."""
+
+    def _seed(self, marks):
+        from robotx.communication.commitment_store import CommitmentStore
+
+        store = CommitmentStore(marks)
+        future, past = time.time() + 600, time.time() - 1
+        self.acquired = {"commitmentId": "c-cust", "fence": "7", "kind": "ACQUIRED"}
+        self.released = {"commitmentId": "c-cust", "fence": "7", "kind": "RELEASED"}
+        self.reject = {"commitmentId": "c-rej", "fence": "8", "reason": "NO_MOTOR_LINK"}
+        self.defer = {"commitmentId": "c-def", "fence": "9", "until": int(future * 1000), "reason": "CHARGING"}
+        # Custody the backend has not settled: its claim was answered verifying / CUSTODY_STILL_HELD.
+        store.update("c-cust", response="ACCEPT", task_id="T-C", fence_wire="7", custody_sent=["ACQUIRED", "RELEASED"],
+                     custody_payloads={"ACQUIRED": self.acquired, "RELEASED": self.released},
+                     completion="SENT", completion_claim={"taskId": "T-C", "lat": 1.0, "lon": 2.0},
+                     completion_acked=True, completion_ack_result="VERIFYING", completion_ack_reason="CUSTODY_STILL_HELD")
+        store.update("c-rej", response="REJECT", response_payload=self.reject, offer_expiry=future)
+        store.update("c-def", response="DEFER", response_payload=self.defer, offer_expiry=future)
+        # Must NOT be resent: an ACCEPT with no mission being carried out, an expired
+        # offer, custody whose completion was settled.
+        store.update("c-acc", response="ACCEPT", task_id="T-A", response_payload={"commitmentId": "c-acc", "fence": "10"},
+                     offer_expiry=future)
+        store.update("c-old", response="REJECT", response_payload={"commitmentId": "c-old", "fence": "11", "reason": "X"},
+                     offer_expiry=past)
+        store.update("c-done", response="ACCEPT", task_id="T-D", custody_sent=["RELEASED"],
+                     custody_payloads={"RELEASED": {"commitmentId": "c-done", "fence": "12", "kind": "RELEASED"}},
+                     completion="SENT", completion_claim={"taskId": "T-D", "lat": 1.0, "lon": 2.0},
+                     completion_acked=True, completion_ack_result="SETTLED")
+
+    def test_persisted_reports_are_resent_after_each_auth_exactly_and_spaced(self):
+        async def scenario(server, token_path):
+            server.accept_token = ISSUED_TOKEN  # the reconnect presents the issued session token
+            marks = os.path.join(os.path.dirname(token_path), "commitments.json")
+            self._seed(marks)
+            link = self.make_link(server, token_path, commitment_path=marks, backoff_initial_s=0.05, backoff_max_s=0.1)
+            await link.start()
+            first = await wait_for(lambda: len(server.received["CUSTODY_EVENT"]) >= 2 and server.received["OFFER_DEFER"], timeout=15.0)
+            await asyncio.sleep(0.3)
+            await server.kick()  # the session is lost; a new one authenticates
+            second = await wait_for(lambda: len(server.received["CUSTODY_EVENT"]) >= 4 and len(server.received["OFFER_DEFER"]) >= 2, timeout=15.0)
+            await asyncio.sleep(0.3)
+            stats = dict(link.describe()["stats"])
+            await link.stop()
+            return first, second, server, stats
+
+        first, second, server, stats = self.run_async(scenario)
+        self.assertTrue(first and second)
+        self.assertEqual(stats["auth_successes"], 2)
+        custody = server.received["CUSTODY_EVENT"]
+        self.assertEqual(custody, [self.acquired, self.released, self.acquired, self.released])
+        at = server.received_at["CUSTODY_EVENT"]
+        self.assertGreaterEqual(at[1] - at[0], 0.05)  # ACQUIRED, >= 50 ms, RELEASED -- as received
+        self.assertGreaterEqual(at[3] - at[2], 0.05)
+        self.assertEqual(server.received["OFFER_REJECT"], [self.reject, self.reject])
+        self.assertEqual(server.received["OFFER_DEFER"], [self.defer, self.defer])  # the original until, untouched
+        self.assertEqual(server.received["OFFER_ACCEPT"], [])  # no mission: never re-asserted
+        self.assertEqual(server.received["TASK_COMPLETE"], [])  # both claims were acknowledged
+        self.assertEqual(stats["custody_events_resent"], 4)
+        self.assertEqual(stats["offer_responses_resent"], 4)
 
 
 class TestHeartbeatOverTheWire(ContractTestCase):

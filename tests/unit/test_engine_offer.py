@@ -654,6 +654,652 @@ class CompletionTests(CustodyLinkTests):
         self.assertEqual(link.stats["task_completes_verifying"], 1)
 
 
+# --- Y2: a completion claim survives the loss of the socket that carried it ----
+
+
+class Y2CompletionDelivery(AsyncTestCase):
+    """Y2 -- TASK_COMPLETE is persisted before it is emitted and resent, unchanged,
+    after each successful AUTH until the backend's TASK_COMPLETE_ACK is seen.
+
+    Each scenario runs in ONE event loop, as the agent does: the link's asyncio
+    events belong to the loop that first awaits them. The mission is the same
+    one the completion tests drive -- accepted, measured fixes over the drop leg,
+    ACQUIRED and RELEASED, complete -- through the real publish paths.
+    """
+
+    ACK = {"taskId": "T-123", "timestamp": 1}
+
+    # --- one loop, real paths ---------------------------------------------------
+
+    async def accept(self, **cfg):
+        state = state_with_fix(fx.ROBOT_ID)
+        agent = OfferAgent("accept", state=state)
+        link, sio = engine_link(agent=agent, state=state, max_position_age_s=30.0, **cfg)
+        await connect_and_auth(link)
+        await sio.fire("OFFER", fx.envelope())
+        return link, sio, state
+
+    async def publish(self, link, times=1):
+        for _ in range(times):
+            await link._publish_custody()
+            await link._publish_task_complete()
+
+    async def complete(self, link, sio, state, *, drop_before_claim=False):
+        """Drive the drop leg on SYNTHETIC measured fixes, hand over, finish."""
+
+        link._granted_at_ms["c-7f3a"] = now_ms() - 15_000
+        points = path_to_drop()[1:]
+        for i, (lat, lon) in enumerate(points):
+            t = time.time() - 12.0 + 3.0 * i if i < len(points) - 1 else time.time() - 0.5
+            state.update_gps(
+                GpsReading(status=GPSStatus.FIX, fix=GpsFix(latitude=lat, longitude=lon, timestamp=t), age_s=0.1),
+                Position(latitude=lat, longitude=lon, timestamp=t),
+            )
+            await link._publish_telemetry()
+        mission = state.snapshot().mission
+        state.update_mission(replace(mission, status=MissionStatus.AT_DROP, pickup_measured=True, drop_measured=True,
+                                     custody_acquired_at=time.time() - 20, custody_released_at=time.time()))
+        await self.publish(link)  # ACQUIRED, RELEASED -- before any claim
+        if drop_before_claim:
+            await sio.drop()
+        state.update_mission(replace(state.snapshot().mission, status=MissionStatus.COMPLETE, completed_at=time.time()))
+        await self.publish(link, 3)
+
+    async def reconnect(self, link, sio):
+        """The socket is gone; a new session connects, authenticates and starts
+        publishing -- the real `_publish_loop` entry, which ends at once here."""
+
+        if sio.connected:
+            await sio.drop()
+        ok = await connect_and_auth(link)
+        if ok:
+            link._running = False
+            await link._publish_loop()
+        return ok
+
+    async def ack(self, sio, payload=None):
+        await sio.fire("TASK_COMPLETE_ACK", self.ACK if payload is None else payload)
+
+    @staticmethod
+    def record(link):
+        return link.commitments.get("c-7f3a")
+
+    # --- D, E -------------------------------------------------------------------
+
+    def test_D_a_claim_lost_with_its_socket_is_resent_unchanged_after_reconnect_until_acked(self):
+        async def scenario():
+            link, sio, state = await self.accept()
+            await self.complete(link, sio, state)
+            first = sio.events_named("TASK_COMPLETE")
+            r = self.record(link)
+            persisted = (r.completion, r.completion_claim, r.completion_acked)
+            reconnected = await self.reconnect(link, sio)  # the socket died before any ACK
+            claims = list(sio.events_named("TASK_COMPLETE"))
+            pending = self.record(link).completion_unacknowledged
+            await self.ack(sio)
+            acked = self.record(link).completion_acked
+            await self.reconnect(link, sio)
+            return first, persisted, reconnected, claims, pending, acked, sio.events_named("TASK_COMPLETE")
+
+        first, persisted, reconnected, claims, pending, acked, final = self.run_async(scenario())
+        self.assertEqual(len(first), 1)
+        self.assertEqual(persisted, ("SENT", first[0], False))
+        self.assertTrue(reconnected)
+        self.assertEqual(claims, [first[0], first[0]])  # the same report, not a new one
+        self.assertTrue(pending)  # unresolved until ACKed
+        self.assertTrue(acked)
+        self.assertEqual(len(final), 2)  # settled: never again
+
+    def test_E_an_acked_claim_is_not_resent_after_reconnect(self):
+        for reply in (self.ACK, {"taskId": "T-123", "verifying": True},
+                      {"taskId": "T-123", "verifying": True, "reason": "CUSTODY_STILL_HELD"},
+                      {"taskId": "T-123", "alreadyCompleted": True}):
+            with self.subTest(reply=reply):
+                async def scenario():
+                    link, sio, state = await self.accept()
+                    await self.complete(link, sio, state)
+                    await self.ack(sio, reply)
+                    acked = self.record(link).completion_acked
+                    await self.reconnect(link, sio)
+                    await self.reconnect(link, sio)
+                    return acked, sio.events_named("TASK_COMPLETE")
+
+                acked, claims = self.run_async(scenario())
+                self.assertTrue(acked)
+                self.assertEqual(len(claims), 1)
+
+    # --- F ----------------------------------------------------------------------
+
+    def test_F_a_restart_resends_the_persisted_claim_after_auth(self):
+        from robotx.communication.commitment_store import CommitmentStore
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "commitments.json")
+
+            async def first_process():
+                link, sio, state = await self.accept(commitment_path=path)
+                await self.complete(link, sio, state)
+                return sio.events_named("TASK_COMPLETE")[0]  # then the process dies, before any ACK
+
+            claim = self.run_async(first_process())
+
+            async def second_process():
+                # A new process: marks from disk only -- no mission, no track, a new socket.
+                link, sio = engine_link(state=state_with_fix(fx.ROBOT_ID), commitment_path=path)
+                pending = link.commitments.get("c-7f3a").completion_unacknowledged
+                ok = await self.reconnect(link, sio)
+                resent = list(sio.events_named("TASK_COMPLETE"))
+                await self.ack(sio)
+                return pending, ok, resent
+
+            pending, ok, resent = self.run_async(second_process())
+            self.assertTrue(pending)
+            self.assertTrue(ok)
+            self.assertEqual(resent, [claim])
+            self.assertTrue(CommitmentStore(path).get("c-7f3a").completion_acked)  # durable
+
+            async def third_process():
+                link, sio = engine_link(state=state_with_fix(fx.ROBOT_ID), commitment_path=path)
+                await self.reconnect(link, sio)
+                return sio.events_named("TASK_COMPLETE")
+
+            self.assertEqual(self.run_async(third_process()), [])
+
+    # --- G, H, I, J -----------------------------------------------------------
+
+    def test_G_a_repeated_or_foreign_ack_corrupts_nothing(self):
+        async def scenario():
+            link, sio, state = await self.accept()
+            await self.complete(link, sio, state)
+            for reply in (self.ACK, self.ACK, {"taskId": "T-123", "verifying": True}):
+                await self.ack(sio, reply)
+            for junk in (None, {}, {"taskId": 5}, {"taskId": ""}, {"taskId": "T-OTHER"}, "T-123"):
+                await self.ack(sio, junk)
+            r = self.record(link)
+            settled = (r.completion, r.completion_acked)
+            await self.reconnect(link, sio)
+            return settled, sio.events_named("TASK_COMPLETE")
+
+        settled, claims = self.run_async(scenario())
+        self.assertEqual(settled, ("SENT", True))
+        self.assertEqual(len(claims), 1)
+
+    def test_G_an_ack_for_another_task_does_not_settle_this_claim(self):
+        async def scenario():
+            link, sio, state = await self.accept()
+            await self.complete(link, sio, state)
+            await self.ack(sio, {"taskId": "T-OTHER"})
+            return self.record(link).completion_unacknowledged
+
+        self.assertTrue(self.run_async(scenario()))
+
+    def test_H_repeated_reconnects_before_the_ack_keep_the_claim_and_resend_once_each(self):
+        async def scenario():
+            link, sio, state = await self.accept()
+            await self.complete(link, sio, state)
+            for _ in range(3):
+                assert await self.reconnect(link, sio)
+            counts = (len(sio.events_named("TASK_COMPLETE")), link.stats["task_completes_resent"],
+                      self.record(link).completion_unacknowledged)
+            await self.ack(sio)
+            await self.reconnect(link, sio)
+            return counts, len(sio.events_named("TASK_COMPLETE"))
+
+        (sent, resent, pending), final = self.run_async(scenario())
+        self.assertEqual((sent, resent, pending), (4, 3, True))  # 1 + one per authenticated session
+        self.assertEqual(final, 4)
+
+    def test_I_nothing_is_resent_before_authentication_succeeds(self):
+        async def scenario():
+            link, sio, state = await self.accept()
+            await self.complete(link, sio, state)
+            link.cfg = replace(link.cfg, auth_timeout_s=0.05)
+            outcomes = []
+            for mode in ("none", "silent_disconnect", "rejected"):
+                if sio.connected:
+                    await sio.drop()
+                sio.auth_mode = mode
+                ok = await connect_and_auth(link)
+                if not ok:
+                    await link._handle_auth_failure()
+                outcomes.append((mode, ok, len(sio.events_named("TASK_COMPLETE"))))
+            sio.auth_mode = "success"
+            ok = await self.reconnect(link, sio)
+            return outcomes, ok, len(sio.events_named("TASK_COMPLETE"))
+
+        outcomes, ok, final = self.run_async(scenario())
+        self.assertEqual(outcomes, [("none", False, 1), ("silent_disconnect", False, 1), ("rejected", False, 1)])
+        self.assertTrue(ok)
+        self.assertEqual(final, 2)
+
+    def test_J_order_custody_before_the_claim_then_heartbeat_telemetry_before_the_resend(self):
+        async def scenario():
+            link, sio, state = await self.accept()
+            await self.complete(link, sio, state)
+            original = names(sio.emitted)
+            before = len(sio.emitted)
+            await self.reconnect(link, sio)
+            return original, names(sio.emitted[before:])
+
+        original, after = self.run_async(scenario())
+        custody = [i for i, n in enumerate(original) if n == "CUSTODY_EVENT"]
+        self.assertEqual(len(custody), 2)
+        self.assertLess(custody[-1], original.index("TASK_COMPLETE"))  # RELEASED, then the claim
+        self.assertEqual(after[:2], ["AUTH", "HEARTBEAT"])
+        self.assertLess(after.index("TELEMETRY"), after.index("TASK_COMPLETE"))
+
+    # --- persist before emit -------------------------------------------------
+
+    def test_a_claim_made_while_the_socket_is_already_down_is_sent_after_auth(self):
+        async def scenario():
+            link, sio, state = await self.accept()
+            await self.complete(link, sio, state, drop_before_claim=True)
+            made = (sio.events_named("TASK_COMPLETE"), self.record(link).completion_unacknowledged)
+            await self.reconnect(link, sio)
+            return made, sio.events_named("TASK_COMPLETE")
+
+        (sent_while_down, pending), after = self.run_async(scenario())
+        self.assertEqual(sent_while_down, [])
+        self.assertTrue(pending)
+        self.assertEqual(len(after), 1)
+
+    def test_a_claim_that_cannot_be_persisted_is_not_emitted(self):
+        async def scenario():
+            link, sio, state = await self.accept()
+            update = link.commitments.update
+            link.commitments.update = lambda cid, **ch: None if "completion_claim" in ch else update(cid, **ch)
+            await self.complete(link, sio, state)
+            return sio.events_named("TASK_COMPLETE")
+
+        self.assertEqual(self.run_async(scenario()), [])
+
+    def test_an_unsettled_commitment_resends_custody_before_the_claim_but_never_a_finished_accept(self):
+        """No acknowledgement exists for CUSTODY_EVENT or OFFER_*: custody is resent
+        until the completion is settled, before the claim; an ACCEPT is not replayed
+        once the mission it accepted is no longer being carried out."""
+
+        async def scenario():
+            link, sio, state = await self.accept()
+            await self.complete(link, sio, state)
+            before = len(sio.emitted)
+            await self.reconnect(link, sio)
+            return names(sio.emitted[before:])
+
+        resent = self.run_async(scenario())
+        self.assertEqual([n for n in resent if n in ("CUSTODY_EVENT", "TASK_COMPLETE")],
+                         ["CUSTODY_EVENT", "CUSTODY_EVENT", "TASK_COMPLETE"])
+        for name in ("OFFER_ACCEPT", "OFFER_REJECT", "OFFER_DEFER"):
+            self.assertNotIn(name, resent)
+
+
+class Y2CustodyAndOfferDelivery(AsyncTestCase):
+    """Y2 -- CUSTODY_EVENT and OFFER_* responses survive the loss of their socket
+    and a restart: each is persisted, payload and all, before it is emitted and
+    resent unchanged after each successful AUTH while it can still matter.
+
+    The backend acknowledges neither (Y2 protocol-gap audit, Option A): it
+    ignores a duplicate it already applied, so the Pi bounds the resends itself --
+    tombstone, a settled completion, the offer's expiry, a DEFER's own `until`,
+    and for an ACCEPT, the mission still being carried out. The helpers are
+    borrowed from `Y2CompletionDelivery`, so none of its tests runs twice; each
+    scenario is one event loop.
+    """
+
+    accept = Y2CompletionDelivery.accept
+    publish = Y2CompletionDelivery.publish
+    complete = Y2CompletionDelivery.complete
+    reconnect = Y2CompletionDelivery.reconnect
+    ack = Y2CompletionDelivery.ack
+    record = staticmethod(Y2CompletionDelivery.record)
+    ACK = Y2CompletionDelivery.ACK
+
+    ACQUIRED = {"commitmentId": "c-7f3a", "fence": "42", "kind": "ACQUIRED"}
+    RELEASED = {"commitmentId": "c-7f3a", "fence": "42", "kind": "RELEASED"}
+
+    async def answer(self, decision, **cfg):
+        """An OFFER answered with `decision` (an OfferDecision), over the link."""
+
+        state = state_with_fix(fx.ROBOT_ID)
+        agent = OfferAgent(decision, state=state)
+        link, sio = engine_link(agent=agent, state=state, **cfg)
+        await connect_and_auth(link)
+        await sio.fire("OFFER", fx.envelope())
+        return link, sio, state
+
+    async def acquire(self, link, state):
+        state.update_mission(replace(state.snapshot().mission, status=MissionStatus.AT_PICKUP,
+                                     pickup_measured=True, custody_acquired_at=time.time()))
+        await self.publish(link)
+
+    async def restarted(self, path):
+        """A new process: marks from disk only -- no mission, no track, a new socket."""
+
+        link, sio = engine_link(state=state_with_fix(fx.ROBOT_ID), commitment_path=path)
+        sent_at = []
+        emit = sio.emit
+
+        async def timed(event, payload, namespace=None):
+            sent_at.append((event, time.monotonic()))
+            return await emit(event, payload, namespace=namespace)
+
+        sio.emit = timed
+        ok = await self.reconnect(link, sio)
+        return link, sio, ok, sent_at
+
+    @staticmethod
+    def custody(sio):
+        return sio.events_named("CUSTODY_EVENT")
+
+    # --- custody ------------------------------------------------------------------
+
+    def test_C1_a_persisted_acquired_is_resent_exactly_after_restart_and_auth(self):
+        from robotx.communication.commitment_store import CommitmentStore
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "commitments.json")
+
+            async def first():
+                link, sio, state = await self.accept(commitment_path=path)
+                await self.acquire(link, state)
+                return self.custody(sio)  # the process dies here; the socket with it
+
+            original = self.run_async(first())
+            on_disk = CommitmentStore(path).get("c-7f3a")
+
+            async def second():
+                link, sio, ok, _ = await self.restarted(path)
+                return ok, self.custody(sio)
+
+            ok, resent = self.run_async(second())
+        self.assertEqual(original, [self.ACQUIRED])
+        self.assertEqual((on_disk.custody_sent, on_disk.custody_payloads), (["ACQUIRED"], {"ACQUIRED": self.ACQUIRED}))
+        self.assertTrue(ok)
+        self.assertEqual(resent, [self.ACQUIRED])  # the same report, identity unchanged
+
+    def test_C2_acquired_then_released_are_resent_in_order_at_least_50ms_apart(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "commitments.json")
+
+            async def first():
+                link, sio, state = await self.accept(commitment_path=path)
+                await self.acquire(link, state)
+                state.update_mission(replace(state.snapshot().mission, status=MissionStatus.AT_DROP,
+                                             drop_measured=True, custody_released_at=time.time()))
+                await self.publish(link)
+
+            self.run_async(first())
+
+            async def second():
+                link, sio, ok, sent_at = await self.restarted(path)
+                return ok, self.custody(sio), [t for e, t in sent_at if e == "CUSTODY_EVENT"]
+
+            ok, resent, times = self.run_async(second())
+        self.assertTrue(ok)
+        self.assertEqual(resent, [self.ACQUIRED, self.RELEASED])
+        self.assertGreaterEqual(times[1] - times[0], 0.05)
+
+    def test_C2_two_kinds_reported_in_one_tick_are_also_spaced_on_the_live_path(self):
+        async def scenario():
+            link, sio, state = await self.accept()
+            state.update_mission(replace(state.snapshot().mission, status=MissionStatus.AT_DROP, pickup_measured=True,
+                                         drop_measured=True, custody_acquired_at=time.time(), custody_released_at=time.time()))
+            sent_at = []
+            emit = sio.emit
+
+            async def timed(event, payload, namespace=None):
+                sent_at.append((event, time.monotonic()))
+                return await emit(event, payload, namespace=namespace)
+
+            sio.emit = timed
+            await self.publish(link)
+            return self.custody(sio), [t for e, t in sent_at if e == "CUSTODY_EVENT"]
+
+        sent, times = self.run_async(scenario())
+        self.assertEqual(sent, [self.ACQUIRED, self.RELEASED])
+        self.assertGreaterEqual(times[1] - times[0], 0.05)
+
+    def test_C3_resends_never_add_a_report_or_change_its_identity(self):
+        async def scenario():
+            link, sio, state = await self.accept()
+            await self.complete(link, sio, state)
+            for _ in range(3):
+                await self.reconnect(link, sio)
+            await self.publish(link, 3)  # the live path does not report again either
+            r = self.record(link)
+            return self.custody(sio), r.custody_sent, r.custody_payloads
+
+        sent, custody_sent, payloads = self.run_async(scenario())
+        self.assertEqual(custody_sent, ["ACQUIRED", "RELEASED"])
+        self.assertEqual(payloads, {"ACQUIRED": self.ACQUIRED, "RELEASED": self.RELEASED})
+        self.assertEqual(sent, [self.ACQUIRED, self.RELEASED] * 4)  # 1 original + 3 sessions, same two reports
+
+    def test_C4_a_settled_or_already_completed_ack_ends_the_custody_resends(self):
+        for reply in (self.ACK, {"taskId": "T-123", "alreadyCompleted": True}):
+            with self.subTest(reply=reply):
+                async def scenario():
+                    link, sio, state = await self.accept()
+                    await self.complete(link, sio, state)
+                    await self.ack(sio, reply)
+                    before = len(self.custody(sio))
+                    await self.reconnect(link, sio)
+                    await self.reconnect(link, sio)
+                    return before, len(self.custody(sio)), self.record(link)
+
+                before, after, r = self.run_async(scenario())
+                self.assertEqual(before, after)
+                self.assertTrue(r.custody_settled)
+
+    def test_C5_verifying_custody_still_held_keeps_released_going_until_the_commitment_ends(self):
+        async def scenario():
+            link, sio, state = await self.accept()
+            await self.complete(link, sio, state)
+            await self.ack(sio, {"taskId": "T-123", "verifying": True, "reason": "CUSTODY_STILL_HELD"})
+            r = self.record(link)
+            recorded = (r.completion_acked, r.completion_ack_result, r.completion_ack_reason, r.custody_settled)
+            before = len(self.custody(sio))
+            await self.reconnect(link, sio)
+            resent = self.custody(sio)[before:]
+            claims = len(sio.events_named("TASK_COMPLETE"))
+            # The commitment ends: the backend withdraws it.
+            await sio.fire("WITHDRAW", fx.envelope(command="WITHDRAW", fence="43", sequence=1, outbox_id="ob-20"))
+            ended = self.record(link).tombstoned
+            before = len(self.custody(sio))
+            await self.reconnect(link, sio)
+            return recorded, resent, claims, ended, self.custody(sio)[before:]
+
+        recorded, resent, claims, ended, after_end = self.run_async(scenario())
+        self.assertEqual(recorded, (True, "VERIFYING", "CUSTODY_STILL_HELD", False))
+        self.assertEqual(resent, [self.ACQUIRED, self.RELEASED])
+        self.assertEqual(claims, 1)  # the acknowledged claim itself is not repeated
+        self.assertTrue(ended)
+        self.assertEqual(after_end, [])
+
+    def test_C_custody_made_while_the_socket_is_down_is_persisted_and_sent_after_auth(self):
+        async def scenario():
+            link, sio, state = await self.accept()
+            await sio.drop()
+            await self.acquire(link, state)  # reported with no socket: persisted, not emitted
+            made = (self.custody(sio), self.record(link).custody_payloads)
+            await self.reconnect(link, sio)
+            return made, self.custody(sio)
+
+        (sent_while_down, persisted), after = self.run_async(scenario())
+        self.assertEqual(sent_while_down, [])
+        self.assertEqual(persisted, {"ACQUIRED": self.ACQUIRED})
+        self.assertEqual(after, [self.ACQUIRED])
+
+    def test_C_custody_that_cannot_be_persisted_is_not_emitted(self):
+        async def scenario():
+            link, sio, state = await self.accept()
+            update = link.commitments.update
+            link.commitments.update = lambda cid, **ch: None if "custody_payloads" in ch else update(cid, **ch)
+            await self.acquire(link, state)
+            return self.custody(sio)
+
+        self.assertEqual(self.run_async(scenario()), [])
+
+    # --- OFFER responses ----------------------------------------------------------
+
+    def test_O1_accept_is_persisted_exactly_and_resent_while_its_mission_is_active(self):
+        async def scenario():
+            link, sio, state = await self.accept()
+            original = sio.events_named("OFFER_ACCEPT")
+            r = self.record(link)
+            persisted = (r.response, r.response_payload, r.offer_expiry)
+            await self.reconnect(link, sio)  # mission active, offer unexpired
+            return original, persisted, sio.events_named("OFFER_ACCEPT")
+
+        original, (response, payload, expiry), after = self.run_async(scenario())
+        self.assertEqual(original, [{"commitmentId": "c-7f3a", "fence": "42"}])
+        self.assertEqual((response, payload), ("ACCEPT", original[0]))
+        self.assertAlmostEqual(expiry, time.time() + 20.0, delta=3.0)
+        self.assertEqual(after, [original[0], original[0]])
+
+    def test_O1_accept_is_durable_across_a_restart_but_not_replayed_without_its_mission(self):
+        from robotx.communication.commitment_store import CommitmentStore
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "commitments.json")
+
+            async def first():
+                link, sio, state = await self.accept(commitment_path=path)
+                return sio.events_named("OFFER_ACCEPT")[0]
+
+            original = self.run_async(first())
+            on_disk = CommitmentStore(path).get("c-7f3a")
+
+            async def second():
+                link, sio, ok, _ = await self.restarted(path)  # the mission did not survive
+                return ok, sio.events_named("OFFER_ACCEPT")
+
+            ok, resent = self.run_async(second())
+        self.assertEqual((on_disk.response, on_disk.response_payload), ("ACCEPT", original))
+        self.assertTrue(ok)
+        self.assertEqual(resent, [])
+
+    def test_O1_accept_is_not_resent_once_the_mission_is_abandoned_or_the_offer_expired(self):
+        for how in ("abandoned", "expired", "withdrawn"):
+            with self.subTest(how=how):
+                async def scenario():
+                    link, sio, state = await self.accept()
+                    if how == "abandoned":  # a local STOP marks the mission ABORTED
+                        state.update_mission(replace(state.snapshot().mission, status=MissionStatus.ABORTED))
+                    elif how == "expired":
+                        link.commitments.update("c-7f3a", offer_expiry=time.time() - 1)
+                    else:
+                        await sio.fire("WITHDRAW", fx.envelope(command="WITHDRAW", fence="43", sequence=1, outbox_id="ob-20"))
+                    await self.reconnect(link, sio)
+                    return sio.events_named("OFFER_ACCEPT")
+
+                self.assertEqual(len(self.run_async(scenario())), 1)
+
+    def test_O2_reject_is_persisted_exactly_and_resent_after_restart(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "commitments.json")
+
+            async def first():
+                link, sio, _ = await self.answer(OfferDecision.reject("NO_MOTOR_LINK"), commitment_path=path)
+                return sio.events_named("OFFER_REJECT")
+
+            original = self.run_async(first())
+
+            async def second():
+                link, sio, ok, _ = await self.restarted(path)
+                return ok, sio.events_named("OFFER_REJECT")
+
+            ok, resent = self.run_async(second())
+        self.assertEqual(original, [{"commitmentId": "c-7f3a", "fence": "42", "reason": "NO_MOTOR_LINK"}])
+        self.assertTrue(ok)
+        self.assertEqual(resent, original)
+
+    def test_O3_defer_keeps_its_exact_until_and_reason_across_a_restart(self):
+        from robotx.communication.commitment_store import CommitmentStore
+
+        until_ms = int((time.time() + 600) * 1000)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "commitments.json")
+
+            async def first():
+                link, sio, _ = await self.answer(OfferDecision.defer(until_ms, "CHARGING"), commitment_path=path)
+                return sio.events_named("OFFER_DEFER")
+
+            original = self.run_async(first())
+            on_disk = CommitmentStore(path).get("c-7f3a").response_payload
+            time.sleep(0.05)  # a resend made now must not carry a "now"-based until
+
+            async def second():
+                link, sio, ok, _ = await self.restarted(path)
+                return ok, sio.events_named("OFFER_DEFER")
+
+            ok, resent = self.run_async(second())
+        expected = {"commitmentId": "c-7f3a", "fence": "42", "until": until_ms, "reason": "CHARGING"}
+        self.assertEqual(original, [expected])
+        self.assertEqual(on_disk, expected)
+        self.assertTrue(ok)
+        self.assertEqual(resent, [expected])
+
+    def test_O3_a_defer_whose_until_or_offer_has_passed_is_not_replayed(self):
+        import asyncio
+
+        for how in ("until_passed", "offer_expired"):
+            with self.subTest(how=how):
+                async def scenario():
+                    until_ms = int((time.time() + 0.3) * 1000) if how == "until_passed" else int((time.time() + 600) * 1000)
+                    link, sio, _ = await self.answer(OfferDecision.defer(until_ms, "CHARGING"))
+                    if how == "until_passed":
+                        await asyncio.sleep(0.4)
+                    else:
+                        link.commitments.update("c-7f3a", offer_expiry=time.time() - 1)
+                    await self.reconnect(link, sio)
+                    return sio.events_named("OFFER_DEFER")
+
+                self.assertEqual(len(self.run_async(scenario())), 1)
+
+    def test_O3_an_iso_until_is_honoured_too(self):
+        async def scenario():
+            later = fx.iso(time.time() + 600)
+            link, sio, _ = await self.answer(OfferDecision.defer(later, "CHARGING"))
+            await self.reconnect(link, sio)
+            return later, sio.events_named("OFFER_DEFER")
+
+        later, sent = self.run_async(scenario())
+        self.assertEqual([p["until"] for p in sent], [later, later])
+
+    # --- boundaries ---------------------------------------------------------------
+
+    def test_nothing_is_resent_before_authentication_succeeds(self):
+        async def scenario():
+            link, sio, state = await self.accept()
+            await self.acquire(link, state)
+            link.cfg = replace(link.cfg, auth_timeout_s=0.05)
+            counts = []
+            for mode in ("none", "silent_disconnect", "rejected"):
+                if sio.connected:
+                    await sio.drop()
+                sio.auth_mode = mode
+                ok = await connect_and_auth(link)
+                if not ok:
+                    await link._handle_auth_failure()
+                counts.append((len(self.custody(sio)), len(sio.events_named("OFFER_ACCEPT"))))
+            sio.auth_mode = "success"
+            await self.reconnect(link, sio)
+            return counts, (len(self.custody(sio)), len(sio.events_named("OFFER_ACCEPT")))
+
+        counts, final = self.run_async(scenario())
+        self.assertEqual(counts, [(1, 1), (1, 1), (1, 1)])
+        self.assertEqual(final, (2, 2))
+
+    def test_resend_order_is_offer_response_then_custody(self):
+        async def scenario():
+            link, sio, state = await self.accept()
+            await self.acquire(link, state)
+            before = len(sio.emitted)
+            await self.reconnect(link, sio)
+            return [n for n in names(sio.emitted[before:]) if n in ("OFFER_ACCEPT", "CUSTODY_EVENT", "TASK_COMPLETE")]
+
+        self.assertEqual(self.run_async(scenario()), ["OFFER_ACCEPT", "CUSTODY_EVENT"])
+
+
 class TestL1Evidence(unittest.TestCase):
     """The five backend conditions, each able to fail on its own."""
 

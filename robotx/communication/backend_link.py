@@ -78,6 +78,7 @@ import socketio  # type: ignore
 from robotx.communication.commands import CommandExecutor, CommandTarget
 from robotx.communication.commitment_store import CommitmentStore
 from robotx.communication.engine import (
+    CUSTODY_KINDS,
     OFFER,
     TERMINATING_COMMANDS,
     Envelope,
@@ -92,6 +93,7 @@ from robotx.communication.engine import (
     check_fence,
     check_sequence,
     parse_envelope,
+    parse_iso,
     parse_offer,
     verify_signature,
 )
@@ -142,6 +144,10 @@ _EVENT_DEDUPE_S = 30.0
 _EVENT_MIN_INTERVAL_S = 1.0
 # Engine envelopes held for a sequence gap, across all commitments.
 _MAX_HELD_ENVELOPES = 16
+# Y2 -- the least spacing between two emissions of the same report event. The
+# backend drops, silently, a second CUSTODY_EVENT / OFFER_* from one socket
+# within 50 ms (rateLimit.allow minIntervalMs); this keeps a margin above it.
+_SAME_EVENT_GAP_S = 0.06
 
 
 class BackendLossPolicy(str, Enum):
@@ -417,12 +423,15 @@ class BackendLink:
             "offers_rejected": 0,
             "offers_deferred": 0,
             "custody_events_sent": 0,
+            "custody_events_resent": 0,
+            "offer_responses_resent": 0,
             "tasks_received": 0,
             "tasks_rejected": 0,
             "tasks_recovery_resends": 0,
             "task_completes_sent": 0,
             "task_completes_withheld": 0,
             "task_completes_acked": 0,
+            "task_completes_resent": 0,
             "task_completes_verifying": 0,
             "stop_events_ignored": 0,
             "stop_events_received": 0,
@@ -1005,6 +1014,8 @@ class BackendLink:
         self._last_heartbeat_t = time.monotonic()
         await self._publish_telemetry()
         self._last_telemetry_t = time.monotonic()
+        # Y2 -- this session is authenticated: resend what an earlier one lost.
+        await self._resend_unacknowledged_reports()
 
         while self._running and self.connected:
             now = time.monotonic()
@@ -1409,7 +1420,16 @@ class BackendLink:
             decision = OfferDecision.reject(decision.reason or "DEFER_UNAVAILABLE")
             payload = build_offer_response(offer, decision)
 
-        persisted = self.commitments.update(offer.commitment_id, response=decision.verdict.value)
+        # Y2 -- the exact payload and the offer's expiry go down with the verdict,
+        # so a response lost with its socket is resent unchanged after the next
+        # AUTH while the offer can still be answered. The backend makes the
+        # offer's expiry and the envelope's notValidAfter the same instant.
+        persisted = self.commitments.update(
+            offer.commitment_id,
+            response=decision.verdict.value,
+            response_payload=dict(payload),
+            offer_expiry=offer.offer_expiry if offer.offer_expiry is not None else offer.envelope.not_valid_after,
+        )
         if persisted is None:
             # Could not record the answer, so it must not be given: a restart
             # would not know it had been, and could answer twice.
@@ -1470,10 +1490,31 @@ class BackendLink:
             self.stats["probes_answered"] = self.stats.get("probes_answered", 0) + 1
 
     async def _on_task_complete_ack(self, data: Any) -> None:
-        """The backend's verdict on a TASK_COMPLETE. Never retried either way."""
+        """The backend's verdict on a TASK_COMPLETE. Never retried either way.
+
+        Y2 -- any TASK_COMPLETE_ACK for a claim's taskId settles that claim, a
+        `verifying` one included (the contract: do not repeat the claim). It
+        is the one report this protocol acknowledges; a settled claim is never
+        resent. A repeated ACK finds nothing left to settle.
+        """
 
         self._note_recv()
         reply = data if isinstance(data, dict) else {}
+        task_id = reply.get("taskId")
+        if isinstance(task_id, str) and task_id:
+            # Y2 -- which answer it was, kept with the claim: only a settled one ends
+            # the custody resends (`CommitmentRecord.custody_settled`).
+            if reply.get("alreadyCompleted"):
+                result = "ALREADY_COMPLETED"
+            elif reply.get("verifying"):
+                result = "VERIFYING"
+            else:
+                result = "SETTLED"
+            reason = reply.get("reason") if isinstance(reply.get("reason"), str) else None
+            for record in self.commitments.all():
+                if record.completion_unacknowledged and record.completion_claim.get("taskId") == task_id:
+                    self.commitments.update(record.commitment_id, completion_acked=True,
+                                            completion_ack_result=result, completion_ack_reason=reason)
         if reply.get("verifying"):
             self.stats["task_completes_verifying"] += 1
             log_event(logger, "task.complete_verifying",
@@ -1517,6 +1558,7 @@ class BackendLink:
         if held is None:
             return
         record, mission = held
+        paced: Dict[str, float] = {}
         for kind, at in (("ACQUIRED", mission.custody_acquired_at),
                          ("RELEASED", mission.custody_released_at)):
             if at is None or kind in record.custody_sent:
@@ -1524,12 +1566,27 @@ class BackendLink:
             payload = build_custody_event(
                 commitment_id=record.commitment_id, fence=record.fence_wire, kind=kind
             )
+            # Y2 -- persisted before it is emitted, the exact payload with it: a
+            # report lost with its socket (or a restart) is resent unchanged after
+            # the next AUTH. One that cannot be recorded is not made yet, and
+            # RELEASED never goes ahead of an ACQUIRED that has not.
+            persisted = self.commitments.update(
+                record.commitment_id,
+                custody_sent=record.custody_sent + [kind],
+                custody_payloads={**record.custody_payloads, kind: payload},
+            )
+            if persisted is None:
+                log_event(logger, "custody.not_persisted", "custody report could not be persisted; not reporting yet",
+                          level=logging.WARNING, commitment_id=record.commitment_id, kind=kind)
+                return
+            record = persisted
+            await self._pace(paced, self.cfg.binding.custody_event)
             if await self._emit(self.cfg.binding.custody_event, payload):
                 self.stats["custody_events_sent"] += 1
-                record = self.commitments.update(
-                    record.commitment_id, custody_sent=record.custody_sent + [kind]
-                ) or record
                 log_event(logger, "custody.reported", commitment_id=record.commitment_id, kind=kind)
+            else:
+                log_event(logger, "custody.pending", "custody report not sent; it is resent after the next authentication",
+                          level=logging.WARNING, commitment_id=record.commitment_id, kind=kind)
 
     async def _publish_task_complete(self) -> None:
         """TASK_COMPLETE, once, and only on evidence the backend would accept.
@@ -1582,10 +1639,133 @@ class BackendLink:
 
         last = track[-1]
         payload = build_task_complete_payload(task_id=record.task_id, lat=last.lat, lon=last.lon)
+        # Y2 -- the claim is persisted before it is emitted, so a socket that
+        # dies with it in flight (or a restart) cannot lose it: it stays
+        # unacknowledged and is resent, unchanged, after the next AUTH. A claim
+        # that cannot be recorded is not made (the OFFER response rule).
+        if self.commitments.update(cid, completion="SENT", completion_claim=payload) is None:
+            log_event(logger, "task.complete_not_persisted",
+                      "completion claim could not be persisted; not claiming yet",
+                      level=logging.WARNING, task_id=record.task_id, commitment_id=cid)
+            return
         if await self._emit(self.cfg.binding.task_complete, payload):
             self.stats["task_completes_sent"] += 1
-            self.commitments.update(cid, completion="SENT")
             log_event(logger, "task.complete_reported", task_id=record.task_id, commitment_id=cid)
+        else:
+            log_event(logger, "task.complete_pending",
+                      "completion claim not sent; it is resent after the next authentication",
+                      level=logging.WARNING, task_id=record.task_id, commitment_id=cid)
+
+    @staticmethod
+    async def _pace(paced: Dict[str, float], event: str) -> None:
+        """Wait until `event` may be emitted again: at least `_SAME_EVENT_GAP_S`
+        after the previous emission of the same event in this pass."""
+
+        last = paced.get(event)
+        if last is not None:
+            wait = _SAME_EVENT_GAP_S - (time.monotonic() - last)
+            if wait > 0:
+                await asyncio.sleep(wait)
+        paced[event] = time.monotonic()
+
+    async def _resend_unacknowledged_reports(self) -> None:
+        """Y2 -- after each successful AUTH, resend what an earlier session lost.
+
+        In report order: OFFER responses, then custody (ACQUIRED before
+        RELEASED), then completion claims. Each is the persisted payload, sent
+        unchanged, once per authenticated session -- the reconnect backoff is
+        the retry policy. The backend acknowledges only TASK_COMPLETE; a repeated
+        OFFER_* or CUSTODY_EVENT it already applied is ignored (its commitment
+        is released, its fence superseded, or the Leg has left the one state
+        that event answers), so a resend changes nothing it should not.
+        """
+
+        await self._resend_offer_responses()
+        await self._resend_custody_events()
+        await self._resend_unacknowledged_completions()
+
+    def _offer_response_resendable(self, record: Any, now: float) -> bool:
+        """Whether a persisted OFFER_* response can still answer its offer.
+
+        Never after the offer's expiry (the backend refuses it), never for a
+        withdrawn or recalled commitment, never a DEFER whose own `until` has
+        passed (the backend refuses that too), and an ACCEPT only while this
+        Rover is still carrying that mission out -- an acceptance it no longer
+        honours must not be re-asserted.
+        """
+
+        if record.tombstoned or not isinstance(record.response_payload, dict):
+            return False
+        if record.offer_expiry is None or now >= record.offer_expiry:
+            return False
+        if record.response == OfferVerdict.ACCEPT.value:
+            held = self._held_mission()
+            return held is not None and held[0].commitment_id == record.commitment_id and held[1].status.is_active
+        if record.response == OfferVerdict.DEFER.value:
+            until = record.response_payload.get("until")
+            if isinstance(until, bool):
+                return False
+            if isinstance(until, (int, float)):
+                return until / 1000.0 > now
+            at = parse_iso(until)
+            return at is not None and at > now
+        return record.response == OfferVerdict.REJECT.value
+
+    async def _resend_offer_responses(self) -> None:
+        events = {
+            OfferVerdict.ACCEPT.value: self.cfg.binding.offer_accept,
+            OfferVerdict.REJECT.value: self.cfg.binding.offer_reject,
+            OfferVerdict.DEFER.value: self.cfg.binding.offer_defer,
+        }
+        now = time.time()
+        paced: Dict[str, float] = {}
+        for record in sorted(self.commitments.all(), key=lambda r: r.updated_at):
+            if not self._offer_response_resendable(record, now):
+                continue
+            event = events[record.response]
+            await self._pace(paced, event)
+            if await self._emit(event, dict(record.response_payload)):
+                self.stats["offer_responses_resent"] += 1
+                log_event(logger, "offer.response_resent", commitment_id=record.commitment_id,
+                          verdict=record.response)
+
+    async def _resend_custody_events(self) -> None:
+        """Every persisted custody report of a commitment still in play, ACQUIRED
+        before RELEASED, spaced. Stops for a commitment once it is withdrawn or
+        recalled (tombstoned) or its completion was acknowledged as settled; a
+        `verifying` answer (e.g. CUSTODY_STILL_HELD) may mean RELEASED was lost,
+        so it is kept going."""
+
+        paced: Dict[str, float] = {}
+        for record in sorted(self.commitments.all(), key=lambda r: r.updated_at):
+            if record.tombstoned or record.response != OfferVerdict.ACCEPT.value or record.custody_settled:
+                continue
+            for kind in CUSTODY_KINDS:
+                payload = record.custody_payloads.get(kind)
+                if not isinstance(payload, dict):
+                    continue
+                await self._pace(paced, self.cfg.binding.custody_event)
+                if await self._emit(self.cfg.binding.custody_event, dict(payload)):
+                    self.stats["custody_events_resent"] += 1
+                    log_event(logger, "custody.resent", commitment_id=record.commitment_id, kind=kind)
+
+    async def _resend_unacknowledged_completions(self) -> None:
+        """Y2 -- resend every completion claim the backend has not acknowledged.
+
+        Called once per authenticated session, from the start of the publish
+        loop: never before AUTH_SUCCESS, never on a timer -- the reconnect
+        backoff is the retry policy. The payload is the persisted claim itself,
+        so a retry is the same report, and the backend answers a repeat it has
+        already processed with `alreadyCompleted` (dtaro.handler).
+        """
+
+        pending = sorted((r for r in self.commitments.all() if r.completion_unacknowledged),
+                         key=lambda r: r.updated_at)
+        for record in pending:
+            if await self._emit(self.cfg.binding.task_complete, dict(record.completion_claim)):
+                self.stats["task_completes_resent"] += 1
+                log_event(logger, "task.complete_resent", task_id=record.task_id,
+                          commitment_id=record.commitment_id)
 
     # --- link-loss policy -----------------------------------------------------
 
