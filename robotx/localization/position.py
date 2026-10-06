@@ -172,6 +172,22 @@ class PositionEstimator:
         self._last_heading_source = HeadingSource.NONE
         self._heading_anchor = None
 
+    def invalidate_heading(self) -> None:
+        """Forget the heading: the robot has rotated in a way GPS cannot see.
+
+        A GPS heading describes the direction the robot last *moved*. Turning in
+        place changes the direction it faces without moving it, so the held
+        heading is no longer true -- yet nothing in the fixes would ever say so.
+        Until movement derives a new one, the honest heading is None (source
+        NONE). The movement anchor goes too, so the next heading comes only from
+        movement after the rotation. Merely standing still does not call this:
+        a robot that has not turned still faces where it last moved.
+        """
+
+        self._last_heading = None
+        self._last_heading_source = HeadingSource.NONE
+        self._heading_anchor = None
+
     def update(self, reading: GpsReading) -> Optional[Position]:
         """Return the current position, or None when there is no usable fix."""
 

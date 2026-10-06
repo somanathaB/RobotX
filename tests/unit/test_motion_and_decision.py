@@ -290,12 +290,39 @@ class TestDecisionMaker(unittest.TestCase):
         left_turn = self.decide(navigation=navigating(heading_error=-30.0))
         self.assertLess(left_turn.left, left_turn.right)
 
-    def test_large_heading_error_rotates_in_place(self):
-        intent = self.decide(navigation=navigating(heading_error=150.0))
-        self.assertIs(intent.command, MotionCommand.TURN_RIGHT)
+    def test_large_heading_error_steers_forward_never_pivots(self):
+        # Gate 3b defect 2: a GPS course cannot change while the robot rotates in
+        # place, so route following never pivots. A large error is steered by the
+        # same forward law as a moderate one, saturated: both sides >= 0 (no
+        # reverse), the side to turn towards slowed.
+        cfg = self.decider.cfg
+        for error in (90.0, 120.0, 150.0, 180.0):
+            with self.subTest(error=error):
+                right_turn = self.decide(navigation=navigating(heading_error=error))
+                self.assertIs(right_turn.command, MotionCommand.FORWARD)
+                self.assertEqual((right_turn.left, right_turn.right), (cfg.cruise_speed, 0.0))
 
-        intent = self.decide(navigation=navigating(heading_error=-150.0))
-        self.assertIs(intent.command, MotionCommand.TURN_LEFT)
+                left_turn = self.decide(navigation=navigating(heading_error=-error))
+                self.assertIs(left_turn.command, MotionCommand.FORWARD)
+                self.assertEqual((left_turn.left, left_turn.right), (0.0, cfg.cruise_speed))
+
+    def test_the_steering_law_is_continuous_across_90_degrees(self):
+        just_below = self.decide(navigation=navigating(heading_error=89.0))
+        at = self.decide(navigation=navigating(heading_error=90.0))
+        self.assertEqual((just_below.command, just_below.left, just_below.right),
+                         (at.command, at.left, at.right))
+
+    def test_obstacle_avoidance_still_pivots(self):
+        # Defect 2's fix is route following only: avoidance turns are unchanged,
+        # opposed sides (which is what invalidates the GPS heading afterwards).
+        left, right = center_zone(FRAME_W, 0.33)
+        for cx, command in ((left + 5, MotionCommand.TURN_RIGHT), (right - 5, MotionCommand.TURN_LEFT)):
+            with self.subTest(cx=cx):
+                # Even with a large heading error pending, the obstacle decides first.
+                intent = self.decide(navigation=navigating(heading_error=150.0),
+                                     perception=perception([detection(area=5000, cx=cx)]))
+                self.assertIs(intent.command, command)
+                self.assertLess(intent.left * intent.right, 0)
 
     def test_missing_heading_creeps_instead_of_cruising(self):
         state = NavigationState(

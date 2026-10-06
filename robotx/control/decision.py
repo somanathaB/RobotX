@@ -206,16 +206,12 @@ class DecisionMaker:
                 speed, reason="on course" + (" (cautious)" if cautious else "")
             )
 
-        # Large heading error: rotate in place rather than driving a wide arc.
-        if abs(error) >= 90.0:
-            if error > 0:
-                return MotionIntent.turn_right(
-                    self.cfg.turn_speed, f"turning to course (error={error:.0f}deg)"
-                )
-            return MotionIntent.turn_left(
-                self.cfg.turn_speed, f"turning to course (error={error:.0f}deg)"
-            )
-
+        # Every heading error, however large, is steered while moving forward --
+        # never by rotating in place. The only heading this robot has is GPS
+        # course over ground, which changes only while it translates: a pivot is
+        # invisible to it, so the error would never shrink and the pivot would
+        # never end. Past `steering_full_scale_deg` the steer saturates and the
+        # robot turns as tightly as forward motion allows.
         steer = max(-1.0, min(1.0, error / max(1.0, self.cfg.steering_full_scale_deg)))
         return MotionIntent.forward(
             speed,

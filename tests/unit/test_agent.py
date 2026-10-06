@@ -11,6 +11,7 @@ import unittest
 
 from robotx.application.agent import RobotAgent
 from robotx.config.settings import Settings
+from robotx.control.decision import center_zone
 from robotx.control.motion import MotionCommand
 from robotx.diagnostics.health import HealthStatus
 from robotx.hardware.gps import GpsFix, GpsReading, GPSStatus
@@ -431,6 +432,56 @@ class TestMidRunDegradation(AgentTestCase):
             snapshot.health.components["perception"].status, HealthStatus.FAILED
         )
         self.assertIs(snapshot.health.status, HealthStatus.FAILED)
+
+
+
+class TestGpsHeadingAfterRotation(AgentTestCase):
+    """Gate 3b defect 2, at the agent: a heading the robot has turned away from
+    in place is dropped, a heading it merely stopped on is kept, and each run
+    starts with none."""
+
+    NORTH_2M = (HERE[0] + 2.0 / 111_320.0, HERE[1])  # ~2 m north: enough to derive a GPS track
+
+    def driving_north(self):
+        agent = self.make_agent()
+        agent.perception.set_clear()
+        agent.gps.set_fix(*HERE)
+        agent.start_mission([NORTH])
+        agent.tick()
+        agent.gps.set_fix(*self.NORTH_2M)  # moved: GPS_TRACK heading north
+        agent.tick()
+        self.assertIsNotNone(agent.state.snapshot().position.heading_deg)
+        return agent
+
+    def test_an_executed_pivot_invalidates_the_heading(self):
+        agent = self.driving_north()
+        left, _ = center_zone(640, agent.decision.cfg.center_zone_ratio)
+        agent.perception.set_detection(area=5000, cx=left + 5)   # avoidance: pivot right
+        pivot = agent.tick().motion_intent
+        self.assertLess(pivot.left * pivot.right, 0, "the gated intent is a pivot")
+        agent.perception.set_clear()
+        snapshot = agent.tick()                                  # same place: nothing moved
+        self.assertIsNone(snapshot.position.heading_deg)
+        self.assertIsNone(snapshot.navigation.heading_error_deg)
+        self.assertEqual(snapshot.motion_intent.reason, "no heading: creeping to establish GPS track")
+
+    def test_merely_stopping_keeps_the_heading(self):
+        agent = self.driving_north()
+        agent.perception.set_detection(area=40000, cx=320)      # obstacle ahead: STOP
+        stopped = agent.tick().motion_intent
+        self.assertTrue(stopped.is_stop)
+        agent.perception.set_clear()
+        snapshot = agent.tick()
+        self.assertAlmostEqual(snapshot.position.heading_deg, 0.0, delta=1.0)
+        self.assertIsNotNone(snapshot.navigation.heading_error_deg)
+
+    def test_a_new_run_does_not_inherit_the_previous_runs_heading(self):
+        agent = self.driving_north()
+        agent.stop_mission("done")
+        agent.start_mission([NORTH])                             # _begin_run
+        snapshot = agent.tick()                                  # stationary
+        self.assertIsNone(snapshot.position.heading_deg)
+        self.assertEqual(snapshot.motion_intent.reason, "no heading: creeping to establish GPS track")
 
 
 if __name__ == "__main__":

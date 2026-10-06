@@ -7,19 +7,46 @@ optional Directions client -- and this module does not care which.
 
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import dataclass
-from typing import List, Optional, Sequence
+from typing import List, Optional, Sequence, Tuple
 
-from robotx.localization.position import LatLon, haversine_m
+from robotx.localization.position import EARTH_RADIUS_M, LatLon, haversine_m
 
 
-__all__ = ["LatLon", "PlannerConfig", "RoutePlanner", "haversine_m"]
+__all__ = ["LatLon", "PlannerConfig", "RoutePlanner", "haversine_m", "segment_distance_m"]
+
+
+def segment_distance_m(point: LatLon, start: LatLon, end: LatLon) -> float:
+    """Distance from `point` to the segment `start`-`end`, in metres.
+
+    The perpendicular (cross-track) distance where the point lies alongside the
+    segment, and the distance to the nearer end beyond it -- so a robot that
+    overshoots the segment's end, or has not reached its start, is measured to
+    that end. Computed in a flat local projection centred on `start`
+    (equirectangular), which at campus scale differs from the great-circle
+    figure by far less than a GPS fix's own uncertainty.
+    """
+
+    scale = math.radians(1.0) * EARTH_RADIUS_M  # metres per degree of latitude
+    cos_lat = math.cos(math.radians(start[0]))
+
+    def local(p: LatLon) -> Tuple[float, float]:
+        return ((p[1] - start[1]) * scale * cos_lat, (p[0] - start[0]) * scale)
+
+    bx, by = local(end)
+    px, py = local(point)
+    length_sq = bx * bx + by * by
+    t = 0.0 if length_sq == 0.0 else max(0.0, min(1.0, (px * bx + py * by) / length_sq))
+    return math.hypot(px - t * bx, py - t * by)
 
 
 @dataclass(frozen=True)
 class PlannerConfig:
     waypoint_arrival_m: float = 8.0
+    # Half-width of the corridor around the route: how far the robot may be from
+    # the segment it is driving before that counts as evidence of being off route.
     off_route_m: float = 25.0
     reroute_after_n: int = 8
     blocked_reroute_after_n: int = 3
@@ -33,6 +60,9 @@ class RoutePlanner:
         self._route: List[LatLon] = []
         self._idx = 0
         self._last_pos: Optional[LatLon] = None
+        # Where the robot was when this route was given to it: the start of the
+        # segment leading to waypoint 0, which has no previous waypoint.
+        self._route_start: Optional[LatLon] = None
 
         self._offroute_count = 0
         self._blocked_count = 0
@@ -41,6 +71,7 @@ class RoutePlanner:
     def set_route(self, route: Sequence[LatLon]) -> None:
         self._route = [(float(lat), float(lon)) for lat, lon in route]
         self._idx = 0
+        self._route_start = None
         self._offroute_count = 0
         self._blocked_count = 0
 
@@ -63,6 +94,19 @@ class RoutePlanner:
             return None
         return self._route[-1]
 
+    def active_segment(self) -> Optional[Tuple[LatLon, LatLon]]:
+        """The stretch of route being driven: previous waypoint -> next waypoint.
+
+        For waypoint 0 the start is the robot's first position after the route
+        was set. None until there is both a route and that position.
+        """
+
+        end = self.next_waypoint()
+        if end is None:
+            return None
+        start = self._route[self._idx - 1] if self._idx > 0 else self._route_start
+        return None if start is None else (start, end)
+
     def report_blocked(self) -> None:
         self._blocked_count += 1
 
@@ -72,6 +116,8 @@ class RoutePlanner:
 
         if not self._route:
             return
+        if self._route_start is None:
+            self._route_start = pos
 
         waypoint = self.next_waypoint()
         if waypoint is None:
@@ -82,13 +128,15 @@ class RoutePlanner:
             self._idx = min(self._idx + 1, len(self._route) - 1)
             self._offroute_count = 0
 
-        # Off-route heuristic: consistently far from the waypoint we are
-        # heading for. One bad fix should not trigger a reroute, so this
+        # Off-route: consistently outside the corridor around the segment being
+        # driven. Measured to the segment, not to the next waypoint -- on a leg
+        # longer than the corridor the robot is far from its next waypoint while
+        # exactly on the route. One bad fix should not trigger a reroute, so this
         # accumulates and decays.
-        next_waypoint = self.next_waypoint()
-        if next_waypoint is None:
+        segment = self.active_segment()
+        if segment is None:
             return
-        if haversine_m(pos, next_waypoint) > self.cfg.off_route_m:
+        if segment_distance_m(pos, *segment) > self.cfg.off_route_m:
             self._offroute_count += 1
         else:
             self._offroute_count = max(0, self._offroute_count - 1)

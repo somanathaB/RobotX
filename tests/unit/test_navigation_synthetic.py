@@ -183,12 +183,17 @@ class TestNavigationOnSyntheticTrack(unittest.TestCase):
         self.assertEqual(distances, sorted(distances, reverse=True))
         self.assertLess(distances[-1], 8.0)
 
-    def test_facing_the_wrong_way_produces_a_turn(self):
+    def test_facing_the_wrong_way_turns_while_moving_forward(self):
         self.navigator.set_route([END])
         # Target is due north; the robot is tracking due south.
         _, nav, intent = self.advance(START, track=180.0)
         self.assertAlmostEqual(abs(nav.heading_error_deg), 180.0, places=0)
-        self.assertIn(intent.command, (MotionCommand.TURN_LEFT, MotionCommand.TURN_RIGHT))
+        # Not a pivot (Gate 3b defect 2): GPS course only changes while the robot
+        # translates, so it turns by steering forward -- one side slowed, neither
+        # reversed -- and the course it then reports closes the loop.
+        self.assertIs(intent.command, MotionCommand.FORWARD)
+        self.assertNotEqual(intent.left, intent.right, "should be turning")
+        self.assertGreaterEqual(min(intent.left, intent.right), 0.0, "no reverse")
 
     def test_slight_drift_steers_without_stopping(self):
         self.navigator.set_route([END])

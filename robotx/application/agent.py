@@ -565,6 +565,10 @@ class RobotAgent:
         # somewhere it is not.
         if self.dead_reckoner is not None:
             self.dead_reckoner.reset()
+        # Likewise the GPS heading: it says where the robot last moved, and since
+        # then it may have been turned or carried. A run starts with no heading
+        # and establishes one by moving.
+        self.position_estimator.reset()
 
     def stop_mission(self, reason: str = "operator stop") -> None:
         """Halt: clear the route, drop to STOPPED, and publish a stop intent."""
@@ -864,6 +868,12 @@ class RobotAgent:
         # into a place the rover has never been.
         if self.dead_reckoner is not None:
             self.dead_reckoner.integrate(linear=intent.linear, angular=intent.angular)
+
+        # The same gated intent tells the GPS heading when it has gone stale: one
+        # side driven forward and the other backward rotates the rover in place,
+        # which no GPS fix can observe. Standing still does not.
+        if intent.left * intent.right < 0:
+            self.position_estimator.invalidate_heading()
 
         # A blocked leg feeds back into rerouting. Read off the gated intent so
         # a safety veto for a measured obstacle drives rerouting exactly as the

@@ -325,6 +325,42 @@ class TestPositionEstimator(unittest.TestCase):
         position = self.estimator.update(fix_reading(51.5001000, -0.1))
         self.assertIsNone(position.heading_deg)
 
+    # --- Gate 3b defect 2: a heading made stale by rotating in place ---------
+
+    def test_invalidate_heading_drops_the_held_heading_and_its_source(self):
+        self.estimator.update(fix_reading(51.5000000, -0.1))
+        moving = self.estimator.update(fix_reading(51.5000500, -0.1))
+        self.assertIs(moving.heading_source, HeadingSource.GPS_TRACK)
+        self.estimator.invalidate_heading()
+        still = self.estimator.update(fix_reading(51.5000500, -0.1))  # rotated in place: no movement
+        self.assertIsNone(still.heading_deg)
+        self.assertIs(still.heading_source, HeadingSource.NONE)
+
+    def test_after_invalidation_only_new_movement_derives_a_heading(self):
+        self.estimator.update(fix_reading(51.5000000, -0.1))
+        self.estimator.update(fix_reading(51.5000500, -0.1))         # moved north
+        self.estimator.invalidate_heading()                           # turned in place
+        self.estimator.update(fix_reading(51.5000500, -0.1))         # anchor: here, after the turn
+        east = self.estimator.update(fix_reading(51.5000500, -0.0999700))  # ~2 m east
+        self.assertIs(east.heading_source, HeadingSource.GPS_TRACK)
+        self.assertAlmostEqual(east.heading_deg, 90.0, delta=1.0)  # east, not a blend with the old north
+
+    def test_a_moving_receiver_course_is_trusted_again_at_once(self):
+        self.estimator.update(fix_reading(51.5, -0.1, speed=1.0, track=0.0))
+        self.estimator.invalidate_heading()
+        fresh = self.estimator.update(fix_reading(51.5, -0.1, speed=1.0, track=270.0))
+        self.assertEqual((fresh.heading_deg, fresh.heading_source), (270.0, HeadingSource.NMEA_TRACK))
+
+    def test_merely_stopping_still_holds_the_heading(self):
+        # Unchanged behaviour: no rotation, no invalidation -- a stopped robot
+        # still faces where it last moved.
+        self.estimator.update(fix_reading(51.5000000, -0.1))
+        self.estimator.update(fix_reading(51.5000500, -0.1))
+        for _ in range(20):
+            held = self.estimator.update(fix_reading(51.5000500, -0.1))
+        self.assertAlmostEqual(held.heading_deg, 0.0, delta=1.0)
+        self.assertIs(held.heading_source, HeadingSource.GPS_TRACK)
+
 
 if __name__ == "__main__":
     unittest.main()
