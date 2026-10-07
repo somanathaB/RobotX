@@ -271,14 +271,18 @@ class CommandError(ValueError):
 
 
 # The only commands the Pi sends, with their fields in PROTOCOL.md section 6
-# order and inclusive ranges. MOVE, MOTORTEST, RESET and the diagnostics are
-# deliberately absent: RobotX expresses motion as left/right (DRIVE), MOTORTEST
-# bypasses the ESP32 safety gate, and RESET clears safety latches -- an
-# operator decision, not something the link does on its own.
+# order and inclusive ranges. MOVE, MOTORTEST and the diagnostics are
+# deliberately absent: RobotX expresses motion as left/right (DRIVE), and
+# MOTORTEST bypasses the ESP32 safety gate. RESET clears the ESP32's
+# safety-stop and command-timeout latches (and stops the motors; it is not a
+# reboot). That is an operator decision, never something the link does on its
+# own: it is only ever sent once, on an explicit operator request
+# (`Esp32Link.request_reset`).
 ALLOWED_COMMANDS: Mapping[str, Tuple[Tuple[str, int, int], ...]] = MappingProxyType({
     "PING": (),
     "STOP": (),
     "DRIVE": (("left", -255, 255), ("right", -255, 255)),
+    "RESET": (),
 })
 
 

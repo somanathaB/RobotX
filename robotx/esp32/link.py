@@ -14,6 +14,9 @@ What the link will transmit, and when
   Pi -> ESP32 direction before the link calls itself UP. Retried while
   unanswered, but only while telemetry is fresh: a PING queued into an ESP32
   blocked in its boot I2C scan would only pile up in its RX buffer.
+- RESET, only on an explicit operator request (`request_reset`), once, and
+  only while the link is UP, bidirectional and fresh with no reboot latched.
+  Never retried, never queued for later, never replayed after a reconnect.
 - STOP or DRIVE, and only when `motion_enabled`, only from a `SafetyDecision`
   (the safety gate's output, never a raw intent), only while the link is UP,
   and only if the command is still fresh when the I/O thread gets to it. The
@@ -228,6 +231,12 @@ class Esp32Link:
 
         self._motion_slot: Optional[Tuple[str, Dict[str, int], float]] = None
         self._motion_sent = False
+        # The operator RESET (`request_reset`): one at a time, written once,
+        # never retried and never replayed. REQUESTED until the I/O thread
+        # writes it, SENT until its ACK, then the outcome.
+        self._reset_status = "NONE"
+        self._reset_detail = ""
+        self._reset_seq: Optional[int] = None
         self._counters: Dict[str, int] = dict(LinkCounters().__dict__)
         self._last_logged_error: Tuple[Optional[str], float] = (None, 0.0)
 
@@ -422,6 +431,7 @@ class Esp32Link:
         self._seq_synced = False
         self._consecutive_timeouts = 0
         self._telemetry_this_connection = False
+        self._drop_pending_reset("the connection was reset before the RESET was acknowledged")
 
     # --- receive ---------------------------------------------------------------
 
@@ -521,6 +531,8 @@ class Esp32Link:
             return
         self._consecutive_timeouts = 0
         cmd, sent_at = entry
+        if cmd == "RESET" and seq == self._reset_seq:
+            self._finish_reset(data["result"], data["reason"])
         if data["result"] == "REJECTED" and data["reason"] == "STALE_SEQ":
             self._seq.resync(data.get("last_seq"))
         if cmd == "PING" and seq == self._ping_seq:
@@ -545,6 +557,8 @@ class Esp32Link:
                 self._counters["unmatched_responses"] += 1
             else:
                 self._consecutive_timeouts = 0
+                if seq == self._reset_seq:
+                    self._finish_reset("REJECTED", f"ERROR {reason}")
             if seq == self._ping_seq:
                 self._ping_seq = None
         last_reason, last_at = self._last_logged_error
@@ -569,6 +583,7 @@ class Esp32Link:
         self._reboot_reason = reason
         self._pending.clear()
         self._motion_slot = None
+        self._drop_pending_reset("the ESP32 rebooted")
         self._bidirectional = False
         self._ping_seq = None
         self._seq.resync(None)
@@ -586,6 +601,8 @@ class Esp32Link:
                 self._consecutive_timeouts += 1
                 if seq == self._ping_seq:
                     self._ping_seq = None
+                if seq == self._reset_seq:
+                    self._finish_reset("TIMEOUT", f"no ACK within {self.cfg.ack_timeout_s:g} s")
 
     def _telemetry_fresh(self, now: float) -> bool:
         return (
@@ -647,7 +664,14 @@ class Esp32Link:
         self._detail = detail
 
     def _motion_ready(self, now: float, cmd: str = "DRIVE") -> bool:
-        """Whether the link would carry `cmd` right now. Lock held."""
+        """Whether the link would carry `cmd` right now. Lock held.
+
+        DRIVE additionally needs the fresh TELEMETRY to report the drive
+        available and no controller safety fault (`ControllerTelemetry.
+        safety_faults`). Freshness is checked first, so a cached frame can never
+        make the controller look safe. STOP is not held back by a fault: it only
+        ever asks for less motion.
+        """
 
         if not (self.cfg.transmit_enabled and self.cfg.motion_enabled):
             return False
@@ -656,7 +680,11 @@ class Esp32Link:
         if not self._bidirectional or self._reboot_latched or not self._telemetry_fresh(now):
             return False
         if cmd == "DRIVE":
-            return self._telemetry is not None and self._telemetry.motor_drive_available
+            return (
+                self._telemetry is not None
+                and self._telemetry.motor_drive_available
+                and not self._telemetry.safety_faults
+            )
         return True
 
     def status(self) -> Esp32Status:
@@ -680,6 +708,8 @@ class Esp32Link:
                 motion_enabled=self.cfg.motion_enabled,
                 motion_ready=self._motion_ready(now),
                 counters=LinkCounters(**self._counters),
+                reset_status=self._reset_status,
+                reset_detail=self._reset_detail,
             )
             diag = ControllerDiag(
                 sections={k: dict(v) for k, v in self._diag.items()},
@@ -725,6 +755,61 @@ class Esp32Link:
         return True
 
     # --- transmit ------------------------------------------------------------------
+
+    def request_reset(self) -> Optional[str]:
+        """Operator request: send ONE RESET to the ESP32. Never blocks.
+
+        RESET clears the ESP32's safety-stop and command-timeout latches and
+        stops its motors; it is not a reboot. Returns None when the I/O thread
+        will write it on its next pass, otherwise why it was refused -- and then
+        nothing is queued, retried, or sent later. Refused unless transmit is
+        enabled, the link is UP and bidirectional on fresh TELEMETRY, no reboot
+        is latched, and no RESET is already pending. The outcome is reported as
+        `ControllerState.reset_status`; TELEMETRY, not the ACK, says whether
+        the controller is actually clear.
+        """
+
+        now = self._clock()
+        with self._lock:
+            self._refresh_status(now)
+            if self._reset_status in ("REQUESTED", "SENT"):
+                return "a RESET is already pending"
+            refusal = self._reset_blocker(now)
+            if refusal is None:
+                self._reset_status = "REQUESTED"
+                self._reset_detail = ""
+                self._reset_seq = None
+            return refusal
+
+    def _reset_blocker(self, now: float) -> Optional[str]:
+        """Why a RESET may not be written right now, or None. Lock held."""
+
+        if not self.cfg.transmit_enabled:
+            return "ESP32 transmit is disabled"
+        if not self._port_open or self._stopping:
+            return f"ESP32 link is {self._status.value}"
+        if self._reboot_latched:
+            return "an ESP32 reboot is latched; clear the emergency stop first"
+        if not self._telemetry_fresh(now):
+            return "ESP32 TELEMETRY is not fresh"
+        if self._status is not Esp32LinkStatus.UP or not self._bidirectional:
+            return f"ESP32 link is {self._status.value}, not UP and bidirectional"
+        return None
+
+    def _finish_reset(self, result: str, detail: str) -> None:
+        """Record the RESET's outcome. Lock held."""
+
+        self._reset_status = result
+        self._reset_detail = detail
+        self._reset_seq = None
+        log_event(logger, "esp32.reset_result", detail, result=result,
+                  level=logging.INFO if result == "ACCEPTED" else logging.WARNING)
+
+    def _drop_pending_reset(self, why: str) -> None:
+        """A RESET not yet acknowledged is abandoned, never carried over. Lock held."""
+
+        if self._reset_status in ("REQUESTED", "SENT"):
+            self._finish_reset("DROPPED", why)
 
     def submit(self, decision: SafetyDecision) -> None:
         """Offer the safety gate's decision for transmission. Never blocks.
@@ -791,6 +876,21 @@ class Esp32Link:
                     frames.append((cmd, encode_command(seq, cmd, **fields)))
                     self._pending[seq] = (cmd, now)
                     self._motion_sent = True
+
+            # An operator RESET goes out once, if the link still allows it at
+            # the moment of writing; otherwise it is dropped, never deferred.
+            if self._reset_status == "REQUESTED":
+                blocker = self._reset_blocker(now)
+                if blocker is None and len(self._pending) >= self.cfg.max_pending:
+                    blocker = "too many commands awaiting an ACK"
+                if blocker is None:
+                    seq = self._seq.next()
+                    frames.append(("RESET", encode_command(seq, "RESET")))
+                    self._pending[seq] = ("RESET", now)
+                    self._reset_seq = seq
+                    self._reset_status = "SENT"
+                else:
+                    self._finish_reset("DROPPED", f"not sent: {blocker}")
 
         for label, data in frames:
             port.write(data)

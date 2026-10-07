@@ -14,8 +14,8 @@ from robotx.application.agent import RobotAgent
 from robotx.config.settings import Settings
 from robotx.control.motion import MotionIntent
 from robotx.diagnostics.health import HealthStatus
-from robotx.perception.types import PerceptionResult, PerceptionStatus
-from robotx.state.robot_state import Esp32LinkStatus, OperatingMode
+from robotx.perception.types import FrameMetadata, PerceptionResult, PerceptionStatus
+from robotx.state.robot_state import Esp32LinkStatus, MissionRefused, OperatingMode
 from robotx.state.telemetry import build_telemetry
 from tests.fixtures import esp32 as fx
 
@@ -282,6 +282,378 @@ class TestOffers(unittest.TestCase):
                                                    ROBOTX_ROBOT_ID="robotx-pi")
         agent.tick()
         self.assertEqual(agent.assess_offer(self.offer()).reason, "NO_POSITION_FIX")
+
+
+class _ClearScenePerception:
+    """A clear scene with frame metadata, so the decision layer will drive."""
+
+    def latest(self):
+        return PerceptionResult(timestamp=time.time(), status=PerceptionStatus.OK, detections=(),
+                                frame=FrameMetadata(width=640, height=480, source="test", age_s=0.0))
+
+
+# Each fresh controller state the Pi must treat as not safe to drive in.
+CONTROLLER_FAULTS = {
+    "safety_stop": {"safety_stop": True},
+    "front_valid=false": {"front_valid": False},
+    "command_timeout": {"command_timeout": True},
+}
+
+
+class TestControllerSafetyFaults(unittest.TestCase):
+    """A fresh ESP32 safety fault stops autonomous motion and new assignments."""
+
+    def offer(self):
+        from robotx.communication.engine import parse_envelope, parse_offer
+        from tests.fixtures import engine as efx
+
+        return parse_offer(parse_envelope(efx.envelope(), expected_agent_id=efx.ROBOT_ID))
+
+    def driving_agent(self):
+        """An AUTO mission that is genuinely sending DRIVE over a healthy link."""
+
+        agent, link, port, clock = agent_with_link(motion=True, drive_available=True,
+                                                   ROBOTX_DEADRECKON_ENABLED="1")
+        agent.perception = _ClearScenePerception()
+        agent.start_mission([(0.0, 0.0005)])
+        snap = agent.tick()
+        link.poll_once()
+        self.assertIs(snap.mode, OperatingMode.AUTO)
+        self.assertEqual(port.command_names()[-1], "DRIVE")
+        return agent, link, port, clock
+
+    def report(self, link, port, **fields):
+        """One fresh TELEMETRY frame, otherwise healthy, with `fields` applied."""
+
+        port.feed(fx.telemetry(motor_drive_available=True, uptime_ms=3590000, **fields))
+        link.poll_once()
+
+    def assert_fault_pauses_mission_and_stops_drive(self, fault):
+        agent, link, port, clock = self.driving_agent()
+        drives = port.command_names().count("DRIVE")
+        self.report(link, port, **CONTROLLER_FAULTS[fault])
+        self.assertFalse(link.status().motion_ready)
+
+        for _ in range(3):
+            snap = agent.tick()
+            link.poll_once()
+            self.assertIs(snap.mode, OperatingMode.PAUSED)
+            self.assertTrue(snap.motion_intent.is_stop)
+        self.assertEqual(port.command_names().count("DRIVE"), drives, "DRIVE after the fault")
+        # STOP is not held back by the fault.
+        self.assertEqual(port.command_names()[-1], "STOP")
+
+    def assert_fault_makes_robot_ineligible(self, fault):
+        agent, link, port, clock = agent_with_link(motion=True, drive_available=True,
+                                                   ROBOTX_ROBOT_ID="robotx-pi")
+        self.report(link, port, **CONTROLLER_FAULTS[fault])
+        agent.tick()
+        self.assertIs(agent.state.snapshot().communication.esp32, Esp32LinkStatus.UP)
+        self.assertEqual(agent.assess_offer(self.offer()).reason, "NO_MOTOR_LINK")
+
+    def test_safety_stop_pauses_active_mission(self):
+        self.assert_fault_pauses_mission_and_stops_drive("safety_stop")
+
+    def test_front_invalid_pauses_active_mission(self):
+        self.assert_fault_pauses_mission_and_stops_drive("front_valid=false")
+
+    def test_command_timeout_pauses_active_mission(self):
+        self.assert_fault_pauses_mission_and_stops_drive("command_timeout")
+
+    def test_safety_stop_blocks_offer_admission(self):
+        self.assert_fault_makes_robot_ineligible("safety_stop")
+
+    def test_front_invalid_blocks_offer_admission(self):
+        self.assert_fault_makes_robot_ineligible("front_valid=false")
+
+    def test_command_timeout_blocks_offer_admission(self):
+        self.assert_fault_makes_robot_ineligible("command_timeout")
+
+    def test_healthy_controller_keeps_driving_and_stays_eligible(self):
+        agent, link, port, clock = self.driving_agent()
+        self.report(link, port, safety_stop=False, front_valid=True, command_timeout=False)
+        self.assertTrue(link.status().motion_ready)
+        drives = port.command_names().count("DRIVE")
+        for _ in range(3):
+            snap = agent.tick()
+            link.poll_once()
+            self.assertIs(snap.mode, OperatingMode.AUTO)
+        self.assertEqual(port.command_names().count("DRIVE"), drives + 3)
+
+        idle, idle_link, idle_port, _ = agent_with_link(motion=True, drive_available=True,
+                                                        ROBOTX_ROBOT_ID="robotx-pi")
+        self.report(idle_link, idle_port, safety_stop=False, front_valid=True, command_timeout=False)
+        idle.tick()
+        # Past the motor-link check, stopped only by the next one.
+        self.assertEqual(idle.assess_offer(self.offer()).reason, "NO_POSITION_FIX")
+
+    def test_a_cleared_fault_does_not_resume_a_paused_mission(self):
+        agent, link, port, clock = self.driving_agent()
+        self.report(link, port, command_timeout=True)
+        agent.tick()
+        link.poll_once()
+        self.assertIs(agent.state.snapshot().mode, OperatingMode.PAUSED)
+        drives = port.command_names().count("DRIVE")
+
+        # The firmware clears its watchdog on the Pi's STOP; the link is
+        # motion-ready again, but the mission stays paused until an explicit RESUME.
+        self.report(link, port, command_timeout=False)
+        self.assertTrue(link.status().motion_ready)
+        for _ in range(3):
+            snap = agent.tick()
+            link.poll_once()
+            self.assertIs(snap.mode, OperatingMode.PAUSED)
+        self.assertEqual(port.command_names().count("DRIVE"), drives)
+
+    def test_stale_telemetry_is_not_a_safe_controller(self):
+        agent, link, port, clock = agent_with_link(motion=True, drive_available=True,
+                                                   ROBOTX_ROBOT_ID="robotx-pi")
+        self.report(link, port, safety_stop=False, front_valid=True, command_timeout=False)
+        agent.tick()
+        self.assertEqual(agent.assess_offer(self.offer()).reason, "NO_POSITION_FIX")
+
+        clock.advance(2.0)                     # past stale_after_s, nothing new arrives
+        link.poll_once()
+        status = link.status()
+        cached = status.controller.telemetry
+        self.assertEqual(cached.safety_faults, ())          # the cached frame still looks safe
+        self.assertIs(status.link, Esp32LinkStatus.STALE)
+        self.assertFalse(status.motion_ready)
+        agent.tick()
+        self.assertEqual(agent.assess_offer(self.offer()).reason, "NO_MOTOR_LINK")
+
+
+async def _call(agent, method, path):
+    """One request through the real FastAPI route handlers, in-process."""
+
+    import httpx
+
+    import robotx.application.main as api
+
+    api.state.agent = agent
+    try:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=api.app), base_url="http://pi") as client:
+            response = await client.request(method, path)
+    finally:
+        api.state.agent = None
+    return response.status_code, response.json()
+
+
+def call(agent, method, path):
+    import asyncio
+
+    return asyncio.run(_call(agent, method, path))
+
+
+ENGINE = {"ROBOTX_SOCKET_ENABLED": "1", "ROBOTX_SOCKET_SERVER_URL": "https://backend.example"}
+
+
+class TestControllerReset(unittest.TestCase):
+    """Operator RESET: explicit, never in AUTO, and it resumes nothing."""
+
+    driving_agent = TestControllerSafetyFaults.driving_agent
+    report = TestControllerSafetyFaults.report
+
+    def setUp(self):
+        self.answered = set()
+
+    def answer(self, link, port):
+        """Acknowledge every command written so far, as the real ESP32 would.
+
+        One chunk: FakePort hands back one queued chunk per read.
+        """
+
+        acks = []
+        for c in port.commands():
+            if c["seq"] not in self.answered:
+                self.answered.add(c["seq"])
+                acks.append(fx.ack(c["seq"], cmd=c["cmd"]))
+        if acks:
+            port.feed(b"".join(acks))
+        link.poll_once()
+
+    def resets(self, port):
+        return [c for c in port.commands() if c["cmd"] == "RESET"]
+
+    def paused_by(self, **fault):
+        """A mission that was driving, paused by a fresh controller fault."""
+
+        agent, link, port, clock = self.driving_agent()
+        self.answer(link, port)
+        self.report(link, port, **fault)
+        snap = agent.tick()
+        link.poll_once()
+        self.answer(link, port)
+        self.assertIs(snap.mode, OperatingMode.PAUSED)
+        return agent, link, port, clock
+
+    def reset_and_ack(self, agent, link, port):
+        agent.reset_controller("test")
+        link.poll_once()
+        self.assertEqual(len(self.resets(port)), 1)
+        self.answer(link, port)
+        self.assertEqual(link.status().controller.reset_status, "ACCEPTED")
+
+    # --- the agent gate ---------------------------------------------------
+
+    def test_refused_in_auto_and_nothing_is_sent(self):
+        agent, link, port, clock = self.driving_agent()
+        with self.assertRaises(MissionRefused) as ctx:
+            agent.reset_controller("test")
+        self.assertIn("AUTO", str(ctx.exception))
+        for _ in range(2):
+            agent.tick()
+            link.poll_once()
+        self.assertEqual(self.resets(port), [])
+        self.assertEqual(link.status().controller.reset_status, "NONE")
+        self.assertIs(agent.state.snapshot().mode, OperatingMode.AUTO)
+
+    def test_allowed_in_paused_and_the_mode_is_kept(self):
+        agent, link, port, clock = self.paused_by(safety_stop=True)
+        self.reset_and_ack(agent, link, port)
+        self.assertIs(agent.tick().mode, OperatingMode.PAUSED)
+
+    def test_allowed_in_idle_and_the_mode_is_kept(self):
+        agent, link, port, clock = agent_with_link(motion=True, drive_available=True)
+        self.assertIs(agent.tick().mode, OperatingMode.IDLE)
+        self.reset_and_ack(agent, link, port)
+        self.assertIs(agent.tick().mode, OperatingMode.IDLE)
+
+    def test_allowed_in_stopped_and_the_mode_is_kept(self):
+        agent, link, port, clock = self.driving_agent()
+        agent.stop_mission("test")
+        self.assertIs(agent.tick().mode, OperatingMode.STOPPED)
+        link.poll_once()
+        self.answer(link, port)
+        self.reset_and_ack(agent, link, port)
+        self.assertIs(agent.tick().mode, OperatingMode.STOPPED)
+
+    def test_does_not_clear_the_pi_emergency_stop(self):
+        agent, link, port, clock = agent_with_link(motion=True, drive_available=True)
+        agent.emergency_stop("test")
+        self.assertIs(agent.tick().mode, OperatingMode.STOPPED)
+        link.poll_once()
+        self.answer(link, port)
+        self.reset_and_ack(agent, link, port)
+        agent.tick()
+        self.assertTrue(agent.emergency_stopped)
+        self.assertIs(agent.state.snapshot().mode, OperatingMode.STOPPED)
+
+    def test_after_reset_and_safe_telemetry_it_is_ready_but_stays_paused(self):
+        agent, link, port, clock = self.paused_by(safety_stop=True)
+        drives = port.command_names().count("DRIVE")
+        route = list(agent._mission_route)
+        self.reset_and_ack(agent, link, port)
+        self.report(link, port, safety_stop=False)          # the ESP32's latch is clear
+        self.assertTrue(link.status().motion_ready)
+        for _ in range(3):
+            snap = agent.tick()
+            link.poll_once()
+            self.answer(link, port)
+            self.assertIs(snap.mode, OperatingMode.PAUSED)   # nothing resumed
+        self.assertEqual(port.command_names().count("DRIVE"), drives)
+        self.assertEqual(agent._mission_route, route)
+
+    def test_explicit_resume_is_required_before_drive(self):
+        agent, link, port, clock = self.paused_by(safety_stop=True)
+        drives = port.command_names().count("DRIVE")
+        self.reset_and_ack(agent, link, port)
+        self.report(link, port, safety_stop=False)
+        agent.tick()
+        link.poll_once()
+        self.assertEqual(port.command_names().count("DRIVE"), drives)
+
+        agent.resume_mission("operator")
+        snap = agent.tick()
+        link.poll_once()
+        self.assertIs(snap.mode, OperatingMode.AUTO)
+        self.assertEqual(port.command_names()[-1], "DRIVE")
+
+    def test_a_fault_that_persists_after_reset_pauses_again_on_resume(self):
+        agent, link, port, clock = self.paused_by(front_valid=False)
+        drives = port.command_names().count("DRIVE")
+        self.reset_and_ack(agent, link, port)
+        self.report(link, port, front_valid=False)           # RESET does not fix sensing
+        self.assertFalse(link.status().motion_ready)
+
+        agent.resume_mission("operator")
+        for _ in range(3):
+            snap = agent.tick()
+            link.poll_once()
+            self.answer(link, port)
+            self.assertIs(snap.mode, OperatingMode.PAUSED)
+        self.assertEqual(port.command_names().count("DRIVE"), drives)
+
+    # --- POST /controller/reset ------------------------------------------------
+
+    def assert_api_refused(self, agent, link, port, contains):
+        mode = agent.state.snapshot().mode
+        status, body = call(agent, "POST", "/controller/reset")
+        self.assertEqual(status, 409)
+        self.assertIn(contains, body["detail"])
+        link.poll_once()
+        self.assertEqual(self.resets(port), [])
+        self.assertIs(agent.state.snapshot().mode, mode)
+
+    def test_api_409_in_auto(self):
+        agent, link, port, clock = self.driving_agent()
+        self.assert_api_refused(agent, link, port, "AUTO")
+
+    def test_api_409_when_the_esp32_is_not_ready(self):
+        agent = RobotAgent(settings())
+        port = fx.FakePort()
+        agent.esp32, _ = fx.make_link(port)
+        link = agent.esp32
+        link.poll_once()                                     # CONNECTING
+        agent.tick()
+        self.assert_api_refused(agent, link, port, "not fresh")
+
+    def test_api_409_for_stale_telemetry(self):
+        agent, link, port, clock = agent_with_link(motion=True, drive_available=True)
+        clock.advance(2.0)
+        link.poll_once()
+        agent.tick()
+        self.assert_api_refused(agent, link, port, "not fresh")
+
+    def test_api_409_when_reboot_latched(self):
+        agent, link, port, clock = agent_with_link(motion=True, drive_available=True)
+        port.feed(fx.telemetry(uptime_ms=500, last_seq=None))
+        link.poll_once()
+        agent.tick()                                         # also latches the Pi e-stop
+        self.assert_api_refused(agent, link, port, "reboot is latched")
+
+    def test_api_409_when_a_reset_is_already_pending(self):
+        agent, link, port, clock = agent_with_link(motion=True, drive_available=True)
+        agent.tick()
+        self.assertEqual(call(agent, "POST", "/controller/reset")[0], 200)
+        status, body = call(agent, "POST", "/controller/reset")
+        self.assertEqual(status, 409)
+        self.assertIn("already pending", body["detail"])
+        link.poll_once()
+        self.assertEqual(len(self.resets(port)), 1)
+
+    def test_api_200_sends_one_reset_and_does_not_resume(self):
+        agent, link, port, clock = self.paused_by(safety_stop=True)
+        status, body = call(agent, "POST", "/controller/reset")
+        self.assertEqual(status, 200)
+        self.assertEqual(body, {"mode": "PAUSED", "reset_status": "REQUESTED"})
+        link.poll_once()
+        self.assertEqual(len(self.resets(port)), 1)
+        self.answer(link, port)
+        self.report(link, port, safety_stop=False)
+        for _ in range(3):
+            self.assertIs(agent.tick().mode, OperatingMode.PAUSED)
+            link.poll_once()
+            self.answer(link, port)
+
+    def test_api_is_reachable_in_engine_mode(self):
+        agent, link, port, clock = agent_with_link(motion=True, drive_available=True, **ENGINE)
+        self.assertTrue(agent.settings.socket_enabled)
+        agent.tick()
+        status, body = call(agent, "POST", "/controller/reset")
+        self.assertEqual(status, 200)
+        link.poll_once()
+        self.assertEqual(len(self.resets(port)), 1)
 
 
 class TestUartOwnership(unittest.TestCase):

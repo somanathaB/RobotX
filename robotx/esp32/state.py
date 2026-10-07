@@ -108,6 +108,27 @@ class ControllerTelemetry:
             received_at=received_at,
         )
 
+    @property
+    def safety_faults(self) -> Tuple[str, ...]:
+        """The controller safety states this frame reports, by name; empty when none.
+
+        The ESP32 already holds its own motors in each of these. They are named
+        here so the Pi stops commanding motion into them too: a latched safety
+        stop, front sensing it does not trust, and its command watchdog having
+        fired. Judged on this frame alone -- whether the frame is still fresh
+        enough to believe is the link's decision (`Esp32Link._telemetry_fresh`),
+        not this one's.
+        """
+
+        faults = []
+        if self.safety_stop:
+            faults.append("safety_stop")
+        if not self.front_valid:
+            faults.append("front_valid=false")
+        if self.command_timeout:
+            faults.append("command_timeout")
+        return tuple(faults)
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "uptime_ms": self.uptime_ms,
@@ -193,6 +214,11 @@ class ControllerState:
     motion_enabled: bool = False
     motion_ready: bool = False           # the link would carry a DRIVE right now
     counters: LinkCounters = field(default_factory=LinkCounters)
+    # The latest operator RESET: NONE | REQUESTED | SENT | ACCEPTED | REJECTED |
+    # DUPLICATE | TIMEOUT | DROPPED, and the ESP32's reason when it gave one.
+    # An ACCEPTED RESET is not proof of health: TELEMETRY still decides that.
+    reset_status: str = "NONE"
+    reset_detail: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -213,6 +239,8 @@ class ControllerState:
             "motion_enabled": self.motion_enabled,
             "motion_ready": self.motion_ready,
             "counters": self.counters.to_dict(),
+            "reset_status": self.reset_status,
+            "reset_detail": self.reset_detail,
         }
 
 

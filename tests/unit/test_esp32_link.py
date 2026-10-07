@@ -549,6 +549,24 @@ class TestMotionCommands(unittest.TestCase):
             link.poll_once()
         self.assertEqual(port.command_names().count("DRIVE"), 1)
 
+    def test_a_controller_safety_fault_turns_drive_into_stop_and_stop_still_goes(self):
+        faults = {"safety_stop": {"safety_stop": True},
+                  "front_valid=false": {"front_valid": False},
+                  "command_timeout": {"command_timeout": True}}
+        for name, fault in faults.items():
+            with self.subTest(fault=name):
+                link, port, clock = self.up_with_drive()
+                port.feed(fx.telemetry(motor_drive_available=True, uptime_ms=3590000, **fault))
+                link.poll_once()
+                st = link.status()
+                self.assertIs(st.link, S.UP)                 # the link itself is fine
+                self.assertFalse(st.motion_ready)
+                self.assertEqual(st.controller.telemetry.safety_faults, (name,))
+                link.submit(fx.decision(MotionIntent.forward(0.5)))
+                link.poll_once()
+                self.assertEqual(port.command_names()[-1], "STOP")
+                self.assertNotIn("DRIVE", port.command_names())
+
     def test_drive_unavailable_turns_drive_into_stop(self):
         link, port, clock = fresh(motion_enabled=True)
         fx.bring_up(link, port, clock)             # real telemetry: drive unavailable
@@ -573,6 +591,199 @@ class TestMotionCommands(unittest.TestCase):
             link.poll_once()
         self.assertEqual(port.writes[0], b"\n")
         self.assertEqual(port.command_names(), ["PING"])
+
+
+class TestReset(unittest.TestCase):
+    """The operator RESET: gated, sent once, never retried, queued or replayed."""
+
+    def up(self, **cfg):
+        link, port, clock = fresh(**cfg)
+        fx.bring_up(link, port, clock)
+        self.assertIs(link.status().link, S.UP)
+        return link, port, clock
+
+    def resets(self, port):
+        return [c for c in port.commands() if c["cmd"] == "RESET"]
+
+    def sent_reset(self, **cfg):
+        link, port, clock = self.up(**cfg)
+        self.assertIsNone(link.request_reset())
+        link.poll_once()
+        self.assertEqual(len(self.resets(port)), 1)
+        return link, port, clock, self.resets(port)[0]["seq"]
+
+    def assert_refused(self, link, port, contains):
+        writes = list(port.writes) if port is not None else []
+        refusal = link.request_reset()
+        self.assertIsNotNone(refusal)
+        self.assertIn(contains, refusal)
+        self.assertEqual(link.status().controller.reset_status, "NONE")
+        if port is not None:
+            link.poll_once()
+            self.assertEqual(self.resets(port), [])
+            self.assertEqual(port.writes[len(writes):], [])
+
+    def test_refused_when_disconnected(self):
+        link, clock = fx.make_link(OSError("no such device"))
+        link.poll_once()
+        self.assertIs(link.status().link, S.DISCONNECTED)
+        self.assertIsNotNone(link.request_reset())
+        self.assertIn("DISCONNECTED", link.request_reset())
+        self.assertEqual(link.status().controller.reset_status, "NONE")
+
+    def test_refused_when_connecting(self):
+        link, port, clock = fresh()
+        link.poll_once()                                   # open + resync LF only
+        self.assertIs(link.status().link, S.CONNECTING)
+        self.assert_refused(link, port, "not fresh")
+        port.feed(fx.REAL_TELEMETRY)                       # TELEMETRY, but no PING ACK yet
+        link.poll_once()
+        self.assertIs(link.status().link, S.CONNECTING)
+        self.assertIn("CONNECTING", link.request_reset())
+
+    def test_refused_when_stale(self):
+        link, port, clock = self.up()
+        clock.advance(1.5)
+        link.poll_once()
+        self.assertIs(link.status().link, S.STALE)
+        self.assert_refused(link, port, "not fresh")
+
+    def test_refused_when_degraded(self):
+        link, port, clock = self.up()
+        port.feed(fx.frame({"type": "DIAG", "section": "SYSTEM", "uptime_ms": 3589000, "proto": 3}))
+        link.poll_once()
+        self.assertIs(link.status().link, S.DEGRADED)
+        self.assert_refused(link, port, "DEGRADED")
+
+    def test_refused_when_reboot_latched(self):
+        link, port, clock = self.up()
+        port.feed(fx.telemetry(uptime_ms=500, last_seq=None))   # uptime went backwards
+        link.poll_once()
+        self.assertTrue(link.status().controller.reboot_latched)
+        self.assert_refused(link, port, "reboot is latched")
+
+    def test_a_reset_whose_telemetry_goes_stale_before_it_is_written_is_dropped(self):
+        link, port, clock = self.up()
+        self.assertIsNone(link.request_reset())
+        clock.advance(1.5)                                 # stale before the I/O thread writes
+        link.poll_once()
+        st = link.status().controller
+        self.assertEqual(st.reset_status, "DROPPED")
+        self.assertIn("not fresh", st.reset_detail)
+        port.feed(fx.telemetry(uptime_ms=3590000))         # fresh again: still nothing sent
+        for _ in range(3):
+            link.poll_once()
+        self.assertEqual(self.resets(port), [])
+
+    def test_refused_when_transmit_is_disabled(self):
+        link, port, clock = fresh(transmit_enabled=False)
+        link.poll_once()
+        port.feed(fx.REAL_TELEMETRY)
+        link.poll_once()
+        self.assertIs(link.status().link, S.UP)           # receive-only UP
+        self.assert_refused(link, port, "transmit is disabled")
+        self.assertEqual(port.writes, [])
+
+    def test_sent_exactly_once(self):
+        link, port, clock, seq = self.sent_reset()
+        for _ in range(5):
+            port.feed(fx.telemetry(uptime_ms=3590000))
+            link.poll_once()
+        self.assertEqual([c["seq"] for c in self.resets(port)], [seq])
+        self.assertEqual(self.resets(port)[0], {"type": "COMMAND", "seq": seq, "cmd": "RESET"})
+        self.assertEqual(link.status().controller.reset_status, "SENT")
+
+    def test_a_second_reset_while_one_is_pending_is_refused(self):
+        link, port, clock = self.up()
+        self.assertIsNone(link.request_reset())
+        self.assertIn("already pending", link.request_reset())      # REQUESTED
+        link.poll_once()
+        self.assertIn("already pending", link.request_reset())      # SENT
+        link.poll_once()
+        self.assertEqual(len(self.resets(port)), 1)
+
+    def test_not_replayed_after_reconnect(self):
+        first, second = fx.FakePort(), fx.FakePort()
+        link, clock = fx.make_link(first, second)
+        fx.bring_up(link, first, clock)
+        self.assertIsNone(link.request_reset())
+        first.fail_read = OSError("device reports readiness to read but returned no data")
+        link.poll_once()                                   # lost before it was written
+        st = link.status().controller
+        self.assertEqual(st.reset_status, "DROPPED")
+        self.assertIn("connection was reset", st.reset_detail)
+
+        clock.advance(1.0)
+        fx.bring_up(link, second, clock)
+        for _ in range(3):
+            second.feed(fx.telemetry(uptime_ms=3600000))
+            link.poll_once()
+        self.assertIs(link.status().link, S.UP)
+        self.assertEqual(self.resets(first) + self.resets(second), [])
+
+    def test_a_sent_reset_is_dropped_not_replayed_on_reconnect(self):
+        first, second = fx.FakePort(), fx.FakePort()
+        link, clock = fx.make_link(first, second)
+        fx.bring_up(link, first, clock)
+        self.assertIsNone(link.request_reset())
+        link.poll_once()
+        self.assertEqual(len(self.resets(first)), 1)
+        first.fail_read = OSError("gone")
+        link.poll_once()
+        self.assertEqual(link.status().controller.reset_status, "DROPPED")
+        clock.advance(1.0)
+        fx.bring_up(link, second, clock)
+        link.poll_once()
+        self.assertEqual(self.resets(second), [])
+
+    def test_ack_accepted_is_recorded(self):
+        link, port, clock, seq = self.sent_reset()
+        port.feed(fx.ack(seq, cmd="RESET"))
+        link.poll_once()
+        st = link.status().controller
+        self.assertEqual((st.reset_status, st.reset_detail), ("ACCEPTED", "NONE"))
+        self.assertIsNone(link.request_reset())           # a new one may be asked for
+
+    def test_ack_rejected_and_duplicate_are_recorded(self):
+        for result, reason, frame in (
+            ("REJECTED", "UNKNOWN_FIELD", lambda seq: fx.ack(seq, cmd="RESET", result="REJECTED",
+                                                             reason="UNKNOWN_FIELD", field="x")),
+            ("DUPLICATE", "DUPLICATE_SEQ", lambda seq: fx.ack(seq, cmd="RESET", result="DUPLICATE",
+                                                              reason="DUPLICATE_SEQ")),
+            ("REJECTED", "ERROR INVALID_MESSAGE", lambda seq: fx.error("INVALID_MESSAGE", seq=seq)),
+        ):
+            with self.subTest(result=result, reason=reason):
+                link, port, clock, seq = self.sent_reset()
+                port.feed(frame(seq))
+                link.poll_once()
+                st = link.status().controller
+                self.assertEqual((st.reset_status, st.reset_detail), (result, reason))
+
+    def test_timeout_is_recorded(self):
+        link, port, clock, seq = self.sent_reset()
+        clock.advance(0.6)
+        port.feed(fx.telemetry(uptime_ms=3590000))         # link still fresh; only the ACK is missing
+        link.poll_once()
+        st = link.status()
+        self.assertEqual(st.controller.reset_status, "TIMEOUT")
+        self.assertEqual(st.controller.counters.ack_timeouts, 1)
+        self.assertEqual(len(self.resets(port)), 1)        # not retried
+        port.feed(fx.ack(seq, cmd="RESET"))                # a late ACK changes nothing
+        link.poll_once()
+        self.assertEqual(link.status().controller.reset_status, "TIMEOUT")
+
+    def test_never_produces_a_drive(self):
+        link, port, clock = fresh(motion_enabled=True)
+        link.poll_once()
+        port.feed(fx.telemetry(motor_drive_available=True, last_seq=None))
+        link.poll_once()
+        port.feed(fx.ack(1))
+        link.poll_once()
+        self.assertTrue(link.status().motion_ready)
+        self.assertIsNone(link.request_reset())
+        for _ in range(3):
+            link.poll_once()
+        self.assertEqual(port.command_names(), ["PING", "RESET"])
 
 
 class TestPySerialAdapter(unittest.TestCase):

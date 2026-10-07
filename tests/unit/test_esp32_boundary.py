@@ -62,9 +62,9 @@ class TestBoundary(unittest.TestCase):
                 continue
             self.assertNotIn("serial", {n.split(".")[0] for n in imports_of(path)}, path.name)
 
-    def test_only_ping_stop_and_drive_can_be_encoded(self):
-        self.assertEqual(set(protocol.ALLOWED_COMMANDS), {"PING", "STOP", "DRIVE"})
-        for cmd in ("MOVE", "MOTORTEST", "RESET"):
+    def test_only_ping_stop_drive_and_reset_can_be_encoded(self):
+        self.assertEqual(set(protocol.ALLOWED_COMMANDS), {"PING", "STOP", "DRIVE", "RESET"})
+        for cmd in ("MOVE", "MOTORTEST"):
             with self.assertRaises(protocol.CommandError):
                 protocol.encode_command(1, cmd)
 

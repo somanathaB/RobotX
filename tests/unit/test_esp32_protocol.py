@@ -230,11 +230,25 @@ class TestEncode(unittest.TestCase):
                          b'{"type":"COMMAND","seq":42,"cmd":"DRIVE","left":150,"right":150}*E0DC\n')
         self.assertEqual(p.encode_command(7, "STOP"), fx.frame('{"type":"COMMAND","seq":7,"cmd":"STOP"}'))
 
-    def test_only_ping_stop_and_drive_exist(self):
-        self.assertEqual(set(p.ALLOWED_COMMANDS), {"PING", "STOP", "DRIVE"})
-        for forbidden in ("MOVE", "MOTORTEST", "RESET", "I2CSCAN", "TOFTEST", "HWREPORT", "drive", ""):
+    def test_only_ping_stop_drive_and_reset_exist(self):
+        self.assertEqual(set(p.ALLOWED_COMMANDS), {"PING", "STOP", "DRIVE", "RESET"})
+        for forbidden in ("MOVE", "MOTORTEST", "I2CSCAN", "TOFTEST", "HWREPORT", "drive", "reset", ""):
             with self.assertRaises(p.CommandError, msg=forbidden):
                 p.encode_command(1, forbidden)
+
+    def test_reset_uses_the_normal_command_frame(self):
+        payload = b'{"type":"COMMAND","seq":123,"cmd":"RESET"}'
+        frame = p.encode_command(123, "RESET")
+        self.assertEqual(frame, payload + b"*%04X\n" % p.crc16(payload))
+        self.assertEqual(int(frame[-5:-1], 16), p.crc16(frame[:-6]))
+        # The Pi's own decoder sees it as a well-formed frame (only its type is
+        # one the ESP32 receives rather than sends).
+        self.assertEqual(p.decode_line(frame).reason, p.FrameError.UNKNOWN_TYPE)
+
+    def test_reset_takes_no_fields(self):
+        for fields in (dict(foo="bar"), dict(left=0), dict(all=True)):
+            with self.assertRaises(p.CommandError, msg=fields):
+                p.encode_command(123, "RESET", **fields)
 
     def test_field_rules(self):
         bad = [

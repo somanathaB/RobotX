@@ -515,8 +515,10 @@ class RobotAgent:
         # cannot move at all, whatever it accepts.
         if not snapshot.communication.esp32.is_up:
             return OfferDecision.reject("NO_MOTOR_LINK")
-        # An UP link is not yet a motor link: motion must be enabled on the Pi
-        # and the ESP32 must report that its drive is actually available.
+        # An UP link is not yet a motor link: motion must be enabled on the Pi,
+        # and the ESP32's fresh TELEMETRY must report its drive available and no
+        # controller safety fault (safety_stop, front_valid=false,
+        # command_timeout) -- see Esp32Link._motion_ready.
         if self.esp32 is not None and not self.esp32.status().motion_ready:
             return OfferDecision.reject("NO_MOTOR_LINK")
         if snapshot.position is None or not snapshot.position.is_measured or not snapshot.gps.has_fix:
@@ -699,6 +701,40 @@ class RobotAgent:
     def emergency_stopped(self) -> bool:
         return self.safety.estop_engaged
 
+    # --- controller reset (operator) -----------------------------------------
+
+    _RESET_MODES = (OperatingMode.PAUSED, OperatingMode.IDLE, OperatingMode.STOPPED)
+
+    def reset_controller(self, reason: str = "operator reset") -> None:
+        """Ask the ESP32 to clear its safety-stop and command-timeout latches.
+
+        An explicit operator action, never taken automatically. RESET stops the
+        ESP32's motors and clears its latches; it is not a reboot, so it is
+        entirely separate from the reboot -> emergency-stop path. It changes
+        nothing on the Pi: not the mode, the route, the mission, the e-stop.
+        A mission paused by the fault stays PAUSED until an explicit RESUME,
+        and a fault still present simply pauses it again.
+
+        Refused (`MissionRefused`) while AUTO -- the next control tick could
+        send DRIVE straight after the RESET -- and whenever the link refuses
+        it (`Esp32Link.request_reset`). A refused request sends nothing.
+        """
+
+        mode = self.state.mode
+        refusal: Optional[str] = None
+        if mode not in self._RESET_MODES:
+            refusal = f"mission is {mode.value}; pause it before resetting the ESP32 controller"
+        elif self.esp32 is None:
+            refusal = "no ESP32 link is running"
+        else:
+            refusal = self.esp32.request_reset()
+        if refusal is not None:
+            log_event(logger, "controller.reset_refused", refusal, level=logging.WARNING,
+                      reason=reason, mode=mode.value)
+            raise MissionRefused(f"controller RESET refused: {refusal}")
+        log_event(logger, "controller.reset_requested", "RESET will be sent to the ESP32 once",
+                  level=logging.WARNING, reason=reason, mode=mode.value)
+
     def resume_idle(self) -> None:
         """Leave STOPPED/ERROR and go back to IDLE, clearing the last error."""
 
@@ -791,7 +827,10 @@ class RobotAgent:
 
         # 2b. ESP32 link: what it reports goes into state before anything
         #     decides, and a link that can no longer carry motion pauses a
-        #     running mission rather than letting it continue unexecuted.
+        #     running mission rather than letting it continue unexecuted. That
+        #     includes an UP link whose fresh TELEMETRY reports a controller
+        #     safety fault (Esp32Link._motion_ready). The pause is not undone
+        #     when the fault clears: resuming stays an explicit RESUME.
         link = self.esp32
         esp32 = self._update_esp32()
         if (
@@ -801,7 +840,11 @@ class RobotAgent:
             and self.state.mode.mission_active
             and not esp32.motion_ready
         ):
-            self.pause_mission(f"ESP32 cannot carry motion: {esp32.link.value} ({esp32.detail})")
+            why = f"{esp32.link.value} ({esp32.detail})"
+            telemetry = esp32.controller.telemetry
+            if esp32.link.is_up and telemetry is not None and telemetry.safety_faults:
+                why += f"; controller reports {', '.join(telemetry.safety_faults)}"
+            self.pause_mission(f"ESP32 cannot carry motion: {why}")
 
         # 2c. Backend link (Y4): its loss policy runs on this loop's own cadence,
         #     before anything decides, so neither a reconnect backoff nor a

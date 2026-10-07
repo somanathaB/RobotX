@@ -257,6 +257,29 @@ async def clear_emergency_stop() -> Dict[str, Any]:
     }
 
 
+@app.post("/controller/reset")
+async def reset_controller() -> Dict[str, Any]:
+    """Ask the ESP32 to clear its safety-stop and command-timeout latches, once.
+
+    An operator safety action, like /safety/estop and /safety/clear, so not
+    behind the engine-mode admission lock. 409 when refused (mission AUTO, link
+    not ready, TELEMETRY stale, reboot latched, a RESET already pending), and
+    then nothing is sent. 200 means the RESET will be written once -- not that
+    the controller is clear: watch `controller.reset_status` and the ESP32's
+    TELEMETRY in /state. Does not resume the mission.
+    """
+
+    agent = get_agent()
+    try:
+        agent.reset_controller("reset via API")
+    except MissionRefused as e:
+        raise HTTPException(status_code=409, detail=str(e)) from None
+    return {
+        "mode": agent.state.mode.value,
+        "reset_status": agent.esp32.status().controller.reset_status,
+    }
+
+
 @app.post("/mission/custody")
 async def confirm_custody(body: Dict[str, Any]) -> Dict[str, Any]:
     """An operator at the stop confirms a parcel handover: {"kind": ACQUIRED|RELEASED}.
