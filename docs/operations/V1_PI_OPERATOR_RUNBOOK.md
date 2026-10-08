@@ -237,6 +237,10 @@ end with the physical robot.)
 - **Expected:** `journalctl -u robotx-agent -b | grep agent.started`; `mode:
   "IDLE"`, `safety` not `"estop"`, `esp32: "UP"`, `reboot_latched: false`,
   backend `status: "STREAMING"`, `/health` camera/perception/esp32 `HEALTHY`.
+  An enrolled robot reconnects on its saved session token (`/backend`
+  `auth_method: "TOKEN"`). No pairing code and no dashboard step are needed
+  while the backend session has not expired (V1_PI_DEPLOYMENT.md section 18).
+  The dashboard then shows the robot online. Online is not "Ready for Tasks".
 - **Failure:** the service is `failed` or keeps restarting
   (`systemctl status robotx-agent`); `agent.start_failed`; backend `DISABLED`
   with `enabled: true`; camera `FAILED` ("camera did not start" — it is not
@@ -307,20 +311,30 @@ The link drops while the robot is driving a mission.
 - **Prerequisite:** the backend itself is reachable (otherwise: Backend
   unavailable).
 - **Action:** `curl -s $S/backend | jq '{status, auth_method, auth_failure, credential, pairing_code}'`
-  and `journalctl -u robotx-agent --since -15min | grep -E 'backend\.(auth_failed|token_discarded|token_kept)'`.
+  and `journalctl -u robotx-agent --since -15min | grep -E 'backend\.(auth_failed|token_discarded|token_kept|pairing_code_rejected|no_credential)'`.
 - **Expected / decision:**
   - `backend.token_kept` (a timeout or a disconnect with no verdict): the stored
     token is kept and retried on the normal backoff. Wait.
   - `backend.token_discarded` (the backend answered `INVALID_CREDENTIAL`), or
-    `credential.token: "UNSET"`: the robot must be paired again —
-    V1_PI_DEPLOYMENT.md sections 17 and 18, with the robot IDLE. A robot that has
-    been offline for more than 24 h also needs this: its session has expired.
+    `credential.token: "UNSET"`: the robot must be enrolled again with the
+    dashboard-first procedure. Follow V1_PI_DEPLOYMENT.md section 17.2 from step
+    2 (Generate Pairing Code, PIN/passkey, run the command the dashboard
+    displays), then section 18.1, with the robot IDLE. This is expected after
+    the robot has been offline longer than the backend session lifetime
+    (`ROBOT_SESSION_TTL_SEC`, default 30 days, range 1 hour to 90 days; section
+    18.3).
+  - During an enrollment: an expired code, a refused code, a locked robot, or a
+    code lost to a backend restart are covered in V1_PI_DEPLOYMENT.md section
+    17.4. In each case, generate a new code in the dashboard and run the new
+    command. Never re-run an old one.
 - **Failure:** pairing is refused repeatedly. **Five failed pairing attempts lock
   pairing for this robot for one hour.** Do not keep retrying.
 - **Escalation:** unlocking early is a backend override
   (`POST /api/robots/<robot-id>/pairing/unlock`, quarantine-override approval).
-  Never put a pairing code back in `/etc/robotx/robotx-agent.env`, and never set
-  `ROBOTX_ROBOT_TOKEN` as a workaround.
+  Never put a pairing code in `/etc/robotx/robotx-agent.env`, and never set
+  `ROBOTX_ROBOT_TOKEN` as a workaround. "✓ Robot Connected" or `STREAMING` after
+  re-enrollment means only that the link is authenticated, not that the robot
+  is ready for tasks.
 
 ## Checking commitment ownership
 

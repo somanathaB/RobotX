@@ -192,7 +192,7 @@ never logged.
 
 | Document | Contents |
 |---|---|
-| `docs/operations/V1_PI_DEPLOYMENT.md` | V1 installation on the Pi: systemd, configuration, signing key, pairing, verification, rollback |
+| `docs/operations/V1_PI_DEPLOYMENT.md` | V1 installation on the Pi: systemd, configuration, signing key, dashboard-first enrollment and reconnect, verification, rollback |
 | `docs/operations/V1_PI_OPERATOR_RUNBOOK.md` | V1 operation: RESUME, STOP, PAUSE, custody, e-stop, stranded goods, out of service |
 | `docs/architecture/ROBOTX_PI_ARCHITECTURE.md` | Subsystem boundaries, data flow, ESP32/backend seams |
 | `docs/communication/ROBOT_BACKEND_PROTOCOL.md` | The robot ↔ backend wire contract, and what the backend must implement |

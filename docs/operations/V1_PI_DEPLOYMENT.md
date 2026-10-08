@@ -21,12 +21,12 @@ stop at the first check that does not give the expected result.
 ## 1. Scope
 
 In scope: the Pi agent (`python -m robotx.application`), its configuration,
-pairing with the backend, the systemd unit, logging, time synchronisation, the
+enrollment with the backend (the dashboard-first procedure), the systemd unit, logging, time synchronisation, the
 first OFFER, enabling motion, rollback and taking the robot out of service.
 
 Out of scope: the backend deployment (only the two backend facts the Pi depends
-on are stated: the signing key and the link timing), the ESP32 firmware, and
-the dashboard.
+on are stated: the signing key, the link timing and the session lifetime), the
+ESP32 firmware, and the dashboard beyond its enrollment screen (section 17).
 
 ## 2. Release baseline
 
@@ -366,8 +366,9 @@ journalctl -u robotx-agent -f            # follow
 journalctl -u robotx-agent -b | grep -E 'agent\.(started|start_failed)|backend\.(config_invalid|auth_failed|loss_pause|heartbeat_too_slow)|esp32\.simulated|api\.network_exposed'
 ```
 
-No secret is ever logged: the signing key, pairing code and token appear only as
-`SET`/`UNSET`. [SW-VERIFIED]
+The agent never logs a secret: the signing key, pairing code and token appear
+only as `SET`/`UNSET` (the code also as `CONSUMED`). [SW-VERIFIED] The command
+the dashboard gives for enrollment is outside the agent; see section 17.
 
 ## 15. Time synchronisation
 
@@ -436,74 +437,235 @@ Do not `enable` it yet; section 17 starts it for the first time.
 `sudo systemd-analyze security robotx-agent` gives an informational exposure
 score; it is not a pass/fail check.
 
-## 17. Commissioning and pairing
+## 17. Enrollment (dashboard-first)
 
-The backend issues a one-time 6-digit pairing code (300 s lifetime) for the
-robot id. The first AUTH spends it and returns a session token, which the Pi
-stores in `/var/lib/robotx/backend_session.json`; from then on the token is used.
+Enrollment links this Pi to the robot record created in the RobotX dashboard.
+It is done once per robot. **The primary procedure is the dashboard's**: the
+operator generates a pairing code in the dashboard and runs the one command the
+dashboard displays, on the Pi. That is the only manual step.
 
-**1. Get the code — on the operator's workstation, not on the Pi.** The route
-requires an authenticated dashboard user. Log in first as described in the
-operator runbook, "Operator command API" → "Authenticate" (the backend returns
-the session only as a `token` cookie, kept in `$COOKIES`). Then send the same
-request the repository's commissioning helper sends:
+How the parts connect. Every connection is outbound from the Pi; the backend
+never opens a connection to the Pi:
 
-```bash
-curl -sS -b "$COOKIES" -X POST "https://<backend-host>/api/robots/commission" \
-  -H 'Content-Type: application/json' \
-  -d '{"robotId":"<commissioned-robot-id>","simulated":false}'
+```text
+Browser / dashboard
+    ↓
+Render RobotX backend
+    ↑ outbound Socket.IO over WSS, opened by the Pi
+Raspberry Pi 5 (robotx-agent)
+    ↓ UART
+ESP32
+    ↓
+motors / sensors
 ```
 
-The response carries `"pairingCode"` and `"expiresIn":300`. Delete the cookie
-file when finished (`rm -f "$COOKIES"`). The repository's helper
-(`python -m robotx.communication.commissioning`) is not used here: it needs the
-`requests` package, which `requirements.txt` does not install (helper debt, not a
-V1 blocker), and it would put an operator credential on the robot.
+What happens, in order:
 
-**2. Within 300 s, on the Pi:**
+1. The dashboard issues a **pairing code** for the Robot ID.
+2. The command shown by the dashboard writes the temporary pairing
+   configuration on the Pi and restarts `robotx-agent`.
+3. The agent connects out to the Render backend and sends `AUTH` with its
+   configured Robot ID (`ROBOTX_ROBOT_ID`) and the pairing code.
+4. The backend accepts the code and returns a session token. The Pi stores it in
+   `/var/lib/robotx/backend_session.json` (mode 0600) and uses it from then on.
+5. The dashboard sees the robot come online and shows **"✓ Robot Connected"**.
+
+The pairing code:
+
+- is six digits, single-use and valid for 300 seconds;
+- is subject to the backend's lockout: **five failed pairing attempts lock
+  pairing for this robot** (section 17.4);
+- is not a permanent credential: once the Pi holds a session token it is not
+  needed again;
+- must never go in a URL, a chat, a ticket, a screenshot or a note.
+
+The agent itself never logs the code (it shows only `SET`/`UNSET`/`CONSUMED`).
+Depending on how the command is built, the code can still end up in the shell
+history or in sudo's log on the Pi. That is acceptable only because the code is
+single-use and expires after 300 s. Never copy it anywhere else.
+
+### 17.1 Prerequisites
+
+- Sections 1–16 are done. `/etc/robotx/robotx-agent.env` has
+  `ROBOTX_SOCKET_SERVER_URL` set to the Render backend's `https://` URL and the
+  command signing key (section 13).
+- `ROBOTX_ROBOT_ID` in `/etc/robotx/robotx-agent.env` is exactly the dashboard's
+  Robot ID (case-sensitive, no extra spaces).
+- An SSH session on the Pi, as an operator account with `sudo` rights
+  (restarting the system service needs root).
+- A dashboard account that may commission robots, and that account's PIN or
+  passkey.
+
+### 17.2 Procedure
+
+**In the dashboard:**
+
+1. Commission the physical robot. The dashboard then opens
+   `/robots/<robot-id>/connect`.
+2. Click **Generate Pairing Code**.
+3. Complete the PIN/passkey step the dashboard asks for.
+4. The dashboard shows the six-digit pairing code and one command, with a copy
+   button. Leave the page open: it is what reports the connection in step 7.
+
+**On the Pi, within 300 s of step 4:**
+
+5. Copy the command **exactly as the dashboard displays it** and run it in the
+   SSH session. Do not type your own version, edit it or reuse one from an
+   earlier enrollment: the dashboard builds it for this robot and this code.
+6. Check the service and the link (section 17.3).
+
+**In the dashboard:**
+
+7. The connect page changes to **"✓ Robot Connected"** by itself. You do not
+   need to refresh it.
+8. Continue to the robot's detail page. Then do section 18 on the Pi.
+
+**"Connected" does not mean "Ready for Tasks".** It means only that the
+backend has authenticated the Pi's link. Enrollment does not make the robot
+assignable. With `ROBOTX_ESP32_MOTION_ENABLED=0` (section 12) the robot rejects
+every OFFER, and sections 19–23 still have to pass before motion is enabled.
+
+### 17.3 Verify the service and the Render connection
+
+On the Pi, after the dashboard's command has run:
+
+```bash
+systemctl status robotx-agent --no-pager            # expect: active (running)
+journalctl -u robotx-agent -b | grep -E 'agent\.(started|start_failed)|backend\.(link_status|pairing_code_consumed|pairing_code_rejected|auth_failed|no_credential)'
+curl -s http://127.0.0.1:8000/backend | jq '{status, streaming, authenticated, auth_method, auth_failure, server, tls, robot_id, credential, pairing_code}'
+```
+
+Expected:
+
+| Field | Value |
+|---|---|
+| `status` / `streaming` | `"STREAMING"` / `true` |
+| `authenticated` | `true` |
+| `auth_method` | `"PAIRING_CODE"` |
+| `auth_failure` | `""` |
+| `server` | the Render backend's URL, the same as `ROBOTX_SOCKET_SERVER_URL` |
+| `tls` | `true` |
+| `robot_id` | the dashboard's Robot ID, exactly |
+| `credential.token` | `"SET"` (path `/var/lib/robotx/backend_session.json`) |
+| `pairing_code` | `"CONSUMED"`: the code was accepted and this process will not present it again |
+
+In the log: `agent.started`, then a `backend.link_status` line `connected to`
+the Render URL, then `backend.pairing_code_consumed`. The agent restarted by the
+command is a fresh process: it attempts the connection at once.
+
+`pairing_code: "UNSET"` after the command means the code did not reach the
+agent's environment. The agent reads it only as `ROBOTX_PAIRING_CODE` from
+`/etc/robotx/pairing.env`. Stop and escalate: do not enter the code anywhere
+else.
+
+### 17.4 When enrollment does not complete
+
+The Pi presents a stored session token before a pairing code. With no token
+stored (the normal case for a first enrollment), it presents the code once. If
+the backend refuses the code, the agent never presents that code again
+(`pairing_code: "CONSUMED"`, log `backend.pairing_code_rejected`). It then waits
+with nothing to present until a new command restarts it.
+
+| Situation | What you see | What to do |
+|---|---|---|
+| **The pairing code expired** (more than 300 s between generating it and running the command) | `status: "AUTH_FAILED"`, `auth_failure` names the backend's refusal, `backend.pairing_code_rejected`; the dashboard does not show "✓ Robot Connected" | Generate a new code in the dashboard (17.2 steps 2–4) and run the **new** command at once. Never run the old command again. |
+| **Pairing is refused** (wrong Robot ID, a code already used, a code for another robot) | as above | Check that `robot_id` in `/backend` equals the dashboard's Robot ID exactly. Fix `ROBOTX_ROBOT_ID` first if it differs. Then generate a new code and run the new command. **Every refused attempt counts toward the lockout:** stop after two or three, and find the cause before trying again. |
+| **The robot is locked** (five failed pairing attempts) | every new code is refused, however correct; `auth_failure` carries the backend's refusal | Stop trying: further attempts cannot succeed. Run `sudo rm -f /etc/robotx/pairing.env` and `sudo systemctl restart robotx-agent` so the Pi presents nothing. The lock lasts one hour. Unlocking it earlier is a backend override (`POST /api/robots/<robot-id>/pairing/unlock`), gated as a quarantine override: elevated role, recorded reason and, where configured, a second approver. Afterwards, start again at 17.2 step 2. |
+| **The backend restarted before the Pi used the code** (pending codes do not survive a backend restart) | the code is refused as above | Generate a new code and run the new command. |
+| **Nothing to present** | `backend.no_credential` in the log at start, `credential.token: "UNSET"`, `pairing_code: "UNSET"` | The command has not run, or it did not deliver the code. Start again at 17.2 step 2. This log line points at the repository's commissioning helper. Use the dashboard procedure instead. |
+| **The backend is unreachable** | `status` cycles `CONNECTING`/`DISCONNECTED` with a `last_connect_error`; no `auth_failure` | Not a pairing problem: the code is kept and retried while it lasts. Check the network, DNS, the clock (section 15) and `server`. If the 300 s pass, generate a new code. |
+
+### 17.5 Legacy/manual fallback
+
+Use this only when the dashboard's command cannot be run as displayed, for
+example when nothing can be pasted into the Pi's terminal. The code still comes
+from the dashboard (17.2 steps 1–4). Only the Pi-side step is done by hand,
+within the same 300 s:
 
 ```bash
 sudo install -m 0600 -o root -g root /dev/null /etc/robotx/pairing.env
 sudoedit /etc/robotx/pairing.env          # one line: ROBOTX_PAIRING_CODE=<6 digits>
-sudo systemctl start robotx-agent
-curl -s http://127.0.0.1:8000/backend | jq '{status, authenticated, auth_method, auth_failure, credential, pairing_code}'
+sudo systemctl restart robotx-agent
 ```
 
-Expected: `authenticated: true`, `auth_method: "PAIRING_CODE"`,
-`credential.token: "SET"`.
+Then verify exactly as in 17.3 and continue with 17.2 step 7. To retry after a
+refusal, generate a new code, replace the line with `sudoedit`, and restart.
+The lockout in 17.4 applies to these attempts too.
 
-If `auth_failure` names a refusal: the code expired or was wrong. The agent
-presents a refused code only once (`pairing_code: "CONSUMED"`), then waits with
-nothing to present. Get a new code and repeat step 2 (`sudoedit`, then
-`sudo systemctl restart robotx-agent`) — at most a few times: **five failed pairing attempts lock
-pairing for this robot for an hour**, and unlocking is a backend override
-(`POST /api/robots/<id>/pairing/unlock`, gated as a quarantine override: elevated
-role, recorded reason and, where configured, a second approver).
+The older procedure is no longer documented. It requested the code with a
+direct `curl` call to `POST /api/robots/commission` from an operator
+workstation, then edited `pairing.env` by hand. Code issuance now goes through
+the dashboard's PIN/passkey step. Never put a pairing code in
+`/etc/robotx/robotx-agent.env`, and never set `ROBOTX_ROBOT_TOKEN` as a
+workaround.
 
-## 18. Pairing-code removal
+## 18. After enrollment: pairing-code removal and reconnect
+
+### 18.1 Remove the pairing code
 
 Immediately after section 17 succeeds, with the robot IDLE:
 
 ```bash
-sudo rm /etc/robotx/pairing.env
+sudo rm -f /etc/robotx/pairing.env       # -f: no error if it is already gone
 sudo systemctl restart robotx-agent
-curl -s http://127.0.0.1:8000/backend | jq '{authenticated, auth_method, pairing_code, credential}'
+curl -s http://127.0.0.1:8000/backend | jq '{status, authenticated, auth_method, pairing_code, credential}'
 ```
 
-Expected: `authenticated: true`, `auth_method: "TOKEN"`, `pairing_code: "UNSET"`,
-`credential.token: "SET"`, `credential.path: "/var/lib/robotx/backend_session.json"`.
+Expected: `status: "STREAMING"`, `authenticated: true`, `auth_method: "TOKEN"`,
+`pairing_code: "UNSET"`, `credential.token: "SET"`,
+`credential.path: "/var/lib/robotx/backend_session.json"`. This restart is the
+first proof that the robot reconnects on its saved token, without a code.
 
-The restart is optional: once a code has been accepted the running agent never
-presents it again (`pairing_code: "CONSUMED"` until the restart, `"UNSET"`
-after). Deleting the file still matters: with the code left in `pairing.env`,
-every later boot would present that spent code once if the stored token were
-ever rejected.
+Remove the file even though the code is spent. The agent never presents an
+accepted code again within the same process. But while the code stays in
+`pairing.env`, every later boot would present that spent code once if the
+stored token were ever rejected, and each refusal counts toward the lockout.
 
 Then enable start at boot:
 
 ```bash
 sudo systemctl enable robotx-agent
 ```
+
+### 18.2 Power cycles and reboots
+
+From now on, every start, reboot or power cycle reconnects on its own. The agent
+authenticates with the saved session token. No pairing code is needed and
+nothing is done in the dashboard, **as long as the backend session has not
+expired.** Check it once now:
+
+```bash
+sudo reboot
+# after the Pi is back, in a new SSH session:
+curl -s http://127.0.0.1:8000/backend | jq '{status, authenticated, auth_method, credential}'
+```
+
+Expected: `status: "STREAMING"`, `auth_method: "TOKEN"`, `credential.token: "SET"`.
+The dashboard shows the robot online again. Being online is still not "Ready
+for Tasks".
+
+A dropped network or a backend restart costs nothing either. The link
+reconnects on its own backoff with the same token. A timeout or a disconnect is
+never taken as a rejected token (`backend.token_kept`).
+
+### 18.3 Session lifetime
+
+The session token lasts as long as the backend's durable robot session. The
+backend sets this lifetime with `ROBOT_SESSION_TTL_SEC`. The default is 30 days.
+The allowed range is 3600–7776000 seconds (1 hour to 90 days). It is a backend
+setting: nothing on the Pi changes it.
+
+A robot that was offline for longer than the session lifetime must be enrolled
+again. On reconnect, the backend rejects the token (`AUTH_FAILED
+INVALID_CREDENTIAL`). The Pi discards it (`backend.token_discarded`,
+`credential.token: "UNSET"`) and then has nothing to present. Re-enroll with
+section 17.2 from step 2, then repeat 18.1. A rejected token is never retried,
+and the Pi cannot renew it by itself.
+
+If instead the log keeps showing `backend.auth_failed` followed by
+`backend.token_kept`, the backend is not giving a verdict on the token. Waiting
+will not fix that. Escalate to the backend owner with the `auth_failure` text.
+Do not delete the token file to force a re-enrollment.
 
 ## 19. Loopback API verification
 
