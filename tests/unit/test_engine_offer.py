@@ -864,6 +864,8 @@ class Y2CompletionDelivery(AsyncTestCase):
                     await link._handle_auth_failure()
                 outcomes.append((mode, ok, len(sio.events_named("TASK_COMPLETE"))))
             sio.auth_mode = "success"
+            # Re-enrolled: the refused token is replaced (the spent pairing code is not reused).
+            link.tokens.save(robot_id=link.cfg.robot_id, token="sess-tok")
             ok = await self.reconnect(link, sio)
             return outcomes, ok, len(sio.events_named("TASK_COMPLETE"))
 
@@ -1282,6 +1284,8 @@ class Y2CustodyAndOfferDelivery(AsyncTestCase):
                     await link._handle_auth_failure()
                 counts.append((len(self.custody(sio)), len(sio.events_named("OFFER_ACCEPT"))))
             sio.auth_mode = "success"
+            # Re-enrolled: the refused token is replaced (the spent pairing code is not reused).
+            link.tokens.save(robot_id=link.cfg.robot_id, token="sess-tok")
             await self.reconnect(link, sio)
             return counts, (len(self.custody(sio)), len(sio.events_named("OFFER_ACCEPT")))
 

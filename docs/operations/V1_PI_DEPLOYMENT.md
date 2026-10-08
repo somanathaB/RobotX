@@ -425,8 +425,9 @@ What the unit guarantees:
 - runs as `robotx` with `dialout` and `video`, from `/opt/robotx/RobotX-Pi`;
 - creates `/var/lib/robotx` (mode 0700, owned by `robotx`) for the token and
   commitment files;
-- restarts on failure after 5 s, at most 5 starts in 300 s, then stays failed
-  until `sudo systemctl reset-failed robotx-agent`;
+- restarts on failure indefinitely, with a delay growing from 5 s to 300 s
+  (`RestartSteps=6`, `RestartMaxDelaySec=300`, no start limit), so it never
+  stays failed and never loops tightly; `systemctl stop` stays stopped;
 - waits for time synchronisation (section 15); has no dependency on the UART or
   camera devices (the ESP32 link reconnects by itself).
 
@@ -471,8 +472,10 @@ curl -s http://127.0.0.1:8000/backend | jq '{status, authenticated, auth_method,
 Expected: `authenticated: true`, `auth_method: "PAIRING_CODE"`,
 `credential.token: "SET"`.
 
-If `auth_failure` names a refusal: the code expired or was wrong. Get a new code
-and repeat step 2 — at most a few times: **five failed pairing attempts lock
+If `auth_failure` names a refusal: the code expired or was wrong. The agent
+presents a refused code only once (`pairing_code: "CONSUMED"`), then waits with
+nothing to present. Get a new code and repeat step 2 (`sudoedit`, then
+`sudo systemctl restart robotx-agent`) — at most a few times: **five failed pairing attempts lock
 pairing for this robot for an hour**, and unlocking is a backend override
 (`POST /api/robots/<id>/pairing/unlock`, gated as a quarantine override: elevated
 role, recorded reason and, where configured, a second approver).
@@ -490,9 +493,11 @@ curl -s http://127.0.0.1:8000/backend | jq '{authenticated, auth_method, pairing
 Expected: `authenticated: true`, `auth_method: "TOKEN"`, `pairing_code: "UNSET"`,
 `credential.token: "SET"`, `credential.path: "/var/lib/robotx/backend_session.json"`.
 
-Why the restart: the code stays in the running process's environment until it
-restarts. If the stored token is ever rejected, a configured code is retried
-every 60 s and runs into the five-attempt lockout within minutes.
+The restart is optional: once a code has been accepted the running agent never
+presents it again (`pairing_code: "CONSUMED"` until the restart, `"UNSET"`
+after). Deleting the file still matters: with the code left in `pairing.env`,
+every later boot would present that spent code once if the stored token were
+ever rejected.
 
 Then enable start at boot:
 

@@ -30,10 +30,11 @@ After=network-online.target
 # systemd-time-wait-sync.service (or chrony-wait.service) is enabled.
 Wants=time-sync.target
 After=time-sync.target
-# A crash loop stops here and stays failed until an operator looks:
-#   sudo systemctl reset-failed robotx-agent
-StartLimitIntervalSec=300
-StartLimitBurst=5
+# No start limit: a crashing agent is retried forever, never left failed with
+# nobody at the robot. The restart delay below grows from 5 s to 5 min, so a
+# crash loop is slow, never tight. Each crash is still in the journal
+# (`agent.start_failed`), and `systemctl status` shows the restart count.
+StartLimitIntervalSec=0
 
 [Service]
 Type=exec
@@ -50,8 +51,13 @@ EnvironmentFile=-/etc/robotx/pairing.env
 Environment=PYTHONUNBUFFERED=1
 ExecStart=/opt/robotx/RobotX-Pi/venv/bin/python -m robotx.application
 
+# on-failure, not always: `systemctl stop` (a clean exit) stays stopped.
+# Delays: 5 s, then about 10, 20, 39, 77, 152 s, then 300 s for every later
+# restart.
 Restart=on-failure
 RestartSec=5
+RestartSteps=6
+RestartMaxDelaySec=300
 # An open /camera stream holds the HTTP server's graceful shutdown; after this
 # the process is killed and the agent's own shutdown (final ESP32 STOP) is
 # skipped. Close camera viewers before stopping.

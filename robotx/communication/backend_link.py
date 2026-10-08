@@ -449,6 +449,12 @@ class BackendLink:
         # went out (nothing to present). Reset on every connect, unlike `_auth_method`,
         # which reports the last method used.
         self._attempt_auth_method: Optional[AuthMethod] = None
+        # The configured pairing code is one-time: once the backend has accepted
+        # it (AUTH_SUCCESS) or refused it (INVALID_CREDENTIAL), this process never
+        # presents it again. Re-presenting a spent or refused code only runs into
+        # the backend's pairing lockout. In memory only; cleared by a restart with
+        # a new code.
+        self._pairing_code_consumed = False
         # Incremented once per set of handler registrations. Must stay at 1 for
         # the life of the process; asserted by test.
         self.handler_registrations = 0
@@ -608,7 +614,8 @@ class BackendLink:
 
         An explicitly configured token wins over the stored one, and a stored
         token wins over the pairing code -- the code is single-use with a 300 s
-        TTL, so it is spent only when there is nothing else.
+        TTL, so it is spent only when there is nothing else, and never again once
+        this process has seen the backend accept or refuse it.
         """
 
         if self.cfg.robot_token:
@@ -616,6 +623,8 @@ class BackendLink:
         stored = self.tokens.load(robot_id=self.cfg.robot_id)
         if stored is not None:
             return (stored.token, None)
+        if self._pairing_code_consumed:
+            return (None, None)
         return (None, self.cfg.pairing_code)
 
     # --- connection state -----------------------------------------------------
@@ -969,6 +978,16 @@ class BackendLink:
         self._note_recv()
         if self._authenticated.is_set():
             return
+        if self._attempt_auth_method is AuthMethod.PAIRING_CODE:
+            # Spent by the backend now, whether or not the token below reaches
+            # disk: presenting it again could only be refused.
+            self._pairing_code_consumed = True
+            log_event(
+                logger,
+                "backend.pairing_code_consumed",
+                "pairing code accepted; this process will not present it again. "
+                "Remove ROBOTX_PAIRING_CODE from the environment (pairing.env)",
+            )
         result = parse_auth_success(data)
 
         if result.has_token and result.token:
@@ -1006,9 +1025,10 @@ class BackendLink:
         restart). Discarding a valid token there would strand the robot until a
         person issued a fresh pairing code, so it is kept and retried.
 
-        A refused *pairing code* is kept: it is far more likely to have expired
-        (300 s TTL) than to be wrong, and the operator needs to see which code
-        the robot is still trying.
+        A *pairing code* refused by that same verdict is never presented again
+        by this process (expired or wrong, retrying it only counts toward the
+        backend's pairing lockout); re-enrolment needs a new code and a restart.
+        A pairing attempt with no verdict keeps the code, like a token.
         """
 
         log_event(
@@ -1037,6 +1057,16 @@ class BackendLink:
                     "the stored session token is kept and retried",
                     level=logging.WARNING,
                 )
+        if self._attempt_auth_method is AuthMethod.PAIRING_CODE and self._credential_rejected:
+            self._pairing_code_consumed = True
+            log_event(
+                logger,
+                "backend.pairing_code_rejected",
+                "the backend refused the pairing code (AUTH_FAILED INVALID_CREDENTIAL); "
+                "it will not be presented again. Re-enrolment required: issue a new "
+                "pairing code, put it in pairing.env and restart the agent",
+                level=logging.ERROR,
+            )
 
         sio = self._sio
         if sio is not None:
@@ -1956,7 +1986,11 @@ class BackendLink:
             "auth_method": None if self._auth_method is None else self._auth_method.value,
             "auth_failure": self._auth_failure_detail,
             "credential": self.tokens.describe(robot_id=self.cfg.robot_id),
-            "pairing_code": "SET" if self.cfg.pairing_code else "UNSET",
+            "pairing_code": (
+                "UNSET" if not self.cfg.pairing_code
+                else "CONSUMED" if self._pairing_code_consumed
+                else "SET"
+            ),
             "robot_id": self.cfg.robot_id,
             # Never the key itself. UNSET means no OFFER can be admitted.
             "command_signing_key": "SET" if self._signing_key else "UNSET",

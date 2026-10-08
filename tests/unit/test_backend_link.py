@@ -916,7 +916,7 @@ class TestR1CredentialRetention(AsyncTestCase):
         self.assertTrue(link._credential_rejected)
         self.assertEqual(tokens.clears, 0)
 
-    def test_a_rejected_pairing_code_is_kept(self):
+    def test_a_rejected_pairing_code_is_not_presented_again(self):
         async def scenario():
             tokens = MemoryTokenStore(token=None)
             link, _ = make_link(tokens=tokens, sio=FakeSio(auth_mode="rejected"), pairing_code="654321")
@@ -925,7 +925,8 @@ class TestR1CredentialRetention(AsyncTestCase):
 
         link, tokens = self.run_async(scenario())
         self.assertEqual(tokens.clears, 0)
-        self.assertEqual(link._available_credential(), (None, "654321"))
+        self.assertEqual(link._available_credential(), (None, None))
+        self.assertEqual(link.cfg.pairing_code, "654321")  # configuration untouched
 
     def test_the_run_loop_reconnects_after_a_dropped_auth_with_the_same_token(self):
         async def scenario():
@@ -953,6 +954,148 @@ class TestR1CredentialRetention(AsyncTestCase):
         self.assertEqual(link.stats["auth_successes"], 1)
         self.assertEqual([p.get("token") for p in sio.events_named("AUTH")], ["stored-tok"] * 3)
         self.assertEqual(tokens.clears, 0)
+
+
+class TestPairingCodeIsOneTime(AsyncTestCase):
+    """The pairing code is a one-time enrolment credential: once the backend has
+    accepted it or refused it (INVALID_CREDENTIAL), this process never presents it
+    again. Anything short of that verdict leaves it usable."""
+
+    async def _attempt(self, link):
+        ok = await connect_and_auth(link)
+        if not ok:
+            await link._handle_auth_failure()
+        return ok
+
+    async def _run_for(self, link, seconds):
+        link._running = True
+        task = asyncio.create_task(link._run())
+        await asyncio.sleep(seconds)
+        link._running = False
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    def test_successful_pairing_saves_the_token_and_the_code_is_not_reused(self):
+        async def scenario():
+            tokens = MemoryTokenStore(token=None)
+            sio = FakeSio(auth_token="issued-tok")
+            link, _ = make_link(tokens=tokens, sio=sio, pairing_code="654321")
+            first = await self._attempt(link)
+            await sio.drop()  # e.g. a Wi-Fi blink
+            second = await self._attempt(link)
+            tokens.token = None  # even with the token gone, the spent code stays spent
+            return link, sio, tokens, first, second
+
+        link, sio, tokens, first, second = self.run_async(scenario())
+        self.assertTrue(first)
+        self.assertTrue(second)
+        self.assertEqual(tokens.saves[0], ("robotx-pi", "issued-tok"))
+        self.assertEqual(sio.events_named("AUTH"), [
+            {"robotId": "robotx-pi", "pairingCode": "654321"},
+            {"robotId": "robotx-pi", "token": "issued-tok"},
+        ])
+        self.assertEqual(link._available_credential(), (None, None))
+        self.assertEqual(link.describe()["pairing_code"], "CONSUMED")
+
+    def test_auth_ok_also_consumes_the_code(self):
+        async def scenario():
+            link, _ = make_link(tokens=MemoryTokenStore(token=None), sio=FakeSio(auth_mode="ok_event"))
+            ok = await self._attempt(link)
+            return link, ok
+
+        link, ok = self.run_async(scenario())
+        self.assertTrue(ok)
+        self.assertTrue(link._pairing_code_consumed)
+
+    def test_transient_failures_keep_the_pairing_code(self):
+        for mode in ("none", "silent_disconnect", "explode", "failed"):
+            with self.subTest(mode=mode):
+                async def scenario():
+                    link, _ = make_link(tokens=MemoryTokenStore(token=None), sio=FakeSio(auth_mode=mode),
+                                        pairing_code="654321", auth_timeout_s=0.05)
+                    ok = await self._attempt(link)
+                    return link, ok
+
+                link, ok = self.run_async(scenario())
+                self.assertFalse(ok)
+                self.assertEqual(link._available_credential(), (None, "654321"))
+                self.assertEqual(link.describe()["pairing_code"], "SET")
+
+    def test_connection_errors_keep_the_pairing_code(self):
+        async def scenario():
+            sio = FakeSio(fail_connect=ConnectionError("Name or service not known"))
+            link, _ = make_link(tokens=MemoryTokenStore(token=None), sio=sio, pairing_code="654321",
+                                backoff_initial_s=0.01, backoff_max_s=0.02)
+            await self._run_for(link, 0.1)
+            return link
+
+        link = self.run_async(scenario())
+        self.assertGreater(link.stats["connect_failures"], 1)
+        self.assertEqual(link._available_credential(), (None, "654321"))
+
+    def test_an_explicitly_refused_code_is_submitted_exactly_once(self):
+        async def scenario():
+            sio = FakeSio(auth_mode="rejected")
+            link, _ = make_link(tokens=MemoryTokenStore(token=None), sio=sio, pairing_code="654321",
+                                backoff_auth_failed_s=0.01, backoff_initial_s=0.01, backoff_max_s=0.02)
+            await self._run_for(link, 0.3)
+            return link, sio
+
+        link, sio = self.run_async(scenario())
+        self.assertGreater(link.stats["auth_failures"], 1)  # the loop kept running
+        self.assertEqual(sio.events_named("AUTH"), [{"robotId": "robotx-pi", "pairingCode": "654321"}])
+        self.assertEqual(link.describe()["pairing_code"], "CONSUMED")
+
+    def test_a_valid_stored_token_means_the_code_is_never_used(self):
+        async def scenario():
+            tokens = MemoryTokenStore(token="stored-tok")
+            link, sio = make_link(tokens=tokens, sio=FakeSio(auth_token="stored-tok"), pairing_code="654321")
+            ok = await self._attempt(link)
+            return link, sio, ok
+
+        link, sio, ok = self.run_async(scenario())
+        self.assertTrue(ok)
+        self.assertTrue(all("pairingCode" not in p for p in sio.events_named("AUTH")))
+        self.assertFalse(link._pairing_code_consumed)
+
+    def test_a_refused_token_falls_back_to_an_unused_code(self):
+        async def scenario():
+            tokens = MemoryTokenStore(token="stale-tok")
+            sio = SequencedSio(["rejected", "success"], auth_token="fresh-tok")
+            link, _ = make_link(tokens=tokens, sio=sio, pairing_code="654321")
+            first = await self._attempt(link)
+            second = await self._attempt(link)
+            return link, sio, tokens, first, second
+
+        link, sio, tokens, first, second = self.run_async(scenario())
+        self.assertFalse(first)
+        self.assertTrue(second)
+        self.assertEqual(sio.events_named("AUTH")[1], {"robotId": "robotx-pi", "pairingCode": "654321"})
+        self.assertEqual(tokens.saves, [("robotx-pi", "fresh-tok")])
+
+    def test_a_refused_token_never_falls_back_to_a_consumed_code(self):
+        async def scenario():
+            tokens = MemoryTokenStore(token=None)
+            sio = SequencedSio(["success", "rejected"], auth_token="issued-tok")
+            link, _ = make_link(tokens=tokens, sio=sio, pairing_code="654321",
+                                backoff_auth_failed_s=0.01, backoff_initial_s=0.01, backoff_max_s=0.02)
+            await self._attempt(link)  # enrolment spends the code
+            await sio.drop()
+            sio.auth_mode = "rejected"
+            await self._run_for(link, 0.3)  # the token is refused, then nothing is left
+            return link, sio, tokens
+
+        link, sio, tokens = self.run_async(scenario())
+        self.assertEqual(tokens.clears, 1)
+        self.assertEqual(sio.events_named("AUTH"), [
+            {"robotId": "robotx-pi", "pairingCode": "654321"},
+            {"robotId": "robotx-pi", "token": "issued-tok"},
+        ])
+        self.assertGreater(link.stats["auth_failures"], 1)
+        self.assertEqual(link._available_credential(), (None, None))
 
 
 class TestR1AuthFailureBackoff(AsyncTestCase):
