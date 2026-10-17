@@ -264,7 +264,16 @@ class TestStatusTransitions(unittest.TestCase):
         st = link.status()
         self.assertIs(st.link, S.STALE)
         self.assertIn("no TELEMETRY", st.detail)
+        self.assertFalse(st.controller.bidirectional)        # RX-24: the proof is gone
+        sent = len(port.commands())
         port.feed(fx.telemetry(uptime_ms=3590000))
+        link.poll_once()
+        st = link.status()
+        self.assertIs(st.link, S.CONNECTING)                 # fresh TELEMETRY alone is not enough
+        self.assertIn("re-proving", st.detail)
+        new = port.commands()[sent:]
+        self.assertEqual([c["cmd"] for c in new], ["PING"])  # motion disabled: no STOP, only the PING
+        port.feed(fx.ack(new[-1]["seq"]))
         link.poll_once()
         self.assertIs(link.status().link, S.UP)
 
@@ -900,6 +909,281 @@ class TestLifecycle(unittest.TestCase):
         time.sleep(0.2)
         link.stop()
         self.assertGreater(len(attempts), 2)
+
+
+class _Esp:
+    """A minimal ESP32 stand-in on a FakePort, for the recovery tests (RX-24/25).
+
+    Live: it ACKs every command the link wrote, in order, and sends TELEMETRY
+    every 100 ms. Stalled: it sends nothing and HOLDS what the link writes, as a
+    real ESP32 whose loop() is blocked holds bytes in its UART RX buffer. On
+    resume it first processes everything it held, in order -- applying each
+    DRIVE/STOP to `output` and ACKing it (late: the link has long expired
+    them) -- exactly what its commPoll() does before its next TELEMETRY.
+    """
+
+    def __init__(self, link, port, clock):
+        self.link, self.port, self.clock = link, port, clock
+        self.seen = len(port.commands())
+        self.stalled = False
+        self.uptime = 3_600_000
+        self.output = (0, 0)
+
+    def consume(self, answer=True, then=b""):
+        """Process what the link wrote; the answers (and `then`) arrive as one read."""
+        cmds = self.port.commands()
+        out = b""
+        for c in cmds[self.seen:]:
+            if c["cmd"] == "DRIVE":
+                self.output = (c["left"], c["right"])
+            elif c["cmd"] in ("STOP", "RESET"):
+                self.output = (0, 0)
+            if answer:
+                out += fx.ack(c["seq"], cmd=c["cmd"])
+        self.seen = len(cmds)
+        if out + then:
+            self.port.feed(out + then)
+
+    def step(self, intent, answer=True):
+        """One 100 ms agent tick: submit, (telemetry), poll, (ESP32 answers), poll."""
+        self.clock.advance(0.1)
+        self.uptime += 100
+        self.link.submit(fx.decision(intent))
+        if not self.stalled:
+            self.port.feed(fx.telemetry(motor_drive_available=True, uptime_ms=self.uptime))
+        self.link.poll_once()
+        if not self.stalled:
+            self.consume(answer)
+        self.link.poll_once()
+
+    def resume(self):
+        """Back from a stall: process the held commands, then send TELEMETRY."""
+        self.stalled = False
+        self.uptime += 100
+        self.consume(then=fx.telemetry(motor_drive_available=True, uptime_ms=self.uptime))
+
+
+class TestLinkRecovery(unittest.TestCase):
+    """RX-24: a proven link that goes silent must re-prove itself and recover.
+    RX-25: a DRIVE buffered in a stalled ESP32 must be followed by a STOP."""
+
+    def up(self, intent):
+        link, port, clock = fresh(motion_enabled=True)
+        link.poll_once()
+        port.feed(fx.telemetry(motor_drive_available=True, last_seq=None))
+        link.poll_once()
+        port.feed(fx.ack(1))
+        link.poll_once()
+        self.assertIs(link.status().link, S.UP)
+        esp = _Esp(link, port, clock)
+        for _ in range(20):                                 # 2 s healthy
+            esp.step(intent)
+        st = link.status()
+        self.assertIs(st.link, S.UP)
+        self.assertTrue(st.motion_ready)
+        return link, port, clock, esp
+
+    def stall(self, esp, intent, seconds):
+        esp.stalled = True
+        for _ in range(int(round(seconds * 10))):
+            esp.step(intent)
+
+    def recover(self, esp, intent, limit_s=1.0):
+        """Resume, then tick until UP. Returns (seconds to UP, status when the
+        resumed ESP32's late ACKs and first TELEMETRY had just been processed)."""
+        t_resume = esp.clock()
+        esp.resume()
+        esp.link.poll_once()
+        first = esp.link.status()
+        for _ in range(int(limit_s * 10) + 1):
+            if esp.link.status().link is S.UP:
+                break
+            esp.step(intent)
+        return esp.clock() - t_resume, first
+
+    def test_idle_stall_is_reproven_within_one_second(self):
+        """The audit probe: an idle agent (STOP every 100 ms), 1.5 s of ESP32 silence."""
+        hold = MotionIntent.hold("idle")
+        link, port, clock, esp = self.up(hold)
+        mark = len(port.commands())
+
+        self.stall(esp, hold, 1.5)
+        st = link.status()
+        self.assertIn(st.link, (S.DEGRADED, S.STALE))
+        self.assertFalse(st.motion_ready)
+        self.assertFalse(st.controller.bidirectional)
+
+        took, first = self.recover(esp, hold)
+        self.assertIsNot(first.link, S.UP, "late ACKs + fresh TELEMETRY restored UP without a new PING")
+        self.assertFalse(first.motion_ready)
+        st = link.status()
+        self.assertIs(st.link, S.UP, f"not re-proven: {st.link.value} ({st.detail})")
+        self.assertTrue(st.motion_ready)
+        self.assertLessEqual(took, 1.0, f"re-proof took {took:.1f} s after the ESP32 returned")
+
+        since = port.commands()[mark:]
+        self.assertNotIn("DRIVE", [c["cmd"] for c in since])
+        self.assertIn("PING", [c["cmd"] for c in since])
+        c = st.controller.counters
+        self.assertEqual(c.link_losses, 1)
+        self.assertGreaterEqual(c.reprobe_pings, 1)
+        self.assertEqual(c.recovery_stops, 0)               # only STOPs were ever sent
+
+    def test_stall_while_driving_buffered_drive_is_followed_by_stop(self):
+        """RX-25: DRIVEs written into a stalled ESP32 are followed, in its buffer, by a STOP."""
+        fwd = MotionIntent.forward(0.5)
+        link, port, clock, esp = self.up(fwd)
+        self.assertNotEqual(esp.output, (0, 0))
+        mark = len(port.commands())
+
+        self.stall(esp, fwd, 1.5)
+        held = port.commands()[mark:]
+        names = [c["cmd"] for c in held]
+        self.assertIn("DRIVE", names)                       # sent while still UP
+        last_drive = max(i for i, n in enumerate(names) if n == "DRIVE")
+        after = names[last_drive + 1:]
+        self.assertTrue(after and after[0] == "STOP",
+                        f"no STOP right behind the last DRIVE in the ESP32 buffer: {names}")
+        self.assertNotIn("DRIVE", after)
+        self.assertEqual(link.status().controller.counters.recovery_stops, 1)
+
+        took, first = self.recover(esp, fwd)
+        # What the resumed ESP32 did with its buffer: the DRIVEs, then the STOP.
+        # Without the recovery STOP the stale DRIVE would run until its 2 s watchdog.
+        self.assertIsNot(first.link, S.UP)
+        st = link.status()
+        self.assertIs(st.link, S.UP, f"not re-proven: {st.link.value} ({st.detail})")
+        self.assertLessEqual(took, 1.0)
+
+        # No DRIVE left the Pi between the loss and the matched PING ACK.
+        cmds = port.commands()[mark:]
+        reproof = max(i for i, c in enumerate(cmds) if c["cmd"] == "PING")
+        loss = last_drive + 1
+        self.assertNotIn("DRIVE", [c["cmd"] for c in cmds[loss:reproof + 1]])
+
+    def test_resumed_esp32_is_stopped_before_it_answers_anything(self):
+        fwd = MotionIntent.forward(0.5)
+        link, port, clock, esp = self.up(fwd)
+        self.stall(esp, fwd, 1.5)
+        esp.stalled = False
+        esp.consume()                                       # the buffer, processed in order
+        self.assertEqual(esp.output, (0, 0), "the resumed ESP32 is left executing a stale DRIVE")
+
+    def test_stale_or_unmatched_acks_cannot_restore_readiness(self):
+        fwd = MotionIntent.forward(0.5)
+        link, port, clock, esp = self.up(fwd)
+        mark = len(port.commands())
+        self.stall(esp, fwd, 1.5)
+        old = port.commands()[mark:]
+
+        # The ESP32 is back, but nothing it says answers a live PING.
+        esp.stalled = False
+        esp.seen = len(port.commands())                     # answer nothing automatically
+        port.feed(
+            b"".join(fx.ack(c["seq"], cmd=c["cmd"]) for c in old)  # late ACKs of the held commands
+            + fx.ack(60000) + fx.ack(12345, cmd="STOP")              # ACKs for nothing ever sent
+            + fx.telemetry(motor_drive_available=True, uptime_ms=esp.uptime + 100)
+        )
+        link.poll_once()
+        st = link.status()
+        self.assertIsNot(st.link, S.UP)
+        self.assertFalse(st.motion_ready)
+
+        sent = port.commands()[len(old) + mark:]
+        ping = [c for c in sent if c["cmd"] == "PING"][-1]
+        stops = [c for c in sent if c["cmd"] == "STOP"]
+        self.assertTrue(stops, "no STOP ahead of the re-probe PING after a DRIVE")
+
+        # A matched STOP ACK is genuine, but it proves nothing about PING.
+        port.feed(fx.ack(stops[-1]["seq"], cmd="STOP")
+                  + fx.telemetry(motor_drive_available=True, uptime_ms=esp.uptime + 200))
+        link.poll_once()
+        self.assertIsNot(link.status().link, S.UP)
+
+        # A non-ACCEPTED answer to the live PING proves nothing either.
+        port.feed(fx.ack(ping["seq"], result="DUPLICATE", reason="DUPLICATE_SEQ"))
+        link.poll_once()
+        self.assertIsNot(link.status().link, S.UP)
+        self.assertFalse(link.status().motion_ready)
+
+        # A PING answered too late: expired, so unmatched.
+        clock.advance(0.1)
+        port.feed(fx.telemetry(motor_drive_available=True, uptime_ms=esp.uptime + 300))
+        link.poll_once()
+        ping2 = [c for c in port.commands() if c["cmd"] == "PING"][-1]
+        clock.advance(0.6)                                  # past ack_timeout_s
+        port.feed(fx.telemetry(motor_drive_available=True, uptime_ms=esp.uptime + 900))
+        link.poll_once()
+        port.feed(fx.ack(ping2["seq"]))
+        link.poll_once()
+        st = link.status()
+        if ping2["seq"] == [c for c in port.commands() if c["cmd"] == "PING"][-1]["seq"]:
+            self.fail("the expired PING was not replaced by a new one")
+        self.assertIsNot(st.link, S.UP, "an expired PING's ACK restored the link")
+
+        # Only a matched, in-time, ACCEPTED PING ACK does.
+        live = [c for c in port.commands() if c["cmd"] == "PING"][-1]
+        port.feed(fx.ack(live["seq"]))
+        link.poll_once()
+        st = link.status()
+        self.assertIs(st.link, S.UP)
+        self.assertTrue(st.motion_ready)
+
+    def test_esp32_that_never_returns_stays_safely_down(self):
+        fwd = MotionIntent.forward(0.5)
+        link, port, clock, esp = self.up(fwd)
+        mark = len(port.commands())
+        esp.stalled = True
+        ready_after_loss = 0
+        lost = False
+        for _ in range(300):                                # 30 s of silence
+            esp.step(fwd)
+            st = link.status()
+            lost = lost or not st.controller.bidirectional
+            if lost and st.motion_ready:
+                ready_after_loss += 1
+        st = link.status()
+        self.assertIs(st.link, S.STALE)
+        self.assertFalse(st.motion_ready)
+        self.assertEqual(ready_after_loss, 0)
+        names = [c["cmd"] for c in port.commands()[mark:]]
+        last_drive = max(i for i, n in enumerate(names) if n == "DRIVE")
+        # Bounded: the one recovery STOP behind the last DRIVE, then nothing --
+        # no re-probe PING, as no TELEMETRY has arrived since the loss.
+        self.assertEqual(names[last_drive + 1:], ["STOP"])
+        c = st.controller.counters
+        self.assertEqual((c.link_losses, c.recovery_stops, c.reprobe_pings), (1, 1, 0))
+
+    def test_no_reprobe_ping_without_telemetry_since_the_loss(self):
+        """status() on another thread may see STALE with a later clock than the
+        I/O thread, whose next pass still finds the last frame 'fresh'. That
+        frame predates the loss: it must not trigger a re-probe PING."""
+        fwd = MotionIntent.forward(0.5)
+        link, port, clock, esp = self.up(fwd)
+        mark = len(port.commands())
+        io_now = clock()
+        clock.advance(1.05)                                 # the status() caller's clock
+        self.assertIs(link.status().link, S.STALE)
+        clock.t = io_now + 0.05                             # the I/O thread's, a moment earlier
+        link.poll_once()
+        self.assertEqual(port.command_names()[mark:], ["STOP"])
+        esp.stalled = False
+        esp.step(fwd)                                       # new TELEMETRY: now re-probe
+        self.assertIn("PING", port.command_names()[mark:])
+
+    def test_receive_only_link_is_unaffected(self):
+        link, port, clock = fresh(transmit_enabled=False)
+        link.poll_once()
+        port.feed(fx.REAL_TELEMETRY)
+        link.poll_once()
+        self.assertIs(link.status().link, S.UP)
+        clock.advance(1.5)
+        link.poll_once()
+        self.assertIs(link.status().link, S.STALE)
+        port.feed(fx.telemetry(uptime_ms=3590000))
+        link.poll_once()
+        self.assertIs(link.status().link, S.UP)             # nothing to re-prove: it never transmits
+        self.assertEqual(port.writes, [])
 
 
 if __name__ == "__main__":

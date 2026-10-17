@@ -243,6 +243,11 @@ class Settings:
     obstacle_min_area_px: int = 1500
     # Fraction of frame width treated as the robot's collision corridor.
     obstacle_center_zone_ratio: float = 0.33
+    # After an obstacle stop: seconds of continuous clear, usable perception
+    # before moving again (robotx.control.obstacle_recovery).
+    obstacle_clear_hold_s: float = 2.0
+    # One blocked episode this long pauses the mission for an operator.
+    obstacle_assist_after_s: float = 30.0
     # Steering: full-scale turn at this heading error (degrees).
     steering_full_scale_deg: float = 45.0
 
@@ -465,6 +470,8 @@ class Settings:
             obstacle_slow_area_px=_get_int(e, "ROBOTX_OBSTACLE_SLOW_AREA_PX", d.obstacle_slow_area_px),
             obstacle_min_area_px=_get_int(e, "ROBOTX_OBSTACLE_MIN_AREA_PX", d.obstacle_min_area_px),
             obstacle_center_zone_ratio=_get_float(e, "ROBOTX_OBSTACLE_CENTER_ZONE_RATIO", d.obstacle_center_zone_ratio),
+            obstacle_clear_hold_s=_get_positive_float(e, "ROBOTX_OBSTACLE_CLEAR_HOLD_S", d.obstacle_clear_hold_s),
+            obstacle_assist_after_s=_get_positive_float(e, "ROBOTX_OBSTACLE_ASSIST_AFTER_S", d.obstacle_assist_after_s),
             steering_full_scale_deg=_get_float(e, "ROBOTX_STEERING_FULL_SCALE_DEG", d.steering_full_scale_deg),
             deadreckon_enabled=_get_bool(e, "ROBOTX_DEADRECKON_ENABLED", d.deadreckon_enabled),
             local_origin_lat=_get_opt_float(e, "ROBOTX_LOCAL_ORIGIN_LAT", d.local_origin_lat),

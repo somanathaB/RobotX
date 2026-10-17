@@ -9,11 +9,24 @@ thread that closes, so nothing can ever read from a closed port.
 What the link will transmit, and when
 -------------------------------------
 - A lone LF on every (re)open: the documented resynchronisation (PROTOCOL.md
-  section 12). Never anything else unprompted.
+  section 12).
 - One PING per connection, once fresh TELEMETRY has arrived, to prove the
   Pi -> ESP32 direction before the link calls itself UP. Retried while
   unanswered, but only while telemetry is fresh: a PING queued into an ESP32
   blocked in its boot I2C scan would only pile up in its RX buffer.
+- RE-PROOF after a loss (RX-24). A proven link that goes STALE, or DEGRADED
+  on unanswered commands, has lost its proof: it is no longer bidirectional,
+  and must answer a NEW PING -- matched and in time -- before it is UP and
+  can carry motion again. The re-probe PING waits for a TELEMETRY frame that
+  arrived AFTER the loss: no PING is aimed at an ESP32 that has shown no life
+  since. While re-proving, a timed-out PING is retried at once (still one at
+  a time, still only on fresh TELEMETRY), so recovery follows the ESP32's
+  return within one ACK timeout. A late ACK is unmatched and proves nothing.
+- A recovery STOP (RX-25), only when a DRIVE was written that no ACCEPTED
+  STOP has confirmed since: once at the moment the proof is lost -- so it
+  queues in the ESP32's RX buffer BEHIND any DRIVE a stalled ESP32 has not
+  processed yet -- and before each PING sent while that is still unconfirmed.
+  Never a DRIVE, never a RESET: recovery can only ask for less motion.
 - RESET, only on an explicit operator request (`request_reset`), once, and
   only while the link is UP, bidirectional and fresh with no reboot latched.
   Never retried, never queued for later, never replayed after a reconnect.
@@ -234,6 +247,19 @@ class Esp32Link:
 
         self._motion_slot: Optional[Tuple[str, Dict[str, int], float]] = None
         self._motion_sent = False
+        # RX-24 / RX-25. `_recovering`: this connection was proven and lost its
+        # proof; it re-proves with a PING. `_unconfirmed_drive`: a DRIVE was
+        # written and no ACCEPTED STOP (or RESET) has been ACKed since -- the
+        # ESP32 may still hold or act on it. Deliberately NOT cleared on a
+        # reconnect: reopening the Pi's port does not empty the ESP32's RX
+        # buffer. `_recovery_stop_due`: write one STOP on the next pass.
+        # `_telemetry_at_loss`: the TELEMETRY count when the proof was lost;
+        # the re-probe PING waits for a frame beyond it. A count, not a time:
+        # status() may detect the loss on another thread with a later clock.
+        self._recovering = False
+        self._telemetry_at_loss = 0
+        self._unconfirmed_drive = False
+        self._recovery_stop_due = False
         # The operator RESET (`request_reset`): one at a time, written once,
         # never retried and never replayed. REQUESTED until the I/O thread
         # writes it, SENT until its ACK, then the outcome.
@@ -434,6 +460,8 @@ class Esp32Link:
         self._seq_synced = False
         self._consecutive_timeouts = 0
         self._telemetry_this_connection = False
+        self._recovering = False
+        self._recovery_stop_due = False
         self._drop_pending_reset("the connection was reset before the RESET was acknowledged")
 
     # --- receive ---------------------------------------------------------------
@@ -539,12 +567,21 @@ class Esp32Link:
             self._finish_reset(data["result"], data["reason"])
         if data["result"] == "REJECTED" and data["reason"] == "STALE_SEQ":
             self._seq.resync(data.get("last_seq"))
+        if cmd in ("STOP", "RESET") and data["result"] == "ACCEPTED":
+            # The ESP32 processed a stop AFTER every DRIVE written before it:
+            # nothing it still holds can be a DRIVE from us.
+            self._unconfirmed_drive = False
         if cmd == "PING" and seq == self._ping_seq:
             self._ping_seq = None
             self._ping_rtt_ms = (now - sent_at) * 1000.0
             if data["result"] == "ACCEPTED":
                 self._note_proto(data.get("proto"), "PING ACK")
                 self._bidirectional = self._proto_problem is None
+                if self._bidirectional and self._recovering:
+                    self._recovering = False
+                    log_event(logger, "esp32.link_reproven",
+                              "a fresh PING was answered in time; the link may carry motion again",
+                              rtt_ms=round(self._ping_rtt_ms, 1))
             else:
                 self._ping_next_at = now  # e.g. STALE_SEQ after resync: try again
         elif data["result"] in ("REJECTED", "DUPLICATE"):
@@ -605,6 +642,10 @@ class Esp32Link:
                 self._consecutive_timeouts += 1
                 if seq == self._ping_seq:
                     self._ping_seq = None
+                    if self._recovering:
+                        # Re-proving: try again as soon as TELEMETRY is fresh,
+                        # not after ping_retry_s. Still one PING at a time.
+                        self._ping_next_at = now
                 if seq == self._reset_seq:
                     self._finish_reset("TIMEOUT", f"no ACK within {self.cfg.ack_timeout_s:g} s")
 
@@ -632,6 +673,7 @@ class Esp32Link:
             detail = f"no TELEMETRY for {age:.1f}s"
             if self._reboot_latched:
                 detail += f"; ESP32 rebooted ({self._reboot_reason}), motion held until acknowledged"
+            self._lose_proof(detail)
             self._set_status(Esp32LinkStatus.STALE, detail)
         elif self._reboot_latched:
             self._set_status(Esp32LinkStatus.DEGRADED,
@@ -639,18 +681,51 @@ class Esp32Link:
         elif self._proto_problem is not None:
             self._set_status(Esp32LinkStatus.DEGRADED, self._proto_problem)
         elif self._consecutive_timeouts >= self.cfg.max_consecutive_ack_timeouts:
-            self._set_status(Esp32LinkStatus.DEGRADED,
-                             f"{self._consecutive_timeouts} consecutive commands unanswered")
+            detail = f"{self._consecutive_timeouts} consecutive commands unanswered"
+            self._lose_proof(detail)
+            if self._recovering:
+                detail += "; re-proving with PING"
+            self._set_status(Esp32LinkStatus.DEGRADED, detail)
         elif not self._telemetry_this_connection:
             self._set_status(Esp32LinkStatus.CONNECTING,
                              "port open; waiting for TELEMETRY (the ESP32 boot I2C scan can take ~2 min)")
         elif self.cfg.transmit_enabled and not self._bidirectional:
-            self._set_status(Esp32LinkStatus.CONNECTING, "TELEMETRY arriving; waiting for PING ACK")
+            self._set_status(Esp32LinkStatus.CONNECTING,
+                             "TELEMETRY arriving; re-proving the link with PING after a loss"
+                             if self._recovering else "TELEMETRY arriving; waiting for PING ACK")
         else:
             self._set_status(
                 Esp32LinkStatus.UP,
                 "bidirectional" if self.cfg.transmit_enabled else "receive-only (transmit disabled)",
             )
+
+    def _lose_proof(self, why: str) -> None:
+        """A proven link has stopped proving itself: re-prove before motion. Lock held.
+
+        Idempotent: acts only on a bidirectional link, so it runs once per loss.
+        It never sends anything itself; `_transmit` writes the recovery STOP
+        (when a DRIVE may be outstanding) and the re-probe PING.
+        """
+
+        if not self.cfg.transmit_enabled or not self._bidirectional:
+            return
+        self._bidirectional = False
+        self._recovering = True
+        self._ping_next_at = 0.0                 # re-probe on the next new TELEMETRY
+        self._telemetry_at_loss = self._counters["telemetry"]
+        self._counters["link_losses"] += 1
+        if self.cfg.motion_enabled and self._unconfirmed_drive:
+            self._recovery_stop_due = True
+        log_event(logger, "esp32.link_proof_lost", why, level=logging.WARNING,
+                  recovery_stop=self._recovery_stop_due)
+
+    def _recovery_stop(self, now: float) -> Tuple[Optional[str], bytes]:
+        """One STOP frame for recovery, registered as pending. Lock held."""
+
+        seq = self._seq.next()
+        self._pending[seq] = ("STOP", now)
+        self._counters["recovery_stops"] += 1
+        return "STOP", encode_command(seq, "STOP")
 
     def _set_status(self, status: Esp32LinkStatus, detail: str) -> None:
         """Lock held."""
@@ -863,6 +938,19 @@ class Esp32Link:
             self._resync_sent = True
 
         with self._lock:
+            # RX-25: the proof was just lost after a DRIVE nobody has seen
+            # stopped. One STOP, now -- possibly into a silent ESP32, which is
+            # the point: it queues BEHIND whatever DRIVE is still in its RX
+            # buffer. Not limited by max_pending (the table is likely full of
+            # the unanswered commands that caused the loss); once per loss.
+            # Not after a reboot: that emptied the ESP32's buffer.
+            stopped_now = False
+            if self._recovery_stop_due:
+                self._recovery_stop_due = False
+                if self.cfg.motion_enabled and not self._reboot_latched:
+                    frames.append(self._recovery_stop(now))
+                    stopped_now = True
+
             if (
                 self._seq_synced
                 and self._telemetry_fresh(now)
@@ -872,12 +960,19 @@ class Esp32Link:
                 and self._proto_problem is None
                 and now >= self._ping_next_at
                 and len(self._pending) < self.cfg.max_pending
+                and (not self._recovering or self._counters["telemetry"] > self._telemetry_at_loss)
             ):
+                # A DRIVE still unconfirmed by a STOP: stop first, then prove
+                # (unless the loss STOP above is already that STOP).
+                if self.cfg.motion_enabled and self._unconfirmed_drive and not stopped_now:
+                    frames.append(self._recovery_stop(now))
                 seq = self._seq.next()
                 frames.append(("PING", encode_command(seq, "PING")))
                 self._pending[seq] = ("PING", now)
                 self._ping_seq = seq
                 self._ping_next_at = now + self.cfg.ping_retry_s
+                if self._recovering:
+                    self._counters["reprobe_pings"] += 1
 
             slot, self._motion_slot = self._motion_slot, None
             if slot is not None:
@@ -889,6 +984,8 @@ class Esp32Link:
                     frames.append((cmd, encode_command(seq, cmd, **fields)))
                     self._pending[seq] = (cmd, now)
                     self._motion_sent = True
+                    if cmd == "DRIVE":
+                        self._unconfirmed_drive = True
 
             # An operator RESET goes out once, if the link still allows it at
             # the moment of writing; otherwise it is dropped, never deferred.

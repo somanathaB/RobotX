@@ -453,17 +453,19 @@ class TestGpsHeadingAfterRotation(AgentTestCase):
         self.assertIsNotNone(agent.state.snapshot().position.heading_deg)
         return agent
 
-    def test_an_executed_pivot_invalidates_the_heading(self):
+    def test_an_off_centre_obstacle_stops_without_pivoting_and_keeps_the_heading(self):
+        # RX-09: this obstacle used to produce an avoidance pivot (and so lose
+        # the heading). It is now a STOP: nothing rotates, the heading stays.
         agent = self.driving_north()
         left, _ = center_zone(640, agent.decision.cfg.center_zone_ratio)
-        agent.perception.set_detection(area=5000, cx=left + 5)   # avoidance: pivot right
-        pivot = agent.tick().motion_intent
-        self.assertLess(pivot.left * pivot.right, 0, "the gated intent is a pivot")
+        agent.perception.set_detection(area=5000, cx=left + 5)
+        stopped = agent.tick().motion_intent
+        self.assertTrue(stopped.is_stop)
+        self.assertEqual((stopped.left, stopped.right), (0.0, 0.0))
         agent.perception.set_clear()
         snapshot = agent.tick()                                  # same place: nothing moved
-        self.assertIsNone(snapshot.position.heading_deg)
-        self.assertIsNone(snapshot.navigation.heading_error_deg)
-        self.assertEqual(snapshot.motion_intent.reason, "no heading: creeping to establish GPS track")
+        self.assertAlmostEqual(snapshot.position.heading_deg, 0.0, delta=1.0)
+        self.assertIsNotNone(snapshot.navigation.heading_error_deg)
 
     def test_merely_stopping_keeps_the_heading(self):
         agent = self.driving_north()

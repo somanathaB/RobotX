@@ -9,6 +9,10 @@ Perception that is stale, errored, or has no frame is NOT "the path is clear" --
 it is a STOP. A person in view is a STOP regardless of distance. Only an
 explicitly usable perception result with a clear corridor allows forward motion.
 
+Every intent this layer produces has both wheel commands >= 0: it stops,
+holds, or drives forward (steering by slowing one side). It never pivots or
+reverses -- there is no rear sensing it could rely on to do so.
+
 Obstacle proximity is judged by bounding-box area in pixels, which is a coarse
 proxy for "close", not a measurement. The camera is monocular; see
 `robotx.perception.types` for why no distance is reported anywhere.
@@ -166,6 +170,17 @@ class DecisionMaker:
         return max(candidates, key=lambda d: d.area_px)
 
     def _avoid(self, obstacle: Detection, perception: PerceptionResult) -> MotionIntent:
+        """Every obstacle in the drive corridor is a STOP (RX-09).
+
+        There is deliberately no avoidance manoeuvre. Turning away in place
+        drives one side backwards, which the ESP32 refuses -- and reports as a
+        fault -- when its rear sensing is not configured or not healthy; and a
+        pivot is invisible to the GPS heading, so the route is lost after it.
+        The rover waits instead: `robotx.control.obstacle_recovery` decides when
+        the path has been clear long enough to move on, and when to ask for an
+        operator. Every reason here contains "obstacle": the agent relies on it.
+        """
+
         if obstacle.area_px >= self.cfg.stop_area_px:
             return MotionIntent.stop(
                 f"obstacle ahead (area={obstacle.area_px}px)"
@@ -176,15 +191,9 @@ class DecisionMaker:
         if perception.largest_area_delta_px >= self.cfg.slow_area_px:
             return MotionIntent.stop("obstacle growing rapidly")
 
-        # Turn away from whichever side the obstacle sits on.
         frame_width = perception.frame.width if perception.frame else 1
-        if obstacle.cx < frame_width / 2:
-            return MotionIntent.turn_right(
-                self.cfg.turn_speed, f"obstacle left (area={obstacle.area_px}px)"
-            )
-        return MotionIntent.turn_left(
-            self.cfg.turn_speed, f"obstacle right (area={obstacle.area_px}px)"
-        )
+        side = "left of centre" if obstacle.cx < frame_width / 2 else "right of centre"
+        return MotionIntent.stop(f"obstacle in path, {side} (area={obstacle.area_px}px)")
 
     # --- route following -----------------------------------------------------
 

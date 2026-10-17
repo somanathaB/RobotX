@@ -33,6 +33,7 @@ from robotx.config.logging_setup import log_event, setup_logging
 from robotx.config.settings import Settings
 from robotx.control.decision import DecisionConfig, DecisionMaker
 from robotx.control.motion import MotionIntent
+from robotx.control.obstacle_recovery import ObstacleRecovery, ObstacleRecoveryConfig
 from robotx.control.safety import SafetyConfig, SafetyDecision, SafetyGate
 from robotx.diagnostics.health import (
     ComponentHealth,
@@ -117,6 +118,16 @@ _GPS_HEALTH = {
 }
 
 
+
+def _is_obstacle_stop(intent: MotionIntent) -> bool:
+    """Whether a gated intent is a stop for something in the rover's path.
+
+    By reason text, as before: the decision layer's camera stops all say
+    "obstacle" (or "person detected"), and so does the gate's range veto.
+    """
+
+    return intent.is_stop and ("obstacle" in intent.reason or "person detected" in intent.reason)
+
 class RobotAgent:
     """Owns every Pi subsystem and the loop that ties them together."""
 
@@ -137,6 +148,10 @@ class RobotAgent:
         self._esp32_config_error: Optional[str] = None
         # ESP32 reboots already acted on, so each triggers the latch once.
         self._esp32_reboots_handled = 0
+        # Link interruptions already seen: the link's (link_losses, disconnects)
+        # counters. Each new one pauses an active mission, even when the link
+        # lost and re-proved itself between two ticks (see `tick`, step 2b).
+        self._esp32_interruptions_seen = (0, 0)
         # Typed as Any to keep `socketio` out of this module's imports; see
         # `_start_backend_link`. None whenever no backend is configured.
         self.backend: Optional[Any] = None
@@ -166,6 +181,8 @@ class RobotAgent:
         self.missions = MissionManager(self.navigator)
         self.decision = DecisionMaker(DecisionConfig.from_settings(settings))
         self.safety = SafetyGate(SafetyConfig.from_settings(settings))
+        # When an obstacle-stopped rover may move again, and when it asks for help.
+        self.obstacles = ObstacleRecovery(ObstacleRecoveryConfig.from_settings(settings))
         self.health = HealthMonitor(HealthConfig.from_settings(settings))
 
         self._task: Optional[asyncio.Task] = None
@@ -418,6 +435,21 @@ class RobotAgent:
             self.emergency_stop(f"ESP32 rebooted: {status.detail}")
         return status
 
+    def _esp32_interrupted(self, status: Optional[Esp32Status]) -> bool:
+        """Whether the link was lost or reopened since the previous tick.
+
+        Read from the link's own counters, so a loss that was already
+        recovered by the time this tick looked is still seen.
+        """
+
+        if status is None:
+            return False
+        counters = status.controller.counters
+        seen = (counters.link_losses, counters.disconnects)
+        interrupted = seen != self._esp32_interruptions_seen
+        self._esp32_interruptions_seen = seen
+        return interrupted
+
     # --- mission control (local, no backend required) ------------------------
 
     @property
@@ -580,6 +612,8 @@ class RobotAgent:
         # then it may have been turned or carried. A run starts with no heading
         # and establishes one by moving.
         self.position_estimator.reset()
+        # An obstacle episode belongs to the run it happened in.
+        self.obstacles.reset()
 
     def stop_mission(self, reason: str = "operator stop") -> None:
         """Halt: clear the route, drop to STOPPED, and publish a stop intent."""
@@ -592,6 +626,7 @@ class RobotAgent:
         # happened.
         self.missions.abandon(reason)
         self.state.update_mission(self.missions.active)
+        self.obstacles.reset()
         self.state.set_mode(OperatingMode.STOPPED)
         self.state.update_motion_intent(MotionIntent.stop(reason))
         log_event(logger, "mission.stopped", reason=reason)
@@ -614,6 +649,12 @@ class RobotAgent:
         Refuses when there is no route left to resume rather than dropping into
         AUTO with an empty navigator, which would report NAVIGATING with
         nowhere to go. The caller turns this into a FAILED acknowledgement.
+
+        Resuming authorizes nothing by itself. Each tick still needs a usable
+        position (NAVIGATING), usable perception, a clear corridor -- sustained
+        for `obstacle_clear_hold_s` if an obstacle stopped the rover -- the
+        safety gate, and a motion-ready ESP32 link; anything missing holds the
+        rover, and a link that cannot carry motion pauses the mission again.
         """
 
         # The mission manager is asked first: on the drop leg it holds the
@@ -625,6 +666,7 @@ class RobotAgent:
         self._mission_route = route
         if self.navigator.planner.route_length() == 0:
             self.navigator.set_route(route)
+        self.obstacles.restart()
         self.state.clear_error()
         self.state.set_mode(OperatingMode.AUTO)
         log_event(logger, "mission.resumed", reason=reason)
@@ -840,19 +882,28 @@ class RobotAgent:
         #     includes an UP link whose fresh TELEMETRY reports a controller
         #     safety fault (Esp32Link._motion_ready). The pause is not undone
         #     when the fault clears: resuming stays an explicit RESUME.
+        #
+        #     Sampling `motion_ready` once a tick is not enough on its own: the
+        #     link can lose its proof and re-prove itself (RX-24) between two
+        #     ticks, and a mission that never saw it would drive on. So a new
+        #     link loss or disconnect since the last tick pauses too, whatever
+        #     the link says now.
         link = self.esp32
         esp32 = self._update_esp32()
+        interrupted = self._esp32_interrupted(esp32)
         if (
             link is not None
             and esp32 is not None
             and link.cfg.motion_enabled
             and self.state.mode.mission_active
-            and not esp32.motion_ready
+            and (not esp32.motion_ready or interrupted)
         ):
             why = f"{esp32.link.value} ({esp32.detail})"
             telemetry = esp32.controller.telemetry
             if esp32.link.is_up and telemetry is not None and telemetry.safety_faults:
                 why += f"; controller reports {', '.join(telemetry.safety_faults)}"
+            if interrupted and esp32.motion_ready:
+                why = "the link was lost and re-proven since the last tick; now " + why
             self.pause_mission(f"ESP32 cannot carry motion: {why}")
 
         # 2c. Backend link (Y4): its loss policy runs on this loop's own cadence,
@@ -903,6 +954,29 @@ class RobotAgent:
             mission_active=mode.mission_active,
             perception=perception,
         )
+
+        # 5b'. Obstacle recovery (RX-08). An obstacle stop -- the decision
+        #      layer's (camera: obstacle or person) or the gate's (measured
+        #      range) -- opens a blocked episode; motion resumes only after
+        #      `obstacle_clear_hold_s` of clear, usable perception. A held tick
+        #      is re-evaluated as a STOP, so the gate keeps the last word. An
+        #      episode that lasts `obstacle_assist_after_s` pauses the mission
+        #      for an operator. A timer never clears an obstacle.
+        recovery = self.obstacles.update(
+            active=mode.mission_active,
+            obstacle=mode.mission_active and _is_obstacle_stop(safety.intent),
+            perception_usable=perception.is_usable,
+        )
+        if recovery.hold and not safety.intent.is_stop:
+            safety = self.safety.evaluate(
+                MotionIntent.stop(recovery.reason),
+                mission_active=mode.mission_active,
+                perception=perception,
+            )
+        if recovery.assist:
+            why = f"blocked for {recovery.blocked_for_s:.0f}s: operator assistance needed"
+            self.pause_mission(f"obstacle: {why}")
+            self.state.set_mode(OperatingMode.PAUSED, error=f"obstacle: {why}")
         intent = safety.intent
         self.state.update_safety(safety)
         self.state.update_motion_intent(intent)
@@ -927,11 +1001,10 @@ class RobotAgent:
         if intent.left * intent.right < 0:
             self.position_estimator.invalidate_heading()
 
-        # A blocked leg feeds back into rerouting. Read off the gated intent so
-        # a safety veto for a measured obstacle drives rerouting exactly as the
-        # decision layer's vision-based one does.
-        if mode.mission_active and intent.is_stop and "obstacle" in intent.reason:
-            self.navigator.report_blocked()
+        # Obstacle stops are no longer fed into the route planner's blocked
+        # counter: three ticks of one brief obstacle made REROUTE_NEEDED
+        # permanent (RX-08), and nothing on this rover can reroute. Step 5b'
+        # handles them.
 
         # 6. Health, evaluated from a single consistent snapshot
         if now - self._last_health_t >= self.settings.health_interval_s:

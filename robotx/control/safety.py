@@ -170,6 +170,13 @@ class SafetyConfig:
     # silent sensor stops the robot instead of being ignored.
     require_range_sensor: bool = False
 
+    # Whether an intent may drive either side backwards (a reverse or an
+    # in-place pivot). False: nothing on the Pi can see behind the rover, and
+    # the ESP32 refuses reverse -- latching a fault -- without healthy rear
+    # sensing. No layer above produces one today (RX-09); this keeps a future
+    # one from reaching the ESP32 by accident. Deliberately not an env setting.
+    allow_negative_wheels: bool = False
+
     @classmethod
     def from_settings(cls, settings: Any) -> "SafetyConfig":
         return cls(
@@ -314,6 +321,13 @@ class SafetyGate:
 
         if not mission_active:
             return self._veto("mode", "motion requested with no active mission")
+
+        if not self.cfg.allow_negative_wheels and min(intent.left, intent.right) < 0:
+            return self._veto(
+                "negative_wheel",
+                f"{intent.command.value} drives a side backwards "
+                f"(left={intent.left:.2f}, right={intent.right:.2f}); no rear sensing to allow it",
+            )
 
         age = age_s(intent, now)
         if age > self.cfg.max_intent_age_s:

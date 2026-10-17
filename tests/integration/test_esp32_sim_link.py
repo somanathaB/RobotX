@@ -632,13 +632,19 @@ class TestBringUpAgainstRealFirmware(unittest.TestCase):
                       "rejected_lines", "partial_on_open", "bad_crc"):
             self.assertEqual(getattr(counters, field), getattr(frozen, field), field)
         self.assertEqual(end.controller.reboot_count, 0)
-        # The transport itself never failed and was never reopened, and the Pi
-        # sent nothing either.
+        # The transport itself never failed and was never reopened. The Pi sent
+        # exactly one command: the recovery STOP written when the proof was lost
+        # behind an unconfirmed DRIVE (RX-25) -- never a DRIVE, and no re-probe
+        # PING, since there is no fresh TELEMETRY to re-prove against. Its ACK
+        # was dropped with everything else, so it timed out.
         self.assertEqual(counters.disconnects, 0)
         self.assertEqual(counters.open_failures, 0)
         self.assertEqual(len(self.ports), 1)
-        self.assertEqual(counters.commands_sent, on.commands_sent)
-        self.assertEqual(counters.ack_timeouts, 0)
+        self.assertEqual(counters.commands_sent, on.commands_sent + 1)
+        self.assertEqual(counters.recovery_stops, on.recovery_stops + 1)
+        self.assertEqual(counters.link_losses, on.link_losses + 1)
+        self.assertEqual(counters.reprobe_pings, on.reprobe_pings)
+        self.assertEqual(counters.ack_timeouts, 1)
         self.assertEqual(counters.esp32_errors, 0)
 
         # ── Phase 7: the still-running simulator is ended by the link's own close ──

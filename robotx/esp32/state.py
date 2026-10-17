@@ -190,6 +190,9 @@ class LinkCounters:
     stale_commands_dropped: int = 0
     open_failures: int = 0
     disconnects: int = 0
+    link_losses: int = 0          # a proven link lost its proof (STALE / unanswered commands)
+    reprobe_pings: int = 0        # PINGs sent to re-prove a link after a loss
+    recovery_stops: int = 0       # STOPs written behind a possibly-buffered DRIVE during recovery
 
     def to_dict(self) -> Dict[str, int]:
         return dict(self.__dict__)

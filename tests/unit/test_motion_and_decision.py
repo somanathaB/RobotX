@@ -212,15 +212,20 @@ class TestDecisionMaker(unittest.TestCase):
         self.assertIs(intent.command, MotionCommand.STOP)
         self.assertIn("obstacle ahead", intent.reason)
 
-    def test_obstacle_left_of_center_turns_right(self):
+    # RX-09: these two used to pivot away (TURN_RIGHT / TURN_LEFT), driving one
+    # side backwards into a rover with no rear sensing. They stop instead.
+    def test_obstacle_left_of_center_stops_instead_of_pivoting(self):
         left, _ = center_zone(FRAME_W, 0.33)
         intent = self.decide(perception=perception([detection(area=5000, cx=left + 5)]))
-        self.assertIs(intent.command, MotionCommand.TURN_RIGHT)
+        self.assertIs(intent.command, MotionCommand.STOP)
+        self.assertEqual((intent.left, intent.right), (0.0, 0.0))
+        self.assertIn("obstacle in path, left of centre", intent.reason)
 
-    def test_obstacle_right_of_center_turns_left(self):
+    def test_obstacle_right_of_center_stops_instead_of_pivoting(self):
         _, right = center_zone(FRAME_W, 0.33)
         intent = self.decide(perception=perception([detection(area=5000, cx=right - 5)]))
-        self.assertIs(intent.command, MotionCommand.TURN_LEFT)
+        self.assertIs(intent.command, MotionCommand.STOP)
+        self.assertIn("obstacle in path, right of centre", intent.reason)
 
     def test_obstacle_outside_the_corridor_does_not_trigger_avoidance(self):
         intent = self.decide(perception=perception([detection(area=5000, cx=20)]))
@@ -312,17 +317,17 @@ class TestDecisionMaker(unittest.TestCase):
         self.assertEqual((just_below.command, just_below.left, just_below.right),
                          (at.command, at.left, at.right))
 
-    def test_obstacle_avoidance_still_pivots(self):
-        # Defect 2's fix is route following only: avoidance turns are unchanged,
-        # opposed sides (which is what invalidates the GPS heading afterwards).
+    def test_obstacle_avoidance_never_pivots(self):
+        # RX-09 (formerly "still pivots"): an obstacle in the corridor is a STOP,
+        # never opposed sides -- even with a large heading error pending.
         left, right = center_zone(FRAME_W, 0.33)
-        for cx, command in ((left + 5, MotionCommand.TURN_RIGHT), (right - 5, MotionCommand.TURN_LEFT)):
+        for cx in (left + 5, 320, right - 5):
             with self.subTest(cx=cx):
-                # Even with a large heading error pending, the obstacle decides first.
                 intent = self.decide(navigation=navigating(heading_error=150.0),
                                      perception=perception([detection(area=5000, cx=cx)]))
-                self.assertIs(intent.command, command)
-                self.assertLess(intent.left * intent.right, 0)
+                self.assertIs(intent.command, MotionCommand.STOP)
+                self.assertEqual((intent.left, intent.right), (0.0, 0.0))
+                self.assertIn("obstacle", intent.reason)
 
     def test_missing_heading_creeps_instead_of_cruising(self):
         state = NavigationState(
