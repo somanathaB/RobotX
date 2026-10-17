@@ -41,6 +41,7 @@ venv/bin/python -m unittest tests.unit.test_motion_and_decision -v
 | `test_audit_regressions.py` | One test per defect found in the production-readiness audit |
 | `test_protocol.py` | Backend payloads, refusal to fabricate battery/position, inbound validation, credential redaction |
 | `test_commands.py` | Command execution, refusals, idempotency, the communication/hardware boundary |
+| `test_demo_battery.py` | Demo battery simulation: backend-simulator drain, 30 % / 60 s demo recharge, persistence, TELEMETRY `battery` |
 | `test_backend_link.py` | Link lifecycle, backoff, rate limiting, dispatch, honest status reporting |
 | `test_agent_backend_commands.py` | The real agent under STOP/PAUSE/RETURN/RESUME, including safety non-bypass |
 

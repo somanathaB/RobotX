@@ -69,6 +69,7 @@ from robotx.localization.local_frame import (
 )
 from robotx.localization.position import LatLon, PositionConfig, PositionEstimator
 from robotx.hardware.battery import battery_status
+from robotx.hardware.demo_battery import DemoBatteryConfig, DemoBatterySimulator
 from robotx.state.robot_state import (
     BackendLinkStatus,
     Esp32LinkStatus,
@@ -184,6 +185,9 @@ class RobotAgent:
         # When an obstacle-stopped rover may move again, and when it asks for help.
         self.obstacles = ObstacleRecovery(ObstacleRecoveryConfig.from_settings(settings))
         self.health = HealthMonitor(HealthConfig.from_settings(settings))
+        # DEMO battery simulation, only when explicitly enabled; otherwise the
+        # battery stays UNAVAILABLE exactly as before.
+        self.demo_battery: Optional[DemoBatterySimulator] = self._build_demo_battery(settings)
 
         self._task: Optional[asyncio.Task] = None
         self._running = False
@@ -200,6 +204,33 @@ class RobotAgent:
         # act on. Both stay empty/None until a mission actually provides them.
         self._mission_route: List[LatLon] = []
         self._mission_origin: Optional[LatLon] = None
+
+    @staticmethod
+    def _build_demo_battery(settings: Settings) -> Optional[DemoBatterySimulator]:
+        """The simulated pack, or None. A bad setting disables it, loudly."""
+
+        if not settings.demo_battery_enabled:
+            return None
+        try:
+            # A recharge must be reported in a CHARGING frame before drain resumes
+            # only when there is a backend to report to.
+            cfg = DemoBatteryConfig.from_settings(settings, confirm_reports=settings.socket_enabled)
+            simulator = DemoBatterySimulator(cfg)
+        except ValueError as e:
+            log_event(logger, "demo_battery.config_invalid", "demo battery simulation NOT enabled",
+                      level=logging.ERROR, error=str(e))
+            return None
+        log_event(logger, "demo_battery.enabled",
+                  "SIMULATED battery telemetry is ON (demo); this is not a measurement",
+                  level=logging.WARNING, drain_model=cfg.drain_model.value,
+                  threshold=cfg.recharge_threshold_percent, recharge_s=cfg.recharge_duration_s)
+        return simulator
+
+    def battery_telemetry_sent(self, payload: Dict[str, Any]) -> None:
+        """The backend link sent a TELEMETRY frame (see `DemoBatterySimulator.note_reported`)."""
+
+        if self.demo_battery is not None:
+            self.demo_battery.note_reported(payload)
 
     # --- lifecycle -----------------------------------------------------------
 
@@ -279,7 +310,13 @@ class RobotAgent:
             )
             return
 
-        self.backend = BackendLink(cfg, self.state, self, agent_alive=self.is_alive)
+        self.backend = BackendLink(
+            cfg,
+            self.state,
+            self,
+            agent_alive=self.is_alive,
+            telemetry_sent=self.battery_telemetry_sent if self.demo_battery is not None else None,
+        )
         await self.backend.start()
 
     async def stop(self) -> None:
@@ -874,7 +911,12 @@ class RobotAgent:
         # 2. Power. The Pi is the producer only because no battery hardware
         #    exists; when it does it will be on the ESP32 and its parser will
         #    write this same field. Either way consumers read it from state.
-        self.state.update_power(PowerState.from_status_dict(battery_status()))
+        #    With the DEMO simulation on, it is the producer instead -- once per
+        #    tick, so no interval is drained twice.
+        if self.demo_battery is not None:
+            self.state.update_power(PowerState.from_status_dict(self._update_demo_battery(position)))
+        else:
+            self.state.update_power(PowerState.from_status_dict(battery_status()))
 
         # 2b. ESP32 link: what it reports goes into state before anything
         #     decides, and a link that can no longer carry motion pauses a
@@ -1019,6 +1061,27 @@ class RobotAgent:
             self._last_telemetry_t = now
 
         return snapshot
+
+    def _update_demo_battery(self, position: Optional[Any]) -> Dict[str, Any]:
+        """One step of the DEMO battery simulation, from this tick's state.
+
+        Working = driving a mission (AUTO). Idle = mode IDLE with no mission
+        held: the backend simulator's own condition for starting a charge.
+        Only a measured fix counts toward distance; dead reckoning never does.
+        """
+
+        assert self.demo_battery is not None
+        mode = self.state.mode
+        fix = (
+            (position.latitude, position.longitude, position.timestamp)
+            if position is not None and position.is_measured
+            else None
+        )
+        return self.demo_battery.update(
+            working=mode is OperatingMode.AUTO,
+            idle=mode is OperatingMode.IDLE and not self.missions.has_active_mission,
+            fix=fix,
+        )
 
     def _advance_mission(self, navigation: NavigationState, *, position_measured: bool) -> None:
         """Step the assigned mission once, and react to what it did.

@@ -19,8 +19,10 @@ Summary of the wire
   the credential.
 - `HEARTBEAT {}` every ~2 s, or `{commitmentId, fence}` while carrying out an
   accepted mission.
-- `TELEMETRY {timestamp, sequence, status, lat?, lon?, speed?}`. Anything not
-  measured is **omitted**, never nulled or zeroed.
+- `TELEMETRY {timestamp, sequence, status, lat?, lon?, speed?, battery?}`.
+  Anything not measured is **omitted**, never nulled or zeroed. `battery` is
+  present only when the opt-in DEMO battery simulation is on (see
+  `build_telemetry_payload`).
 - Operator `COMMAND {commandId, type, timestamp}` -> `COMMAND_ACK {commandId}`
   once applied. A bare `STOP` (task cancellation) expects no ack. `RESUME` also
   carries `commitmentId` (the commitment the backend holds live, or null); a
@@ -33,9 +35,12 @@ Summary of the wire
 Fields the Pi deliberately does NOT send
 ----------------------------------------
 `robotId` outside AUTH (identity is the authenticated socket), `isOnline`,
-`lastSeenAt`, battery, e-stop and every other quantity this Rover cannot
-measure. A key named like `capability`/`capabilities` would make the backend
-drop the whole telemetry frame, and none is ever put in one.
+`lastSeenAt`, battery (except the opt-in DEMO simulation), e-stop and every
+other quantity this Rover cannot measure. `energy.socMethod` is never sent:
+without it the backend shows a physical robot's `battery` but never plans
+with it (batteryObservation.service.js, P2B-2). A key named like
+`capability`/`capabilities` would make the backend drop the whole telemetry
+frame, and none is ever put in one.
 """
 
 from __future__ import annotations
@@ -422,7 +427,14 @@ def build_telemetry_payload(
       non-dead-reckoned Observation and counts as completion evidence; a
       dead-reckoned pose is commanded motion around a configured origin, so it
       is never sent, and there is no switch that could send it.
-    - `battery` is never sent: this Rover has no battery sensing.
+    - `battery` is never sent from hardware: this Rover has no battery
+      sensing. It is sent only when the opt-in DEMO simulation is on
+      (`ROBOTX_DEMO_BATTERY_ENABLED`), as the simulated percentage, and never
+      with `energy.socMethod`, so the backend displays it but its energy
+      decision never plans with it. A simulated recharge is a rise, which the
+      backend's §23.5 boundary refuses unless the frame says
+      `status: "CHARGING"`; so a recharge frame from an idle Rover carries
+      that status, and one that cannot (a mission is held) omits `battery`.
     - no `heading`, `distanceTravelled`, `safety`, `faults`, `localisation` or
       `energy`: nothing on this Pi measures them (the ESP32 link does not
       exist), so they are omitted rather than asserted.
@@ -443,6 +455,11 @@ def build_telemetry_payload(
     stop_latch = _stop_latch_block(snapshot, controller_max_age_s)
     if stop_latch is not None:
         payload["safety"] = {"stopLatch": stop_latch}
+    battery, charging = demo_battery_report(snapshot)
+    if battery is not None:
+        payload["battery"] = battery
+        if charging:
+            payload["status"] = DEMO_RECHARGE_STATUS
 
     position = snapshot.position
     omitted: Optional[str] = None
@@ -474,6 +491,31 @@ def build_telemetry_payload(
 
     payload["timestamp"] = now_ms(now)
     return TelemetryFrame(payload, position_omitted=omitted)
+
+
+# The backend's existing status for a robot whose charge is rising
+# (telemetry.handler.js INCOMING_STATUS; not persisted, P7-D1).
+DEMO_RECHARGE_STATUS = "CHARGING"
+
+
+def demo_battery_report(snapshot: RobotSnapshot) -> Tuple[Optional[float], bool]:
+    """`(battery, charging)` for TELEMETRY: what to send, and whether it is a recharge frame.
+
+    `(None, False)` unless the DEMO battery simulation produced this snapshot's
+    power reading -- the hardware path (UNAVAILABLE) is never sent. A
+    simulated recharge is reported only from an idle Rover (mode IDLE, no
+    mission in progress); otherwise `battery` is left out until it can be.
+    """
+
+    power = snapshot.power
+    if not power.is_simulated:
+        return None, False
+    percent = round(float(power.percent), 1)
+    if not power.charging:
+        return percent, False
+    mission = snapshot.mission
+    idle = snapshot.mode is OperatingMode.IDLE and (mission is None or not mission.status.is_active)
+    return (percent, True) if idle else (None, False)
 
 
 def build_heartbeat_payload(

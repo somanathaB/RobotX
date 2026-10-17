@@ -135,16 +135,26 @@ class PowerState:
     fuel gauge, ADC or divider. When battery sensing arrives it will be on the
     ESP32, and the parser will write this same field -- every consumer keeps
     working and can still tell measured from unavailable.
+
+    The one exception is the opt-in DEMO simulation
+    (`robotx.hardware.demo_battery`): `status` is then `SIMULATED`, which is
+    never a measurement, and `charging`/`phase` describe its demo recharge.
     """
 
     status: str = "UNAVAILABLE"
     percent: Optional[float] = None
     voltage_v: Optional[float] = None
     source: str = BATTERY_UNAVAILABLE_REASON
+    charging: bool = False
+    phase: Optional[str] = None
 
     @property
     def is_measured(self) -> bool:
-        return self.status != "UNAVAILABLE" and self.percent is not None
+        return self.status not in ("UNAVAILABLE", "SIMULATED") and self.percent is not None
+
+    @property
+    def is_simulated(self) -> bool:
+        return self.status == "SIMULATED" and self.percent is not None
 
     @classmethod
     def from_status_dict(cls, data: Dict[str, Any]) -> "PowerState":
@@ -155,6 +165,8 @@ class PowerState:
             percent=data.get("percent"),
             voltage_v=data.get("voltage_v"),
             source=str(data.get("source", BATTERY_UNAVAILABLE_REASON)),
+            charging=bool(data.get("charging", False)),
+            phase=data.get("phase"),
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -163,6 +175,8 @@ class PowerState:
             "percent": self.percent,
             "voltage_v": self.voltage_v,
             "source": self.source,
+            "charging": self.charging,
+            "phase": self.phase,
         }
 
 

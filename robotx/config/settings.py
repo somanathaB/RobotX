@@ -355,6 +355,21 @@ class Settings:
     backend_loss_policy: str = "pause"
     backend_loss_grace_s: float = 10.0
 
+    # --- DEMO battery simulation ---------------------------------------------
+    # This robot has no battery sensing. For a demonstration only, the Pi can
+    # report a SIMULATED percentage through the normal TELEMETRY `battery`
+    # field (robotx.hardware.demo_battery). Off by default: with it off the
+    # battery stays UNAVAILABLE and is never sent. Drain reproduces the backend
+    # simulator ("power" = energyPolicy.js, "legacy_percentage" = constants.js);
+    # the threshold/recharge cycle is demo-only and controls no hardware.
+    demo_battery_enabled: bool = False
+    demo_battery_drain_model: str = "power"
+    demo_battery_initial_percent: float = 100.0
+    demo_battery_recharge_threshold_percent: float = 30.0
+    demo_battery_recharge_s: float = 60.0
+    # Persisted across restarts; delete the file to start a fresh demo at 100 %.
+    demo_battery_state_path: Optional[str] = "~/.robotx/demo_battery.json"
+
     # --- Home position -------------------------------------------------------
     # Where a backend RETURN command sends the robot. With neither this nor a
     # recorded mission origin, RETURN is refused rather than given a guess.
@@ -521,6 +536,16 @@ class Settings:
             backend_tls_verify=_get_bool(e, "ROBOTX_BACKEND_TLS_VERIFY", d.backend_tls_verify),
             backend_loss_policy=_get_str(e, "ROBOTX_BACKEND_LOSS_POLICY", d.backend_loss_policy),
             backend_loss_grace_s=_get_float(e, "ROBOTX_BACKEND_LOSS_GRACE_S", d.backend_loss_grace_s),
+            demo_battery_enabled=_get_bool(e, "ROBOTX_DEMO_BATTERY_ENABLED", d.demo_battery_enabled),
+            demo_battery_drain_model=_get_str(e, "ROBOTX_DEMO_BATTERY_DRAIN_MODEL", d.demo_battery_drain_model),
+            demo_battery_initial_percent=_get_float(
+                e, "ROBOTX_DEMO_BATTERY_INITIAL_PERCENT", d.demo_battery_initial_percent
+            ),
+            demo_battery_recharge_threshold_percent=_get_float(
+                e, "ROBOTX_DEMO_BATTERY_RECHARGE_THRESHOLD_PERCENT", d.demo_battery_recharge_threshold_percent
+            ),
+            demo_battery_recharge_s=_get_positive_float(e, "ROBOTX_DEMO_BATTERY_RECHARGE_S", d.demo_battery_recharge_s),
+            demo_battery_state_path=_get(e, "ROBOTX_DEMO_BATTERY_STATE_PATH", d.demo_battery_state_path),
             home_lat=_get_opt_float(e, "ROBOTX_HOME_LAT", d.home_lat),
             home_lon=_get_opt_float(e, "ROBOTX_HOME_LON", d.home_lon),
             motor_left_in1=_get_int(e, "ROBOTX_MOTOR_LEFT_IN1", d.motor_left_in1),

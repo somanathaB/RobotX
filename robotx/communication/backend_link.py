@@ -395,8 +395,12 @@ class BackendLink:
         token_store: Optional[TokenStore] = None,
         agent_alive: Optional[AgentAlive] = None,
         commitment_store: Optional[CommitmentStore] = None,
+        telemetry_sent: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> None:
         self.cfg = cfg
+        # Told about every TELEMETRY payload that left the Pi. Used only by the
+        # DEMO battery simulation, to know a recharge reached the backend.
+        self._telemetry_sent = telemetry_sent
         # What HEARTBEAT vouches for. None means "no agent loop to vouch for"
         # (a link driven directly, as in tests); the RobotAgent always passes
         # its own `is_alive`.
@@ -1223,6 +1227,11 @@ class BackendLink:
         if not await self._emit(self.cfg.binding.telemetry, frame.payload):
             return
         self.stats["telemetry_sent"] += 1
+        if self._telemetry_sent is not None:
+            try:
+                self._telemetry_sent(frame.payload)
+            except Exception:
+                logger.exception("telemetry_sent callback failed")
         if frame.has_position:
             self.stats["positions_sent"] += 1
             self._last_position_sent = frame.position_timestamp
