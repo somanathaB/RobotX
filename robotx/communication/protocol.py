@@ -22,7 +22,9 @@ Summary of the wire
 - `TELEMETRY {timestamp, sequence, status, lat?, lon?, speed?}`. Anything not
   measured is **omitted**, never nulled or zeroed.
 - Operator `COMMAND {commandId, type, timestamp}` -> `COMMAND_ACK {commandId}`
-  once applied. A bare `STOP` (task cancellation) expects no ack.
+  once applied. A bare `STOP` (task cancellation) expects no ack. `RESUME` also
+  carries `commitmentId` (the commitment the backend holds live, or null); a
+  commitment-bound mission resumes only when it is that one (`BackendLink`).
 - Engine `command` envelopes (OFFER, WITHDRAW, ...) -> `COMMAND_ACK {outboxId,
   fence, authorityEpoch}`, then exactly one of `OFFER_ACCEPT` / `OFFER_REJECT`
   / `OFFER_DEFER`; `CUSTODY_EVENT`; `TASK_COMPLETE {taskId, lat, lon}`.

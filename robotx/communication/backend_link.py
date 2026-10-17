@@ -103,6 +103,7 @@ from robotx.communication.protocol import (
     AuthMethod,
     CommandRejection,
     CommandStatus,
+    CommandType,
     EventLevel,
     InboundCommand,
     ProtocolBinding,
@@ -1311,6 +1312,20 @@ class BackendLink:
             )
             return
 
+        refusal = self._resume_binding_refusal(parsed)
+        if refusal is not None:
+            # Not executed, so not remembered: the backend re-reads the live commitment on
+            # every redelivery, and a corrected one must be decided, not answered from history.
+            self.stats["commands_refused"] += 1
+            log_event(
+                logger,
+                "command.resume_refused",
+                refusal,
+                level=logging.WARNING,
+                command_id=parsed.command_id,
+            )
+            return
+
         outcome = self._execute(parsed)
         if outcome.status is CommandStatus.ACK:
             if await self._emit(self.cfg.binding.command_ack,
@@ -1318,6 +1333,37 @@ class BackendLink:
                 self.stats["acks_sent"] += 1
         else:
             self.stats["commands_refused"] += 1
+
+    def _resume_binding_refusal(self, command: InboundCommand) -> Optional[str]:
+        """Why a RESUME may not resume the mission this Rover holds, or None.
+
+        The Rover drops a mission only when a RECALL / WITHDRAW / ABORT is
+        admitted. One that never arrives (sent while the link was down, held for
+        a sequence gap, or failed by the backend after its ack deadline) leaves
+        the mission and its route here after the server has released the
+        commitment, and a RESUME would drive that obsolete route.
+
+        The backend names the commitment it holds live for this robot on RESUME
+        (`commitmentId`, null for none). An active commitment-bound mission is
+        resumed only when that is the commitment it carries out. Unchanged: a
+        RESUME without the field (an older backend), and one with no
+        commitment-bound mission held -- the executor decides those as before.
+        """
+
+        if command.type is not CommandType.RESUME or "commitmentId" not in command.raw:
+            return None
+        mission = self.state.snapshot().mission
+        if mission is None or not mission.custody_required or not mission.is_active:
+            return None
+        held = self._held_mission()
+        carried = held[0].commitment_id if held is not None else None
+        named = command.raw.get("commitmentId")
+        if carried is not None and named == carried:
+            return None
+        return (
+            f"RESUME names commitment {named!r} as live, but the paused mission (task "
+            f"{mission.task_id!r}) carries out {carried!r}; it is not resumed"
+        )
 
     async def _on_stop_event(self, data: Any) -> None:
         """The bare STOP event: task cancellation. Obeyed; never acknowledged.

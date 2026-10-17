@@ -55,7 +55,7 @@ milliseconds and incremented per frame, so it keeps increasing across restarts.
 | Event | Handling |
 |---|---|
 | `AUTH_SUCCESS` + `AUTH_OK` | Both arrive; the first authenticates, the second is ignored |
-| `COMMAND {commandId, type, timestamp}` | Validated (type, robotId, age). Applied, then `COMMAND_ACK {commandId}`. Refused, unknown, stale or another robot's: **no ack** (the backend marks it FAILED) |
+| `COMMAND {commandId, type, timestamp}` | Validated (type, robotId, age). Applied, then `COMMAND_ACK {commandId}`. Refused, unknown, stale or another robot's: **no ack** (the backend marks it FAILED). `RESUME` also carries `commitmentId` (the commitment the backend holds live for this robot, or null): a paused mission bound to a commitment resumes only when it is that commitment; without the field, as before |
 | `STOP {taskId?, reason, timestamp}` | Obeyed; no ack. Ignored if it names another robot |
 | `command` (engine envelope) | Admission, then act; see below |
 | `TASK_ASSIGN` | Recovery re-send only. Logged and correlated with the held commitment. **Never starts a mission**; no reply |
