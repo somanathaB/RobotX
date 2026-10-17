@@ -24,6 +24,7 @@ logger = logging.getLogger(__name__)
 class NavigationStatus(str, Enum):
     IDLE = "IDLE"              # no route loaded
     NO_POSITION = "NO_POSITION"  # route loaded but no GPS fix to act on
+                                 # (or one too inaccurate: see position_issue)
     NAVIGATING = "NAVIGATING"  # driving toward a waypoint
     ARRIVED = "ARRIVED"        # final waypoint reached
     REROUTE_NEEDED = "REROUTE_NEEDED"  # off route or repeatedly blocked
@@ -44,6 +45,8 @@ class NavigationState:
     waypoints_total: int = 0
     waypoint_index: int = 0
     progress: float = 0.0
+    # Why a position that exists was not navigated on (NO_POSITION only).
+    position_issue: Optional[str] = None
 
     @property
     def has_target(self) -> bool:
@@ -71,6 +74,7 @@ class NavigationState:
             "waypoint_index": self.waypoint_index,
             "waypoints_total": self.waypoints_total,
             "progress": round(self.progress, 3),
+            "position_issue": self.position_issue,
         }
 
 
@@ -80,6 +84,11 @@ class NavigationConfig:
     off_route_m: float = 25.0
     reroute_after_n: int = 8
     blocked_reroute_after_n: int = 3
+    # A fix whose receiver-stated horizontal accuracy is worse than this is not
+    # navigated on: with an 8 m arrival radius, a 20 m-accurate fix can declare
+    # a stop reached that is not. A fix that states no accuracy (NMEA, dead
+    # reckoning) is not judged here -- it has nothing to judge.
+    max_h_acc_m: float = 5.0
 
     @classmethod
     def from_settings(cls, settings: Any) -> "NavigationConfig":
@@ -88,6 +97,7 @@ class NavigationConfig:
             off_route_m=settings.nav_off_route_m,
             reroute_after_n=settings.nav_reroute_after_n,
             blocked_reroute_after_n=settings.nav_blocked_reroute_after_n,
+            max_h_acc_m=settings.nav_max_h_acc_m,
         )
 
     def to_planner_config(self) -> PlannerConfig:
@@ -141,6 +151,23 @@ class Navigator:
         self._last_status = None
         return self._state
 
+    def position_issue(self, position: Optional[Position]) -> Optional[str]:
+        """Why `position` must not be navigated on, or None if it may be."""
+
+        if position is None:
+            return None
+        if position.h_acc_m is not None and position.h_acc_m > self.cfg.max_h_acc_m:
+            return (
+                f"GPS horizontal accuracy {position.h_acc_m:.1f} m is worse than "
+                f"the {self.cfg.max_h_acc_m:.1f} m navigation limit"
+            )
+        return None
+
+    def usable(self, position: Optional[Position]) -> bool:
+        """Whether `position` is one this navigator would act on."""
+
+        return position is not None and self.position_issue(position) is None
+
     def report_blocked(self) -> None:
         """Tell the planner the current leg is obstructed (drives rerouting)."""
 
@@ -158,13 +185,18 @@ class Navigator:
 
         destination = self.planner.destination()
 
-        if position is None:
+        # A position too poor to act on is treated exactly as no position: the
+        # planner is not advanced by it, nothing is declared ARRIVED from it,
+        # and the decision layer stops.
+        issue = self.position_issue(position)
+        if position is None or issue is not None:
             self._state = NavigationState(
                 status=NavigationStatus.NO_POSITION,
                 destination=destination,
                 waypoints_total=route_length,
                 waypoint_index=self.planner.waypoint_index(),
                 progress=self.planner.progress(),
+                position_issue=issue,
             )
             self._log_transition()
             return self._state

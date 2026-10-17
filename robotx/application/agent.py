@@ -129,6 +129,8 @@ class RobotAgent:
         self.gps: Optional[GPSReader] = None
         # Set when GPS was not started because its port is the ESP32's UART.
         self._gps_port_conflict: Optional[str] = None
+        # Set when GPS is enabled but has no source to read (ESP32 link off).
+        self._gps_no_source: Optional[str] = None
         # The one owner of the ESP32 UART. None when ROBOTX_ESP32_ENABLED=0.
         self.esp32: Optional[Esp32Link] = None
         # Why an enabled ESP32 link was not started, if its config was invalid.
@@ -338,6 +340,10 @@ class RobotAgent:
             # The receiver is on the ESP32's I2C bus; its frames arrive on the
             # ESP32 link, so there is no Pi serial port to open at all.
             if self.esp32 is None:
+                self._gps_no_source = (
+                    "ROBOTX_GPS_SOURCE=esp32 but the ESP32 link is not running "
+                    "(ROBOTX_ESP32_ENABLED=0 or an invalid ESP32 configuration)"
+                )
                 log_event(logger, "gps.no_esp32_link",
                           "ROBOTX_GPS_SOURCE=esp32 but the ESP32 link is not running; no position source",
                           level=logging.ERROR)
@@ -522,6 +528,9 @@ class RobotAgent:
         if self.esp32 is not None and not self.esp32.status().motion_ready:
             return OfferDecision.reject("NO_MOTOR_LINK")
         if snapshot.position is None or not snapshot.position.is_measured or not snapshot.gps.has_fix:
+            return OfferDecision.reject("NO_POSITION_FIX")
+        # A fix navigation will not drive on is, for this offer, no fix.
+        if not self.navigator.usable(snapshot.position):
             return OfferDecision.reject("NO_POSITION_FIX")
         if not self.custody_sensing_available():
             return OfferDecision.reject("NO_CUSTODY_SENSING")
@@ -1034,6 +1043,8 @@ class RobotAgent:
                 f"not started: {self._gps_port_conflict} is reserved for the ESP32 UART "
                 "(set ROBOTX_GPS_PORT to the receiver's own port, or ROBOTX_GPS_ENABLED=0)",
             )
+        if self.gps is None and self._gps_no_source is not None:
+            return ComponentHealth("gps", HealthStatus.FAILED, self._gps_no_source)
         if self.gps is None:
             return ComponentHealth(
                 "gps", HealthStatus.UNKNOWN, "disabled by configuration"
@@ -1043,6 +1054,10 @@ class RobotAgent:
         status, detail = _GPS_HEALTH.get(
             reading.status, (HealthStatus.UNKNOWN, "unrecognized GPS status")
         )
+        if reading.status is GPSStatus.FIX and snapshot.position is not None:
+            issue = self.navigator.position_issue(snapshot.position)
+            if issue is not None:
+                return ComponentHealth("gps", HealthStatus.DEGRADED, issue)
         return ComponentHealth("gps", status, reading.error or detail)
 
     def _navigation_health(self, snapshot: RobotSnapshot) -> ComponentHealth:
@@ -1051,7 +1066,9 @@ class RobotAgent:
             return ComponentHealth("navigation", HealthStatus.DEGRADED, "reroute needed")
         if state.status is NavigationStatus.NO_POSITION:
             return ComponentHealth(
-                "navigation", HealthStatus.DEGRADED, "route loaded but no position"
+                "navigation",
+                HealthStatus.DEGRADED,
+                state.position_issue or "route loaded but no position",
             )
         return ComponentHealth("navigation", HealthStatus.HEALTHY, state.status.value)
 

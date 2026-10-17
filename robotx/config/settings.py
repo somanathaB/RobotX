@@ -14,6 +14,7 @@ operator sets the corresponding environment variable. See `.env.example`.
 
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass, fields
 from typing import Any, Mapping, Optional
@@ -66,6 +67,36 @@ def _get_opt_float(env: Env, key: str, default: Optional[float]) -> Optional[flo
         return float(value.strip())
     except ValueError:
         raise ValueError(f"{key} must be a number, got {value!r}") from None
+
+
+GPS_SOURCES = ("pi_serial", "esp32")
+
+
+def _gps_source(env: Env, default: str) -> str:
+    """ROBOTX_GPS_SOURCE, refused at startup unless it is a known source.
+
+    Case and surrounding space are forgiven; anything else is not. Falling back
+    to `pi_serial` on a typo would leave the rover with no position source at
+    all (the Pi UART is the ESP32's), which is a misconfiguration to report,
+    not one to run with.
+    """
+
+    value = env.get("ROBOTX_GPS_SOURCE")
+    if value is None:
+        return default
+    source = value.strip().lower()
+    if source not in GPS_SOURCES:
+        raise ValueError(f"ROBOTX_GPS_SOURCE must be one of {', '.join(GPS_SOURCES)}, got {value!r}")
+    return source
+
+
+def _get_positive_float(env: Env, key: str, default: float) -> float:
+    """A float that must be finite and > 0: a NaN limit would compare false and disable its check."""
+
+    value = _get_float(env, key, default)
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError(f"{key} must be a positive number, got {env.get(key)!r}")
+    return value
 
 
 def _get_bool(env: Env, key: str, default: bool) -> bool:
@@ -189,6 +220,8 @@ class Settings:
     nav_reroute_after_n: int = 8
     nav_blocked_reroute_after_n: int = 3
     nav_target_speed_mps: float = 0.25
+    # Worst receiver-stated horizontal accuracy navigation will act on (metres).
+    nav_max_h_acc_m: float = 5.0
 
     # Optional online routing. Without an API key the agent runs on locally
     # supplied waypoint lists only -- it never fabricates a route.
@@ -401,7 +434,7 @@ class Settings:
             gps_timeout_s=_get_float(e, "ROBOTX_GPS_TIMEOUT_S", d.gps_timeout_s),
             gps_stale_after_s=_get_float(e, "ROBOTX_GPS_STALE_AFTER_S", d.gps_stale_after_s),
             gps_reconnect_interval_s=_get_float(e, "ROBOTX_GPS_RECONNECT_INTERVAL_S", d.gps_reconnect_interval_s),
-            gps_source=_get_str(e, "ROBOTX_GPS_SOURCE", d.gps_source),
+            gps_source=_gps_source(e, d.gps_source),
             esp32_enabled=_get_bool(e, "ROBOTX_ESP32_ENABLED", d.esp32_enabled),
             esp32_port=_get_str(e, "ROBOTX_ESP32_PORT", d.esp32_port),
             esp32_baudrate=_get_int(e, "ROBOTX_ESP32_BAUDRATE", d.esp32_baudrate),
@@ -420,6 +453,7 @@ class Settings:
             nav_reroute_after_n=_get_int(e, "ROBOTX_NAV_REROUTE_AFTER_N", d.nav_reroute_after_n),
             nav_blocked_reroute_after_n=_get_int(e, "ROBOTX_NAV_BLOCKED_REROUTE_AFTER_N", d.nav_blocked_reroute_after_n),
             nav_target_speed_mps=_get_float(e, "ROBOTX_NAV_TARGET_SPEED_MPS", d.nav_target_speed_mps),
+            nav_max_h_acc_m=_get_positive_float(e, "ROBOTX_NAV_MAX_H_ACC_M", d.nav_max_h_acc_m),
             google_maps_api_key=_get(e, "ROBOTX_GOOGLE_MAPS_API_KEY", d.google_maps_api_key),
             directions_min_interval_s=_get_float(e, "ROBOTX_DIRECTIONS_MIN_INTERVAL_S", d.directions_min_interval_s),
             directions_cache_ttl_s=_get_float(e, "ROBOTX_DIRECTIONS_CACHE_TTL_S", d.directions_cache_ttl_s),

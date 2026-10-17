@@ -255,8 +255,10 @@ Rules that the agent does **not** enforce for you ([SW-VERIFIED] in
   `/mission/start` and `/mission/resume`). An empty
   `ROBOTX_COMMITMENT_STATE_PATH=` keeps the commitment marks in memory only. An
   empty number stops the agent at startup.
-- `esp32` and `operator` are compared exactly. `ESP32` or `Operator` silently
-  fall back to the bench defaults, and every OFFER is then rejected.
+- `operator` is compared exactly. `Operator` silently falls back to the bench
+  default, and every OFFER is then rejected. (`ROBOTX_GPS_SOURCE` is the
+  exception: case is forgiven, and any value other than `pi_serial` or `esp32`
+  stops the agent at startup.)
 - `ROBOTX_ROBOT_ID` is not trimmed: it must equal the commissioned id exactly.
 - A backend setting the link refuses (bad URL, loss grace above 10, heartbeat
   above 2, policy `continue`) does **not** stop the service: the agent runs

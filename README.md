@@ -32,7 +32,10 @@ The setup below is the bench / development path.
 - Detects objects (OpenCV motion + edge backends; optional YOLOv8)
 - Reads position either from the ESP32's GPS frames (`ROBOTX_GPS_SOURCE=esp32`,
   the V1 rover's wiring) or from an NMEA receiver on the Pi's own serial port
-  (the bench default), with explicit fix validity and staleness
+  (the bench default), with explicit fix validity and staleness. ESP32 GPS
+  validation and the navigation accuracy gate are unit-tested only: no real
+  ESP32 GPS frame has been captured and checked against them yet
+  (`tests/hardware/capture_esp32_rx.py`)
 - Estimates position and a GPS-derived heading
 - Follows a waypoint route and computes the desired heading
 - Decides what motion it wants, failing safe on anything it does not know
@@ -167,7 +170,9 @@ Everything is read from `ROBOTX_*` environment variables in
 | `ROBOTX_CAMERA_WIDTH/HEIGHT/FPS` | 640/480/20 | Capture settings |
 | `ROBOTX_DETECTION_BACKEND` | `opencv` | `opencv`, `yolo`, or `auto` |
 | `ROBOTX_DETECTION_HZ` | `2.0` | Inference rate |
-| `ROBOTX_GPS_SOURCE` | `pi_serial` | `pi_serial` or `esp32` (V1: `esp32`) |
+| `ROBOTX_GPS_SOURCE` | `pi_serial` | `pi_serial` or `esp32` (V1: `esp32`); anything else stops the agent at startup |
+| `ROBOTX_GPS_STALE_AFTER_S` | `5.0` | A fix older than this (receiver age + time since the frame) is STALE |
+| `ROBOTX_NAV_MAX_H_ACC_M` | `5.0` | Navigation stops on a fix whose receiver-stated horizontal accuracy is worse; OFFERs are rejected `NO_POSITION_FIX` |
 | `ROBOTX_GPS_PORT` | `/dev/ttyAMA0` | GPS serial device (`pi_serial` only) |
 | `ROBOTX_GPS_BAUDRATE` | `9600` | GPS baud rate |
 | `ROBOTX_ESP32_ENABLED` | `0` | Enable the ESP32 UART link (V1: `1`) |

@@ -207,6 +207,9 @@ class Esp32Link:
         # The latest GPS frame and the wall time it was parsed (section 11).
         self._gps: Optional[Dict[str, Any]] = None
         self._gps_at: Optional[float] = None
+        # The same instant on the link's monotonic clock: what GPS age is
+        # judged on, so a wall-clock step cannot make an old fix look fresh.
+        self._gps_mono: Optional[float] = None
 
         self._proto: Optional[int] = None
         self._proto_problem: Optional[str] = None
@@ -473,6 +476,7 @@ class Esp32Link:
                 self._counters["gps"] += 1
                 self._gps = dict(data)
                 self._gps_at = wall
+                self._gps_mono = now
             elif result.type == "EVENT":
                 self._on_event(data, wall)
             elif result.type == "ACK":
@@ -729,6 +733,15 @@ class Esp32Link:
 
         with self._lock:
             return (None if self._gps is None else dict(self._gps)), self._gps_at
+
+    def gps_sample(self) -> Tuple[Optional[Dict[str, Any]], Optional[float], Optional[float]]:
+        """`gps_frame()`, plus the monotonic seconds since that frame was parsed."""
+
+        now = self._clock()
+        with self._lock:
+            frame = None if self._gps is None else dict(self._gps)
+            elapsed = None if self._gps_mono is None else now - self._gps_mono
+            return frame, self._gps_at, elapsed
 
     def events(self) -> Tuple[Tuple[float, Dict[str, Any]], ...]:
         """The most recent EVENT frames (bounded), oldest first."""

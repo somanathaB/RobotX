@@ -412,7 +412,9 @@ robot stays out of new assignment afterwards (PAUSE semantics).
      surroundings.
   4. **ESP32 up and able to move:** `.communication.esp32 == "UP"` and
      `.controller.motion_ready == true`.
-  5. **Position valid:** `.gps.status == "FIX"` and `.position.source == "GPS"`.
+  5. **Position valid:** `.gps.status == "FIX"`, `.position.source == "GPS"`,
+     and `.position.h_acc_m` at most `ROBOTX_NAV_MAX_H_ACC_M` (5.0 m by
+     default; `/health` `gps` is `DEGRADED` and says so when it is not).
   6. **Read the backend state:** run the commitment query (Conventions).
   7. **Still this robot's and still executable:** the newest row's
      `commitmentId` equals `/backend` `.held_commitment.commitmentId`;

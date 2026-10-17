@@ -131,6 +131,10 @@ class DecisionMaker:
         if navigation.status is NavigationStatus.IDLE:
             return MotionIntent.hold("no route loaded")
         if navigation.status is NavigationStatus.NO_POSITION:
+            if navigation.position_issue is not None:
+                # Fixed text: the issue carries a live accuracy figure, and the
+                # reason is logged on every change.
+                return MotionIntent.stop("GPS fix not accurate enough to navigate")
             return MotionIntent.stop("no GPS position")
         if navigation.status is NavigationStatus.ARRIVED:
             return MotionIntent.hold("destination reached")

@@ -8,3 +8,7 @@ __pycache__/
 # Debug artifacts written by tests/hardware/test_cv.py and test_vision.py
 frame.jpg
 frames/
+
+# Raw UART captures from tests/hardware/capture_esp32_rx.py: real data, reviewed
+# by hand before any of it becomes a fixture.
+esp32_rx_*.txt
