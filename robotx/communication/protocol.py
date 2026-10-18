@@ -19,9 +19,11 @@ Summary of the wire
   the credential.
 - `HEARTBEAT {}` every ~2 s, or `{commitmentId, fence}` while carrying out an
   accepted mission.
-- `TELEMETRY {timestamp, sequence, status, lat?, lon?, speed?, battery?}`.
-  Anything not measured is **omitted**, never nulled or zeroed. `battery` is
-  present only when the opt-in DEMO battery simulation is on (see
+- `TELEMETRY {timestamp, sequence, status, lat?, lon?, speed?, position?,
+  safety?, readiness?, battery?, energy?}`. Anything not measured is
+  **omitted**, never nulled or zeroed. `readiness` is present only when every
+  check behind it could be evaluated; `battery` (with `energy.batterySource:
+  "DEMO_SIMULATION"`) only when the opt-in DEMO battery simulation is on (see
   `build_telemetry_payload`).
 - Operator `COMMAND {commandId, type, timestamp}` -> `COMMAND_ACK {commandId}`
   once applied. A bare `STOP` (task cancellation) expects no ack. `RESUME` also
@@ -41,6 +43,10 @@ without it the backend shows a physical robot's `battery` but never plans
 with it (batteryObservation.service.js, P2B-2). A key named like
 `capability`/`capabilities` would make the backend drop the whole telemetry
 frame, and none is ever put in one.
+
+There is no `register` event: the backend has no listener for it, and whether a
+robot is physical and what it can do come from commissioning and the owner's
+declaration, never from the agent (ROBOTX_PI_READINESS_HANDOFF.md P-4).
 """
 
 from __future__ import annotations
@@ -50,7 +56,7 @@ import time
 from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, Mapping, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from robotx.communication.engine import ENGINE_COMMANDS
 from robotx.control.safety import ESTOP_RULE
@@ -188,8 +194,9 @@ class ProtocolBinding:
     probe_result: str = "PROBE_RESULT"
 
     # Not part of the robot contract. Empty means "never emitted"; an operator
-    # may bind them if the backend turns out to accept them.
-    register: str = ""
+    # may bind them if the backend turns out to accept them. (There is no
+    # `register`: the backend has no listener for it, ROBOTX_PI_READINESS_HANDOFF
+    # P-4. A binding file that still names it is ignored like any unknown key.)
     status: str = ""
     event: str = ""
 
@@ -238,7 +245,7 @@ class ProtocolBinding:
         names = (self.auth, self.telemetry, self.heartbeat, self.command_ack,
                  self.offer_accept, self.offer_reject, self.offer_defer,
                  self.custody_event, self.task_complete, self.probe_result,
-                 self.register, self.status, self.event)
+                 self.status, self.event)
         return tuple(name for name in names if name)
 
     def inbound_events(self) -> Tuple[str, ...]:
@@ -285,7 +292,6 @@ class ProtocolBinding:
                 "custody_event": self.custody_event,
                 "task_complete": self.task_complete,
                 "probe_result": self.probe_result,
-                "register": self.register,
                 "status": self.status,
                 "event": self.event,
             },
@@ -319,7 +325,7 @@ class ProtocolBinding:
 
         known = {"namespace", "auth", "telemetry", "heartbeat", "command_ack",
                  "offer_accept", "offer_reject", "offer_defer", "custody_event",
-                 "task_complete", "register", "status", "event", "auth_success",
+                 "task_complete", "status", "event", "auth_success",
                  "auth_ok", "auth_failed", "command", "engine_command", "stop",
                  "task_assign", "task_complete_ack", "probe", "probe_result"}
         kwargs = {k: str(v) for k, v in flat.items() if k in known and v is not None}
@@ -408,6 +414,49 @@ def _stop_latch_block(snapshot: RobotSnapshot, controller_max_age_s: float) -> O
     }
 
 
+# `readiness.blockers` (ROBOTX_PI_READINESS_HANDOFF P-1, contract §4): the
+# reasons this Rover would refuse ANY offer right now, in the exact
+# `OFFER_REJECT` vocabulary the backend classifies as agent readiness
+# (offerRefusal.service.js AGENT_READINESS_REFUSALS), in `assess_offer`'s order.
+# `MISSION_IN_PROGRESS` and `NO_EXECUTABLE_PATH` are about one offer, not the
+# Rover, and are never reported here. Renaming one silently turns it into an
+# unclassified per-Leg refusal on the backend (P-3).
+READINESS_BLOCKERS = (
+    "ESTOP_LATCHED",
+    "AGENT_ERROR",
+    "NO_MOTOR_LINK",
+    "NO_POSITION_FIX",
+    "NO_CUSTODY_SENSING",
+)
+
+# `energy.batterySource` for a `battery` value produced by the DEMO simulation
+# (ROBOTX_PI_READINESS_HANDOFF P-2). The backend shows it as DEMO_SIMULATED and
+# never writes it to BatteryState (batteryObservation.service.js).
+DEMO_BATTERY_SOURCE = "DEMO_SIMULATION"
+
+
+def readiness_block(blockers: Optional[Sequence[str]]) -> Optional[Dict[str, Any]]:
+    """`{"blockers": [...]}` for TELEMETRY, or None when readiness is not reported.
+
+    None in means "could not be evaluated" and yields None: the block is then
+    omitted, which the backend reads as not reported -- never as ready. Only a
+    list that the caller fully evaluated may become `[]`. A code outside the
+    agreed vocabulary is a programming error, not something to send: the
+    backend would treat it as an unknown BLOCKING fault and an unclassified
+    refusal, so it raises here instead.
+    """
+
+    if blockers is None:
+        return None
+    codes: List[str] = []
+    for code in blockers:
+        if code not in READINESS_BLOCKERS:
+            raise ValueError(f"{code!r} is not a readiness blocker the backend accepts")
+        if code not in codes:
+            codes.append(code)
+    return {"blockers": codes}
+
+
 def build_telemetry_payload(
     snapshot: RobotSnapshot,
     *,
@@ -416,6 +465,7 @@ def build_telemetry_payload(
     last_position_timestamp: Optional[float] = None,
     now: Optional[float] = None,
     controller_max_age_s: float = 1.0,
+    readiness_blockers: Optional[Sequence[str]] = None,
 ) -> TelemetryFrame:
     """`TELEMETRY` to the handoff (§5, §16): measured fields only, the rest omitted.
 
@@ -429,20 +479,28 @@ def build_telemetry_payload(
       is never sent, and there is no switch that could send it.
     - `battery` is never sent from hardware: this Rover has no battery
       sensing. It is sent only when the opt-in DEMO simulation is on
-      (`ROBOTX_DEMO_BATTERY_ENABLED`), as the simulated percentage, and never
-      with `energy.socMethod`, so the backend displays it but its energy
-      decision never plans with it. A simulated recharge is a rise, which the
-      backend's §23.5 boundary refuses unless the frame says
+      (`ROBOTX_DEMO_BATTERY_ENABLED`), as the simulated percentage, always
+      beside `energy: {"batterySource": "DEMO_SIMULATION"}` and never with
+      `energy.socMethod`, so the backend displays it labelled DEMO_SIMULATED
+      but its energy decision never plans with it. A simulated recharge is a
+      rise, which the backend's §23.5 boundary refuses unless the frame says
       `status: "CHARGING"`; so a recharge frame from an idle Rover carries
       that status, and one that cannot (a mission is held) omits `battery`.
-    - no `heading`, `distanceTravelled`, `safety`, `faults`, `localisation` or
-      `energy`: nothing on this Pi measures them (the ESP32 link does not
-      exist), so they are omitted rather than asserted.
+    - `readiness: {"blockers": [...]}` only when `readiness_blockers` is a
+      list -- the caller's statement that it evaluated every check
+      (`RobotAgent.readiness_blockers`). None omits the block: an unevaluated
+      Rover is "not reported", never `[]` (ready).
+    - no `heading`, `distanceTravelled`, `faults`, `localisation` or any
+      other `energy` field: nothing on this Pi measures them, so they are
+      omitted rather than asserted.
 
     `timestamp` (epoch ms) is the instant of measurement: the fix's own time
     when the frame carries one, otherwise the instant the status was read. It
     is never re-stamped: a fix too old to send is omitted, not refreshed, and a
     fix already sent is not sent again as though it were a new observation.
+    The readiness block is stamped by the same `timestamp`; on a fix frame
+    that is the fix's time, which is never later than the evaluation, so the
+    report only ever looks older than it is.
 
     `sequence` is supplied by the caller, which owns its strict increase.
     """
@@ -455,9 +513,13 @@ def build_telemetry_payload(
     stop_latch = _stop_latch_block(snapshot, controller_max_age_s)
     if stop_latch is not None:
         payload["safety"] = {"stopLatch": stop_latch}
+    readiness = readiness_block(readiness_blockers)
+    if readiness is not None:
+        payload["readiness"] = readiness
     battery, charging = demo_battery_report(snapshot)
     if battery is not None:
         payload["battery"] = battery
+        payload["energy"] = {"batterySource": DEMO_BATTERY_SOURCE}
         if charging:
             payload["status"] = DEMO_RECHARGE_STATUS
 
@@ -684,41 +746,13 @@ def build_command_ack_payload(*, command_id: str) -> Dict[str, Any]:
     return {"commandId": command_id}
 
 
-def build_register_payload(
-    *,
-    robot_id: str,
-    binding: ProtocolBinding,
-    agent_version: str,
-    capabilities: Mapping[str, Any],
-) -> Dict[str, Any]:
-    """Identity announced after connect.
-
-    `simulated: false` is the one `Robot` column the Pi is entitled to assert:
-    it is a fact about what kind of agent this process is, known here and
-    nowhere else. Everything else about the robot's record -- where it is
-    assigned, what task it holds -- belongs to the backend.
-
-    No token appears here. The credential travels in the connect handshake and
-    must never be repeated in an event payload, where it would be logged by any
-    server with event logging switched on.
-    """
-
-    return {
-        "schemaVersion": WIRE_SCHEMA_VERSION,
-        "robotId": robot_id,
-        "simulated": False,
-        "agent": {"name": "robotx-pi", "version": agent_version},
-        "capabilities": dict(capabilities),
-        "protocolSource": binding.source.value,
-    }
-
-
 def agent_capabilities() -> Dict[str, Any]:
     """What this physical robot can and cannot do, stated once.
 
-    Sent at registration so a dashboard does not have to infer from silence
-    why a field is always null. Everything here is a property of the hardware
-    that exists today, not of what is planned.
+    Local only: it is never put on the wire. The `register` event that used to
+    carry it has no backend listener, and a `capabilities` key in TELEMETRY
+    would make the backend drop the whole frame (§23.2). Everything here is a
+    property of the hardware that exists today, not of what is planned.
     """
 
     return {

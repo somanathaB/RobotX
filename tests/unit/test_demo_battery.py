@@ -525,17 +525,43 @@ class TestTelemetryFrame(unittest.TestCase):
 
     def test_simulated_value_rides_the_existing_battery_field(self):
         payload = self.frame(self.snap(simulated_power(87.26), mode=OperatingMode.AUTO))
-        self.assertEqual(set(payload), self.BASE_KEYS | {"battery"})
+        self.assertEqual(set(payload), self.BASE_KEYS | {"battery", "energy"})
         self.assertEqual(payload["battery"], 87.3)
         self.assertEqual(payload["status"], "ACTIVE")
-        # Never a measurement basis: the backend must not plan with it.
-        self.assertNotIn("energy", payload)
+        # Labelled as simulated (handoff P-2), and never a measurement basis:
+        # no socMethod, so the backend must not plan with it.
+        self.assertEqual(payload["energy"], {"batterySource": "DEMO_SIMULATION"})
         json.dumps(payload)
 
     def test_a_recharge_frame_from_an_idle_rover_says_charging(self):
         payload = self.frame(self.snap(simulated_power(100.0, charging=True, phase="CHARGED_UNREPORTED")))
         self.assertEqual(payload["status"], "CHARGING")
         self.assertEqual(payload["battery"], 100.0)
+        self.assertEqual(payload["energy"], {"batterySource": "DEMO_SIMULATION"})
+
+    def test_every_demo_frame_is_labelled_and_never_carries_a_soc_basis(self):
+        """Acceptance (2): every frame with a demo `battery` says DEMO_SIMULATION, none says socMethod."""
+
+        cases = [
+            (simulated_power(87.26), OperatingMode.AUTO),
+            (simulated_power(42.0), OperatingMode.IDLE),
+            (simulated_power(31.0), OperatingMode.PAUSED),
+            (simulated_power(100.0, charging=True, phase="CHARGED_UNREPORTED"), OperatingMode.IDLE),
+        ]
+        for power, mode in cases:
+            payload = self.frame(self.snap(power, mode=mode))
+            self.assertIn("battery", payload, mode)
+            self.assertEqual(payload["energy"], {"batterySource": "DEMO_SIMULATION"}, mode)
+            self.assertNotIn("socMethod", json.dumps(payload), mode)
+
+    def test_no_label_without_a_demo_battery(self):
+        """`energy` exists only to qualify a demo `battery`; with none sent, it is absent too."""
+
+        self.assertNotIn("energy", self.frame(self.snap(PowerState())))
+        for mode in (OperatingMode.AUTO, OperatingMode.PAUSED):
+            payload = self.frame(self.snap(simulated_power(100.0, charging=True), mode=mode))
+            self.assertNotIn("battery", payload, mode)
+            self.assertNotIn("energy", payload, mode)
 
     def test_a_recharge_that_cannot_say_charging_omits_battery(self):
         for mode in (OperatingMode.AUTO, OperatingMode.PAUSED, OperatingMode.STOPPED, OperatingMode.ERROR):

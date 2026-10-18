@@ -70,7 +70,7 @@ import random
 import time
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import urlparse
 
 import socketio  # type: ignore
@@ -107,12 +107,10 @@ from robotx.communication.protocol import (
     EventLevel,
     InboundCommand,
     ProtocolBinding,
-    agent_capabilities,
     build_auth_payload,
     build_command_ack_payload,
     build_event_payload,
     build_heartbeat_payload,
-    build_register_payload,
     build_status_payload,
     build_task_complete_payload,
     build_telemetry_payload,
@@ -362,6 +360,8 @@ def validate_robot_id(robot_id: str) -> str:
 
 ClientFactory = Callable[["BackendConfig"], Any]
 AgentAlive = Callable[[], bool]
+# The Rover's readiness blockers for one snapshot (`RobotAgent.readiness_blockers`).
+ReadinessSource = Callable[[Any], Sequence[str]]
 
 
 def _default_client_factory(cfg: BackendConfig) -> Any:
@@ -396,8 +396,13 @@ class BackendLink:
         agent_alive: Optional[AgentAlive] = None,
         commitment_store: Optional[CommitmentStore] = None,
         telemetry_sent: Optional[Callable[[Dict[str, Any]], None]] = None,
+        readiness: Optional[ReadinessSource] = None,
     ) -> None:
         self.cfg = cfg
+        # Where TELEMETRY's `readiness.blockers` come from. None (a link driven
+        # directly, as in tests) means the block is never sent: readiness that
+        # nothing evaluated is "not reported", never "ready".
+        self._readiness = readiness
         # Told about every TELEMETRY payload that left the Pi. Used only by the
         # DEMO battery simulation, to know a recharge reached the backend.
         self._telemetry_sent = telemetry_sent
@@ -1128,18 +1133,8 @@ class BackendLink:
         """Stream telemetry for as long as the link stays authenticated."""
 
         self._set_status(BackendLinkStatus.STREAMING, "streaming telemetry")
-        # An optional, operator-bound registration channel. Empty by default:
-        # FalconAut identifies the robot through AUTH, not a register event.
-        if self.cfg.binding.register:
-            await self._emit(
-                self.cfg.binding.register,
-                build_register_payload(
-                    robot_id=self.cfg.robot_id,
-                    binding=self.cfg.binding,
-                    agent_version=AGENT_VERSION,
-                    capabilities=agent_capabilities(),
-                ),
-            )
+        # No registration event: the backend identifies the robot through AUTH
+        # and has no `register` listener (ROBOTX_PI_READINESS_HANDOFF P-4).
         if self.cfg.binding.status:
             await self._publish_status(force=True)
 
@@ -1212,13 +1207,35 @@ class BackendLink:
         if await self._emit(self.cfg.binding.heartbeat, payload):
             self.stats["heartbeats_sent"] += 1
 
+    def _readiness_blockers(self, snapshot: Any) -> Optional[List[str]]:
+        """This frame's readiness blockers, or None when they cannot be vouched for.
+
+        None -- and so no `readiness` block -- when there is no source, when the
+        agent loop has stalled (the snapshot then describes a robot that is no
+        longer sensing, exactly what HEARTBEAT refuses to vouch for), or when a
+        check fails to evaluate. Never `[]` in any of those cases: the backend
+        reads `[]` as "nothing blocks".
+        """
+
+        if self._readiness is None:
+            return None
+        if self._agent_alive is not None and not self._agent_alive():
+            return None
+        try:
+            return list(self._readiness(snapshot))
+        except Exception:  # noqa: BLE001 - an unevaluable check is "not reported"
+            logger.exception("readiness evaluation failed; readiness omitted from this frame")
+            return None
+
     async def _publish_telemetry(self) -> None:
         self._telemetry_sequence += 1
+        snapshot = self.state.snapshot()
         frame = build_telemetry_payload(
-            self.state.snapshot(),
+            snapshot,
             sequence=self._telemetry_sequence,
             max_position_age_s=self.cfg.max_position_age_s,
             last_position_timestamp=self._last_position_sent,
+            readiness_blockers=self._readiness_blockers(snapshot),
         )
         if not frame.has_position:
             # Not an error, and never a reason to put something else in lat/lon.

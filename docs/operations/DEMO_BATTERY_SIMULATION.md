@@ -84,13 +84,20 @@ faster rate is offered, because the backend has none.
 
 The Pi uses the **existing** `TELEMETRY` event and its existing `battery`
 field. That is the field the backend's `telemetry.handler.js` already parses,
-caches, broadcasts and writes to `Robot.battery`. There is no new event, no new
-endpoint and no backend change.
+caches, broadcasts and writes to `Robot.battery`. There is no new event and no
+new endpoint. The `energy.batterySource` label below needs the 2026-10-18
+backend to be displayed as DEMO_SIMULATED; an older backend ignores it.
 
 - **Simulation off:** `battery` is never sent, exactly as before. The dashboard
   shows "0%" only because `Robot.battery` is `null` and the frontend renders
   `battery || 0`.
 - **Simulation on:** every frame carries `battery` (0.1 % resolution).
+- **Every such frame is labelled `energy: {"batterySource": "DEMO_SIMULATION"}`**
+  (ROBOTX_PI_READINESS_HANDOFF P-2). A backend that knows the label shows the
+  value as DEMO_SIMULATED instead of UNVERIFIED and never writes it to
+  `BatteryState`, even beside a `socMethod`; an older backend ignores the label.
+  The label is a statement that the number is invented for the demonstration:
+  it is not a measurement and satisfies no physical state-of-charge requirement.
 - **`energy.socMethod` is never sent.** Without it the backend stores the value
   for display but never writes it into `BatteryState.lastObservedSoc`
   (`batteryObservation.service.js`, P2B-2). So the assignment engine never plans

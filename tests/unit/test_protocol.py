@@ -25,7 +25,6 @@ from robotx.communication.protocol import (
     agent_capabilities,
     build_command_ack_payload,
     build_event_payload,
-    build_register_payload,
     build_status_payload,
     build_telemetry_payload,
     mode_for_command,
@@ -120,7 +119,6 @@ class TestProtocolBinding(unittest.TestCase):
         """Emitting an event the backend never declared invents protocol."""
 
         binding = ProtocolBinding()
-        self.assertEqual(binding.register, "")
         self.assertEqual(binding.status, "")
         self.assertEqual(binding.event, "")
         self.assertNotIn("", binding.outbound_events())
@@ -284,24 +282,18 @@ class TestStatusPayload(unittest.TestCase):
 
 
 class TestOtherPayloads(unittest.TestCase):
-    def test_register_declares_a_physical_robot(self):
-        payload = build_register_payload(
-            robot_id="robotx-pi",
-            binding=ProtocolBinding(),
-            agent_version="2.1",
-            capabilities=agent_capabilities(),
-        )
-        self.assertIs(payload["simulated"], False)
-        self.assertEqual(payload["robotId"], "robotx-pi")
+    def test_there_is_no_register_event(self):
+        """Handoff P-4: the backend has no `register` listener; identity is AUTH."""
 
-    def test_register_never_carries_the_token(self):
-        payload = build_register_payload(
-            robot_id="robotx-pi",
-            binding=ProtocolBinding(),
-            agent_version="2.1",
-            capabilities=agent_capabilities(),
+        binding = ProtocolBinding()
+        self.assertFalse(hasattr(binding, "register"))
+        self.assertNotIn("register", binding.to_dict()["outbound"])
+        # An older binding file that still names it is ignored like any unknown key.
+        loaded = ProtocolBinding.from_mapping(
+            {"outbound": {"register": "register", "telemetry": "TELEMETRY"}},
+            source=BindingSource.FILE,
         )
-        self.assertNotIn("token", json.dumps(payload).lower())
+        self.assertNotIn("register", loaded.outbound_events())
 
     def test_capabilities_admit_what_the_robot_cannot_do(self):
         caps = agent_capabilities()

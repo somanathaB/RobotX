@@ -34,22 +34,39 @@ and logs `backend.config_invalid`. The V1 values and their verification are in
 |---|---|---|
 | `AUTH` | `{robotId, token}` or `{robotId, pairingCode}` | After every connect |
 | `HEARTBEAT` | `{}`, or `{commitmentId, fence}` while carrying out an accepted mission | Every 2 s, only while the agent loop is ticking |
-| `TELEMETRY` | `{timestamp, sequence, status}` plus `lat, lon, speed?` for a fresh measured fix, plus `battery` only in the opt-in demo battery simulation | 1 Hz |
+| `TELEMETRY` | `{timestamp, sequence, status}` plus `lat, lon, speed?, position?` for a fresh measured fix, `safety.stopLatch` while the ESP32 telemetry is fresh, `readiness.blockers` while the agent loop is ticking, and `battery` + `energy.batterySource: "DEMO_SIMULATION"` only in the opt-in demo battery simulation | 1 Hz |
 | `COMMAND_ACK` | operator: `{commandId}`; engine: `{outboxId, fence, authorityEpoch}` | Operator: only once applied. Engine: once admitted |
 | `OFFER_ACCEPT` / `OFFER_REJECT` / `OFFER_DEFER` | `{commitmentId, fence, reason?, until?}` | One verdict per commitment, persisted before it is sent; the same payload is resent after a later `AUTH` while the offer can still be answered (Y2) |
 | `CUSTODY_EVENT` | `{commitmentId, fence, kind}` | Once per genuine handover, persisted before it is sent; resent unchanged after each `AUTH` until the completion is settled (Y2) |
 | `TASK_COMPLETE` | `{taskId, lat, lon}` | Only on L1-sufficient measured evidence, persisted before it is sent; resent unchanged after each `AUTH` until `TASK_COMPLETE_ACK` (Y2) |
 
 **Missing data is omitted.** No `null`, `0`, `-1` or placeholder. The Pi never
-sends `heading`, `distanceTravelled`, `safety`, `faults`, `localisation` or
-`energy`: nothing on it measures them. It never sends a measured `battery`
-either; only the opt-in DEMO simulation (`ROBOTX_DEMO_BATTERY_ENABLED=1`) puts a
-**simulated** percentage in `battery`, without `energy.socMethod` (so the
-backend displays it but never plans with it), and reports its demo recharge
+sends `heading`, `distanceTravelled`, `faults`, `localisation`, an e-stop
+circuit or any measured `energy` field: nothing on it measures them. It never
+sends a measured `battery` either; only the opt-in DEMO simulation
+(`ROBOTX_DEMO_BATTERY_ENABLED=1`) puts a **simulated** percentage in `battery`,
+labelled `energy: {"batterySource": "DEMO_SIMULATION"}` and never with
+`energy.socMethod` (so the backend displays it as DEMO_SIMULATED and never
+plans with it), and reports its demo recharge
 with `status: "CHARGING"` because §23.5 refuses a rise otherwise. See
 [`../operations/DEMO_BATTERY_SIMULATION.md`](../operations/DEMO_BATTERY_SIMULATION.md). `lat`/`lon` are only
 ever a fresh, measured GPS fix, each fix sent once. A dead-reckoned pose is
 never sent, and no setting can make it be.
+
+**Readiness.** `readiness: {"blockers": [...]}` lists every reason the Rover
+would refuse *any* offer right now, from the same checks as `assess_offer`
+(`RobotAgent.readiness_blockers`), in its order and in the exact `OFFER_REJECT`
+codes: `ESTOP_LATCHED`, `AGENT_ERROR`, `NO_MOTOR_LINK` (link not UP, or not
+motion-ready -- always so while `ROBOTX_ESP32_MOTION_ENABLED=false`),
+`NO_POSITION_FIX`, `NO_CUSTODY_SENSING`. The offer-specific
+`MISSION_IN_PROGRESS` and `NO_EXECUTABLE_PATH` are never in it. `[]` is sent
+only when every check passed. The block is **omitted** -- read by the backend as
+"not reported", never as ready -- before the first agent tick, while the agent
+loop is stalled, or if a check fails to evaluate. It is stamped by the frame's
+`timestamp`. (Backend contract §4; ROBOTX_PI_READINESS_HANDOFF P-1.)
+
+There is no `register` event: the backend has no listener for it, and a robot's
+kind and abilities come from commissioning and the owner's declaration (P-4).
 
 `timestamp` is the fix's measurement time when a fix is present, otherwise the
 instant the status was read. `sequence` is seeded from the wall clock in

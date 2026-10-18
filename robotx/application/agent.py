@@ -316,6 +316,7 @@ class RobotAgent:
             self,
             agent_alive=self.is_alive,
             telemetry_sent=self.battery_telemetry_sent if self.demo_battery is not None else None,
+            readiness=self.readiness_blockers,
         )
         await self.backend.start()
 
@@ -580,30 +581,61 @@ class RobotAgent:
             return OfferDecision.reject(f"UNSUPPORTED_MISSION: {e.reason.value}")
 
         snapshot = self.state.snapshot()
-        if self.safety.estop_engaged:
-            return OfferDecision.reject("ESTOP_LATCHED")
-        if snapshot.mode is OperatingMode.ERROR:
-            return OfferDecision.reject("AGENT_ERROR")
+        blockers = self.readiness_blockers(snapshot)
+        # The Rover-level checks, in the same fixed order as always, with the
+        # one offer-level check (a mission already held) in its old place:
+        # after the e-stop and ERROR, before the motor link.
+        if blockers and blockers[0] in ("ESTOP_LATCHED", "AGENT_ERROR"):
+            return OfferDecision.reject(blockers[0])
         if snapshot.mission is not None and snapshot.mission.is_active:
             return OfferDecision.reject("MISSION_IN_PROGRESS")
-        # Motor authority belongs to the ESP32. Without that link the Rover
-        # cannot move at all, whatever it accepts.
-        if not snapshot.communication.esp32.is_up:
-            return OfferDecision.reject("NO_MOTOR_LINK")
-        # An UP link is not yet a motor link: motion must be enabled on the Pi,
-        # and the ESP32's fresh TELEMETRY must report its drive available and no
-        # controller safety fault (safety_stop, front_valid=false,
-        # command_timeout) -- see Esp32Link._motion_ready.
-        if self.esp32 is not None and not self.esp32.status().motion_ready:
-            return OfferDecision.reject("NO_MOTOR_LINK")
-        if snapshot.position is None or not snapshot.position.is_measured or not snapshot.gps.has_fix:
-            return OfferDecision.reject("NO_POSITION_FIX")
-        # A fix navigation will not drive on is, for this offer, no fix.
-        if not self.navigator.usable(snapshot.position):
-            return OfferDecision.reject("NO_POSITION_FIX")
-        if not self.custody_sensing_available():
-            return OfferDecision.reject("NO_CUSTODY_SENSING")
+        if blockers:
+            return OfferDecision.reject(blockers[0])
         return OfferDecision.accept(mission)
+
+    def readiness_blockers(self, snapshot: Optional[Any] = None) -> List[str]:
+        """Every reason this Rover would refuse any offer right now, in `assess_offer`'s order.
+
+        The single source of both `assess_offer`'s Rover-level refusals and the
+        TELEMETRY `readiness.blockers` (ROBOTX_PI_READINESS_HANDOFF P-1), so the
+        backend is told exactly what an offer would be refused for -- before it
+        sends one. Every applicable code, not only the first. `[]` only when
+        every check positively passed; a check that cannot be evaluated raises,
+        and the caller then reports nothing rather than `[]`.
+
+        Offer-specific reasons (`MISSION_IN_PROGRESS`, `NO_EXECUTABLE_PATH`,
+        `UNSUPPORTED_MISSION`) are not here: they are about one offer, not the
+        Rover.
+        """
+
+        snapshot = self.state.snapshot() if snapshot is None else snapshot
+        blockers: List[str] = []
+        if self.safety.estop_engaged:
+            blockers.append("ESTOP_LATCHED")
+        if snapshot.mode is OperatingMode.ERROR:
+            blockers.append("AGENT_ERROR")
+        # Motor authority belongs to the ESP32. Without that link the Rover
+        # cannot move at all, whatever it accepts. An UP link is not yet a
+        # motor link: motion must be enabled on the Pi, and the ESP32's fresh
+        # TELEMETRY must report its drive available and no controller safety
+        # fault (safety_stop, front_valid=false, command_timeout) -- see
+        # Esp32Link._motion_ready. `ROBOTX_ESP32_MOTION_ENABLED=false` is
+        # therefore always NO_MOTOR_LINK.
+        if not snapshot.communication.esp32.is_up or (
+            self.esp32 is not None and not self.esp32.status().motion_ready
+        ):
+            blockers.append("NO_MOTOR_LINK")
+        # A fix navigation will not drive on is no fix.
+        if (
+            snapshot.position is None
+            or not snapshot.position.is_measured
+            or not snapshot.gps.has_fix
+            or not self.navigator.usable(snapshot.position)
+        ):
+            blockers.append("NO_POSITION_FIX")
+        if not self.custody_sensing_available():
+            blockers.append("NO_CUSTODY_SENSING")
+        return blockers
 
     def custody_sensing_available(self) -> bool:
         """Whether a parcel handover on this Rover can be truthfully reported.
