@@ -55,14 +55,15 @@ Routes:
 ### Quick status
 
 ```bash
-curl -s $S/state | jq '{mode, safety: .safety.rule, mission: (.mission | if . then {task_id, status, segment, pickup_measured, drop_measured, custody_acquired_at} else null end), esp32: .communication.esp32, motion_ready: .controller.motion_ready, reboot_latched: .controller.reboot_latched, gps: .gps.status, position: .position.source}'
+curl -s $S/state | jq '{mode, last_error, safety: .safety.rule, mission: (.mission | if . then {task_id, status, segment, pickup_measured, drop_measured, custody_acquired_at} else null end), esp32: .communication.esp32, motion_ready: .controller.motion_ready, reboot_latched: .controller.reboot_latched, gps: .gps.status, position: .position.source}'
 curl -s $S/backend | jq '{status, streaming, authenticated, auth_method, auth_failure, held_commitment, link_loss}'
 ```
 
 | Field | Values |
 |---|---|
 | `mode` | `IDLE`, `AUTO` (driving a mission), `PAUSED` (held, route kept), `STOPPED`, `ERROR` |
-| `safety` | `"estop"` while the software e-stop is latched |
+| `last_error` | Why a mission paused on its own, by prefix: `obstacle:` (blocked 30 s), `navigation:` (no usable GPS position or off route for 30 s, or 60 s of driving with no progress), `controller:` (the ESP32 cannot carry motion: latched safety stop, front sensing invalid, watchdog, link loss), `backend:` (link lost beyond the grace). Only `/state` shows it; the backend sees `PAUSED`. A RESUME clears it. |
+| `safety` | `"estop"` while the software e-stop is latched; `"obstacle"` while the camera or the front range (at or inside 90 cm) holds the rover; `"range_unreliable"` / `"range_missing"` while the ESP32 front range is not valid and fresh |
 | `mission.status` | `TO_PICKUP`, `AT_PICKUP`, `TO_DROP`, `AT_DROP`, `COMPLETE`, `ABORTED` |
 | `esp32` | `UP` is required for motion; `STALE`/`DISCONNECTED` are faults |
 | `gps` / `position` | `FIX` / `"GPS"` = a measured position |
@@ -604,8 +605,9 @@ A service restart, crash or reboot while the robot holds a commitment.
 - **Prerequisite:** the robot is IDLE with no unreleased commitment; no goods
   on board.
 - **Action:** V1_PI_DEPLOYMENT.md section 24. Targets: the V1 candidate
-  (`099e386`/`130e3f6` and its release commit); emergency software rollback to
-  `db10b15` or `8073c71` **only with `ROBOTX_ESP32_MOTION_ENABLED=0`**.
+  (the reviewed candidate of section 2 and its release commit); emergency
+  software rollback to `d718a81`, `5c3d47b`, `099e386`/`130e3f6`, `db10b15` or
+  `8073c71` **only with `ROBOTX_ESP32_MOTION_ENABLED=0`**.
   `7c58cd6`, older commits, `master` and `laptop-pi` are **not** rollback
   targets.
 - **Expected:** after the restart, the deployment checks (sections 19–21) pass;

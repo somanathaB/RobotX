@@ -29,7 +29,11 @@ The setup below is the bench / development path.
 ## What it does today
 
 - Captures frames from the Pi Camera Module 3 (Picamera2/libcamera)
-- Detects objects (OpenCV motion + edge backends; optional YOLOv8)
+- Detects objects (OpenCV motion + edge backends, OpenCV HOG for people;
+  optional YOLOv8). A person stops the rover at once; a camera obstacle must
+  persist for two cycles. Detection accuracy on this camera is unmeasured
+- Stops for the ESP32's front ultrasonic range at or inside 90 cm, before the
+  ESP32's own 40 cm gate latches; a stale or invalid range never reads as clear
 - Reads position either from the ESP32's GPS frames (`ROBOTX_GPS_SOURCE=esp32`,
   the V1 rover's wiring) or from an NMEA receiver on the Pi's own serial port
   (the bench default), with explicit fix validity and staleness. ESP32 GPS
@@ -140,13 +144,15 @@ they are used over SSH, on the Pi itself.
 Automated, hardware-free (stdlib `unittest`, no pytest needed):
 
 ```bash
-venv/bin/python -m unittest discover -s tests/unit -t .         # 924 tests
-venv/bin/python -m unittest discover -s tests/integration -t .  # 55 tests
+venv/bin/python -m unittest discover -s tests/unit -t .         # 1163 tests
+venv/bin/python -m unittest discover -s tests/integration -t .  # 62 tests
 ```
 
-Counts as verified on Linux (Python 3.11 and 3.13, x86_64; Python 3.13 on
-emulated ARM64). On Windows a few tests that depend on POSIX file modes or
-socket timing fail; run the suites on Linux.
+Counts as of 2026-10-18, measured on Windows; the last Linux verification
+(Python 3.11 and 3.13, x86_64; Python 3.13 on emulated ARM64) was at 924/55.
+On Windows a few tests that depend on POSIX file modes or socket timing fail;
+run the suites on Linux. The 7 firmware-simulator integration tests skip unless
+`ROBOTX_ESP32_SIMULATOR_EXE` names a host build of the ESP32 firmware.
 
 The integration suite runs a real Socket.IO server on a loopback port and
 drives the real client against it — genuine handshake, genuine JSON, nothing

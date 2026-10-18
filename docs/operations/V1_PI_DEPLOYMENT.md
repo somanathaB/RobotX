@@ -32,23 +32,32 @@ ESP32 firmware, and the dashboard beyond its enrollment screen (section 17).
 
 | What | Value |
 |---|---|
-| Branch | `gate3-pi-proposal` on `https://github.com/somanathaB/RobotX.git` |
-| Verified software candidate | `130e3f6` — application code of `099e386` (Gate 3b navigation) plus verified dependency pins |
+| Branch | `integration/robotx-pi-autonomy` on `https://github.com/somanathaB/RobotX.git` |
+| Base | `d718a81` (contains `288d26b` GPS validation + accuracy gate, `54b0b12` RESUME binding, `5c3d47b` stop-and-recover / no pivots / link re-proof) |
+| Verified software candidate | `c4f4d2c`: the 2026-10-18 changes on that branch (ESP32 front range in the Pi safety gate, bounded navigation stops, per-fix off-route counting, HOG person detection, two-cycle obstacle persistence). Software-verified only (section 11): **not run on the robot.** |
 | Release commit | the commit that contains this document (`<release-commit>` below) |
+| ESP32 firmware | `main` @ `f10bb8f` on `https://github.com/somanatha-dev/ROBOTX---ESP32.git`, built with `tools/gen_fw_build_id.py` so READY and DIAG SYSTEM report `fw_build` beginning `f10bb8f`. An `unversioned` build is not this firmware as far as anyone can prove. The Pi's 90 cm range stop assumes this firmware's 40 cm front gate (`config.h` `SAFETY_STOP_DISTANCE_CM`). |
 
-Deploy `<release-commit>`. It must differ from `130e3f6` only in deployment and
-documentation files. Check that before installing (empty output = correct):
+`gate3-pi-proposal` / `130e3f6` is **superseded**: it lacks every commit listed
+under Base and the reviewed changes, so on it a camera obstacle makes the rover
+pivot (reverse into its rear gate) and a brief obstacle strands the leg in
+`REROUTE_NEEDED`. Do not deploy it with motion enabled (section 24).
+
+Deploy `<release-commit>`. It must differ from `c4f4d2c` only in
+deployment and documentation files. Check that before installing (empty output
+= correct):
 
 ```bash
-git diff --stat 130e3f6 <release-commit> -- robotx requirements.txt
+git diff --stat c4f4d2c <release-commit> -- robotx requirements.txt
 ```
 
 What each older commit can and cannot be used for is in section 24.
 
 ## 3. Supported Python versions
 
-[SW-VERIFIED] On `130e3f6`: 22/22 targeted, 924/924 unit and 55/55 integration
-tests on
+[SW-VERIFIED] On the former candidate `130e3f6`: 22/22 targeted, 924/924 unit
+and 55/55 integration tests on the platforms below. The reviewed candidate
+(section 2) has been run on Windows only (section 11); re-run it on
 
 - Python 3.11, Linux x86_64;
 - Python 3.13, Linux x86_64;
@@ -137,11 +146,11 @@ runbook, "Access"). Keep the Pi's accounts to the operators.
 
 ```bash
 sudo install -d -m 0755 /opt/robotx
-sudo git clone --branch gate3-pi-proposal https://github.com/somanathaB/RobotX.git /opt/robotx/RobotX-Pi
+sudo git clone --branch integration/robotx-pi-autonomy https://github.com/somanathaB/RobotX.git /opt/robotx/RobotX-Pi
 sudo git -C /opt/robotx/RobotX-Pi checkout --detach <release-commit>
 sudo git -C /opt/robotx/RobotX-Pi rev-parse HEAD          # must print <release-commit>
 sudo git -C /opt/robotx/RobotX-Pi status --porcelain      # must print nothing
-sudo git -C /opt/robotx/RobotX-Pi diff --stat 130e3f6 HEAD -- robotx requirements.txt   # must print nothing
+sudo git -C /opt/robotx/RobotX-Pi diff --stat c4f4d2c HEAD -- robotx requirements.txt   # must print nothing
 ```
 
 The tree stays owned by root and is read-only to the service
@@ -183,13 +192,20 @@ Optional, recommended once per OS image: run the test suites on the Pi from a
 as root (root bypasses the file-permission checks some tests make):
 
 ```bash
-git clone --branch gate3-pi-proposal https://github.com/somanathaB/RobotX.git ~/robotx-test
+git clone --branch integration/robotx-pi-autonomy https://github.com/somanathaB/RobotX.git ~/robotx-test
 cd ~/robotx-test && git checkout --detach <release-commit>
 python3 -m venv --system-site-packages venv
 venv/bin/python -m pip install -r requirements.txt
-venv/bin/python -m unittest discover -s tests/unit -t .          # expect 924 OK
-venv/bin/python -m unittest discover -s tests/integration -t .   # expect 55 OK
+venv/bin/python -m unittest discover -s tests/unit -t .          # expect OK
+venv/bin/python -m unittest discover -s tests/integration -t .   # expect OK
 ```
+
+Counts at the reviewed changes (measured on Windows, 2026-10-18; not yet run on
+the Pi or on Linux): 1163 unit tests (1 skipped) and 62 integration tests. The
+7 firmware-simulator tests skip unless `ROBOTX_ESP32_SIMULATOR_EXE` names a
+host build; on the Pi they skip. On Windows 4 unit and 2 integration tests fail
+for platform reasons (file modes, socket timing); on Linux all are expected to
+pass.
 
 ## 12. Environment file
 
@@ -263,6 +279,24 @@ Rules that the agent does **not** enforce for you ([SW-VERIFIED] in
 - A backend setting the link refuses (bad URL, loss grace above 10, heartbeat
   above 2, policy `continue`) does **not** stop the service: the agent runs
   with the link disabled and logs `backend.config_invalid`. Section 20 catches it.
+
+Safety and navigation settings with reviewed defaults. Leave every one of these
+**out** of the file unless a reviewed change says otherwise; the defaults are
+what was tested:
+
+| Variable | Default | Why it matters |
+|---|---|---|
+| `ROBOTX_SAFETY_STOP_DISTANCE_CM` | 90 | The Pi stops for the ESP32's front ultrasonic range at or inside this, before the ESP32's own 40 cm gate latches a stop that needs an operator RESET. **40 or less leaves the ESP32 link off** (`esp32.config_invalid`), so the robot cannot move. Older `.env.example` copies set **30**: remove that line. |
+| `ROBOTX_SAFETY_REQUIRE_RANGE_SENSOR` | 0 | With the ESP32 link enabled its front range is always required anyway. |
+| `ROBOTX_NAV_MAX_H_ACC_M` | 5.0 | Worst GPS accuracy navigated on. |
+| `ROBOTX_NAV_HOLD_ASSIST_AFTER_S` / `ROBOTX_NAV_NO_PROGRESS_AFTER_S` / `ROBOTX_NAV_PROGRESS_MIN_M` | 30 / 60 / 3.0 | When a GPS loss, off-route hold, or drive that gets nowhere pauses the mission for an operator. |
+| `ROBOTX_OBSTACLE_CLEAR_HOLD_S` / `ROBOTX_OBSTACLE_ASSIST_AFTER_S` | 2.0 / 30.0 | Clear path needed before moving again after an obstacle; when a blocked rover asks for help. |
+| `ROBOTX_DETECTION_CONFIRM_CYCLES` | 2 | Frames a camera obstacle must persist; a person always stops at once. |
+| `ROBOTX_ESP32_STALE_AFTER_S` | 1.0 | Age at which ESP32 TELEMETRY (and so the front range) stops counting. |
+
+```bash
+sudo grep -nE '^ROBOTX_(SAFETY_|NAV_|OBSTACLE_|DETECTION_|ESP32_STALE)' /etc/robotx/robotx-agent.env   # expect no output
+```
 
 Check the file:
 
@@ -711,8 +745,10 @@ another robot.
 ## 21. First startup checks
 
 ```bash
-curl -s http://127.0.0.1:8000/config | jq '{robot_id, socket_enabled, backend_tls_verify, gps_enabled, gps_source, custody_confirmation, esp32_enabled, esp32_port, esp32_motion_enabled, esp32_simulator_exe, api_host, commitment_state_path, backend_token_path}'
+curl -s http://127.0.0.1:8000/config | jq '{robot_id, socket_enabled, backend_tls_verify, gps_enabled, gps_source, custody_confirmation, esp32_enabled, esp32_port, esp32_motion_enabled, esp32_simulator_exe, api_host, commitment_state_path, backend_token_path, safety_stop_distance_cm}'
 journalctl -u robotx-agent -b | grep -c esp32.simulated      # expect 0
+journalctl -u robotx-agent -b | grep -c esp32.config_invalid # expect 0
+curl -s http://127.0.0.1:8000/state | jq '.controller_diag.SYSTEM.fw_build'   # expect "f10bb8f..." (section 2)
 curl -s http://127.0.0.1:8000/health | jq '.health.components | map_values(.status)'
 curl -s http://127.0.0.1:8000/state | jq '{mode, safety: .safety.rule, esp32: .communication.esp32, motion_ready: .controller.motion_ready, reboot_latched: .controller.reboot_latched, gps: .gps.status, position: .position.source}'
 ```
@@ -770,6 +806,18 @@ able to cut drive power must be within reach for every motion test.
    front sensing not valid, a latched safety stop). The right-front ultrasonic is
    recorded as faulty, and the firmware blocks forward motion on a front-sensor
    fault — resolve the hardware, do not work around it.
+
+   Then the front range as the Pi sees it, rover on its wheels, motion still
+   disabled:
+   `curl -s http://127.0.0.1:8000/state | jq '{front: .controller.telemetry.front, gates: .controller.telemetry.gates, safety: .safety, diag_front: .controller_diag.FRONT}'`
+   in each of: an open path with nothing within 3 m; a flat board at about
+   70 cm; the board at about 150 cm; one sensor covered. Expected: open path and
+   150 cm read `valid: true` with both `left_cm`/`right_cm` above 90; 70 cm reads
+   a distance at or below 90. **Do not enable motion** if the open path reads
+   `valid: false` (no echo: the firmware treats it as a sensor fault) or a
+   steady 40–90 cm on both sensors (ground return: the rover will hold at every
+   step). Both are a mounting or firmware-policy decision, not a setting to
+   change here.
 4. Edit the environment file: `ROBOTX_ESP32_MOTION_ENABLED=1` (keep a dated copy
    first, section 12). Restart while IDLE: `sudo systemctl restart robotx-agent`.
 5. Expect `controller.motion_ready: true` in `/state`. If it stays `false`, the
@@ -793,7 +841,9 @@ able to cut drive power must be within reach for every motion test.
 
 | Commit | Use |
 |---|---|
-| `099e386` / `130e3f6` (and the release commit) | V1 functional candidate: the only commits with working V1 navigation. |
+| `c4f4d2c` (and the release commit) | V1 candidate (section 2): ESP32 front range in the Pi safety gate, bounded navigation stops, person detection. |
+| `d718a81`, `5c3d47b` | **Rollback only with `ROBOTX_ESP32_MOTION_ENABLED=0`.** Obstacle stop-and-recover without pivots, but the Pi ignores the ESP32's front range, so every obstacle inside 40 cm latches an ESP32 stop that needs RESET + RESUME. |
+| `099e386` / `130e3f6` | **Rollback only with `ROBOTX_ESP32_MOTION_ENABLED=0`.** The former V1 candidate: camera obstacles pivot the rover and strand the leg in `REROUTE_NEEDED`; no ESP32 GPS validation or accuracy gate. |
 | `db10b15`, `8073c71` | **Emergency software rollback only, with `ROBOTX_ESP32_MOTION_ENABLED=0`.** They run under this unit, keep the engine-mode lock (H1), the loopback bind (H2) and the link-loss pause (Y4), and read the same settings — but their navigation does not complete a V1 route. |
 | `7c58cd6` | **Not a rollback target.** No `robotx/application/__main__.py`, so `python -m robotx.application` cannot start it; it binds every interface by default and lacks the engine-mode lock. |
 | anything older, `master`, `laptop-pi` | **Not rollback targets.** They lack the link-loss pause and/or drop every OFFER. |
@@ -861,7 +911,14 @@ None of these has been done on the physical robot:
   emulated ARM64 has been tested);
 - which device node is the GPIO 14/15 UART, and the ESP32 link over it;
 - the camera under the service user and the unit's hardening;
-- a GPS fix through the ESP32, outdoors;
+- a GPS fix through the ESP32, outdoors: `hacc_mm`, satellites and fix age
+  over 10 minutes, and whether the GPS-track heading is usable at the rover's
+  real speed;
+- the front ultrasonic range in open space and against an object (section 23
+  step 3), the rover's real speed and its stopping distance from 90 cm;
+- HOG person detection on this camera (only people about half the frame tall or
+  more are found) and the camera obstacle detector's false-positive rate
+  outdoors, plus their CPU cost on the Pi 5;
 - ESP32 motion readiness, the faulty front ultrasonic, the 2 s ESP32 watchdog
   stopping the motors when commands stop;
 - a physical emergency stop (none fitted);
