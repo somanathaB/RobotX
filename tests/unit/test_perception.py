@@ -236,7 +236,8 @@ class TestPerceptionPipeline(unittest.TestCase):
         detector = FakeDetector(
             rows=[{"label": "obstacle", "confidence": 0.7, "bbox": (10, 10, 60, 60), "area": 2500}]
         )
-        pipeline = self.make_pipeline(FakeCamera(frame=FakeFrame()), detector)
+        # One cycle, so no multi-cycle confirmation (TestDetectionPersistence).
+        pipeline = self.make_pipeline(FakeCamera(frame=FakeFrame()), detector, confirm_cycles=1)
         result = pipeline.step_once()
 
         self.assertIs(result.status, PerceptionStatus.OK)
@@ -250,7 +251,7 @@ class TestPerceptionPipeline(unittest.TestCase):
         detector = FakeDetector(
             rows=[{"label": "obstacle", "confidence": 0.7, "bbox": (0, 0, 50, 50)}]
         )
-        pipeline = self.make_pipeline(FakeCamera(frame=FakeFrame()), detector)
+        pipeline = self.make_pipeline(FakeCamera(frame=FakeFrame()), detector, confirm_cycles=1)
 
         first = pipeline.step_once()
         self.assertEqual(first.largest_area_delta_px, 2500)

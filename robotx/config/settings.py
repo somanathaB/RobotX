@@ -146,6 +146,10 @@ class Settings:
     # Detector runs on a downscaled frame; bboxes are scaled back to full res.
     detection_inference_width: int = 320
     detection_inference_height: int = 240
+    # Consecutive perception cycles a non-person detection must appear in
+    # (overlapping) before it is acted on; 1 acts on a single frame. A person
+    # is always acted on at once. robotx.perception.pipeline.
+    detection_confirm_cycles: int = 2
     # A perception result older than this is treated as unusable (fail safe).
     perception_stale_after_s: float = 3.0
 
@@ -222,6 +226,13 @@ class Settings:
     nav_target_speed_mps: float = 0.25
     # Worst receiver-stated horizontal accuracy navigation will act on (metres).
     nav_max_h_acc_m: float = 5.0
+    # Bounded navigation stops (robotx.navigation.progress): a hold for no
+    # usable GPS position or off route this long, or this long of commanded
+    # motion without getting nav_progress_min_m closer to the waypoint, pauses
+    # the mission for an operator. Escalation limits, not measured values.
+    nav_hold_assist_after_s: float = 30.0
+    nav_no_progress_after_s: float = 60.0
+    nav_progress_min_m: float = 3.0
 
     # Optional online routing. Without an API key the agent runs on locally
     # supplied waypoint lists only -- it never fabricates a route.
@@ -278,8 +289,15 @@ class Settings:
     # do if it read the same numbers. See robotx.control.safety.
     safety_max_speed: float = 0.75
     safety_max_intent_age_s: float = 1.0
-    safety_stop_distance_cm: float = 30.0
-    # Leave 0 until a forward range sensor is actually wired; see SafetyConfig.
+    # Forward range (the ESP32's front ultrasonics) at or inside which the Pi
+    # stops. Must be beyond the ESP32's own 40 cm gate, or the ESP32 latches
+    # first (the link refuses to start otherwise; robotx.esp32.front_range).
+    # 90 is the firmware's SAFETY_WARN_DISTANCE_CM, the band it reserves for
+    # the Pi to act in: a 50 cm margin for TELEMETRY (200 ms) + loop latency
+    # and stopping distance. The rover's stopping distance is not measured.
+    safety_stop_distance_cm: float = 90.0
+    # With an ESP32 link attached its front range is always required; this
+    # requires a range source even without one. See SafetyConfig.
     safety_require_range_sensor: bool = False
 
     # --- Health -------------------------------------------------------------
@@ -438,6 +456,7 @@ class Settings:
             yolo_model_path=_get_str(e, "ROBOTX_YOLO_MODEL_PATH", d.yolo_model_path),
             detection_inference_width=_get_int(e, "ROBOTX_DETECTION_INFERENCE_WIDTH", d.detection_inference_width),
             detection_inference_height=_get_int(e, "ROBOTX_DETECTION_INFERENCE_HEIGHT", d.detection_inference_height),
+            detection_confirm_cycles=_get_int(e, "ROBOTX_DETECTION_CONFIRM_CYCLES", d.detection_confirm_cycles),
             perception_stale_after_s=_get_float(e, "ROBOTX_PERCEPTION_STALE_AFTER_S", d.perception_stale_after_s),
             detector_mog2_history=_get_int(e, "ROBOTX_MOG2_HISTORY", d.detector_mog2_history),
             detector_mog2_var_threshold=_get_float(e, "ROBOTX_MOG2_VAR_THRESHOLD", d.detector_mog2_var_threshold),
@@ -474,6 +493,9 @@ class Settings:
             nav_blocked_reroute_after_n=_get_int(e, "ROBOTX_NAV_BLOCKED_REROUTE_AFTER_N", d.nav_blocked_reroute_after_n),
             nav_target_speed_mps=_get_float(e, "ROBOTX_NAV_TARGET_SPEED_MPS", d.nav_target_speed_mps),
             nav_max_h_acc_m=_get_positive_float(e, "ROBOTX_NAV_MAX_H_ACC_M", d.nav_max_h_acc_m),
+            nav_hold_assist_after_s=_get_positive_float(e, "ROBOTX_NAV_HOLD_ASSIST_AFTER_S", d.nav_hold_assist_after_s),
+            nav_no_progress_after_s=_get_positive_float(e, "ROBOTX_NAV_NO_PROGRESS_AFTER_S", d.nav_no_progress_after_s),
+            nav_progress_min_m=_get_positive_float(e, "ROBOTX_NAV_PROGRESS_MIN_M", d.nav_progress_min_m),
             google_maps_api_key=_get(e, "ROBOTX_GOOGLE_MAPS_API_KEY", d.google_maps_api_key),
             directions_min_interval_s=_get_float(e, "ROBOTX_DIRECTIONS_MIN_INTERVAL_S", d.directions_min_interval_s),
             directions_cache_ttl_s=_get_float(e, "ROBOTX_DIRECTIONS_CACHE_TTL_S", d.directions_cache_ttl_s),

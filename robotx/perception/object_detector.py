@@ -2,7 +2,12 @@
 
 Backends:
 - `opencv` : CPU-only. MOG2 background subtraction for moving obstacles, with a
-             Canny/contour fallback for static ones. No model download needed.
+             Canny/contour fallback for static ones, plus OpenCV's built-in HOG
+             people detector for the `person` label. No model download needed.
+             HOG's window is 64x128 px of the frame it is given (the 320x240
+             inference frame), so it finds only people at least about half
+             the frame tall -- the near ones. Its accuracy on this camera has
+             not been measured.
 - `yolo`   : YOLOv8 via `ultralytics` (optional dependency; not installed here).
 - `auto`   : prefer `opencv` on the Pi, fall back to `yolo` if OpenCV init fails.
 
@@ -114,12 +119,19 @@ def filter_detections(
     Rejects: full-frame spans, boxes outside the hard area band, boxes whose raw
     coordinates fall outside the frame, and extreme aspect ratios. Survivors are
     ranked by `area * confidence` and truncated to `max_keep`.
+
+    A `person` is exempt from the background, clipping and truncation rules:
+    the nearest person is exactly the one that fills the frame's height or is
+    cut off by its edge, and a person must never be ranked out by bigger
+    obstacles. People are clipped to the frame, kept above the minimum area,
+    and listed first.
     """
 
     w = int(max(1, frame_w))
     h = int(max(1, frame_h))
 
     out: List[Dict[str, Any]] = []
+    people: List[Dict[str, Any]] = []
     for d in detections:
         if not isinstance(d, dict):
             continue
@@ -136,6 +148,18 @@ def filter_detections(
         bw = max(0, x2 - x1)
         bh = max(0, y2 - y1)
         if bw <= 0 or bh <= 0:
+            continue
+
+        try:
+            confidence = float(d.get("confidence", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            confidence = 0.0
+
+        if str(d.get("label", "")) == "person":
+            if bw * bh >= HARD_MIN_AREA:
+                people.append(
+                    {"label": "person", "confidence": confidence, "bbox": (x1, y1, x2, y2), "area": int(bw * bh)}
+                )
             continue
 
         # Background-like: spans most of the frame in either axis.
@@ -158,11 +182,6 @@ def filter_detections(
         if ratio < ASPECT_RATIO_MIN or ratio > ASPECT_RATIO_MAX:
             continue
 
-        try:
-            confidence = float(d.get("confidence", 0.0) or 0.0)
-        except (TypeError, ValueError):
-            confidence = 0.0
-
         out.append(
             {
                 "label": str(d.get("label", "obstacle")) or "obstacle",
@@ -173,7 +192,8 @@ def filter_detections(
         )
 
     out.sort(key=lambda dd: (dd["area"] * dd["confidence"], dd["area"]), reverse=True)
-    return out[: int(max_keep)]
+    people.sort(key=lambda dd: dd["area"], reverse=True)
+    return people + out[: max(0, int(max_keep) - len(people))]
 
 
 class ObjectDetector:
@@ -248,7 +268,10 @@ class ObjectDetector:
         h, w = frame.shape[:2]
         self.last_debug = {"backend": self.backend}
 
-        raw = self._detect_opencv(frame) if self.backend == "opencv" else self._detect_yolo(frame)
+        if self.backend == "opencv":
+            raw = self._detect_opencv(frame) + self._detect_people(frame)
+        else:
+            raw = self._detect_yolo(frame)
         final = filter_detections(raw, frame_w=int(w), frame_h=int(h))
 
         self.last_debug["raw_detections"] = len(raw)
@@ -340,6 +363,35 @@ class ObjectDetector:
             )
 
         self.last_debug["motion_kept"] = len(out)
+        return out
+
+    def _detect_people(self, frame) -> List[Dict[str, Any]]:
+        """People, from the HOG detector `_init_opencv` builds. Never filtered here.
+
+        Every window the detector itself accepts is reported: a person is a
+        STOP, so a missed person is the costly error and a false one only
+        stops the rover. The SVM weight becomes the confidence, clipped to
+        [0, 1]; nothing downstream thresholds a person on it.
+        """
+
+        if self._hog is None or frame is None:
+            return []
+        rects, weights = self._hog.detectMultiScale(frame, winStride=(8, 8), padding=(8, 8), scale=1.05)
+        out: List[Dict[str, Any]] = []
+        for i, (x, y, bw, bh) in enumerate(rects):
+            # OpenCV returns weights as an (n, 1) array.
+            w = weights[i] if i < len(weights) else 0.0
+            weight = float(w[0]) if hasattr(w, "__len__") else float(w)
+            bbox = (int(x), int(y), int(x + bw), int(y + bh))
+            out.append(
+                {
+                    "label": "person",
+                    "confidence": max(0.0, min(1.0, weight)),
+                    "bbox": bbox,
+                    "area": _bbox_area(bbox),
+                }
+            )
+        self.last_debug["people"] = len(out)
         return out
 
     def _detect_static_edges(self, frame) -> List[Dict[str, Any]]:

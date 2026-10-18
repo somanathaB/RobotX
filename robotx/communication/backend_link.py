@@ -2033,6 +2033,13 @@ class BackendLink:
         )
         try:
             self._target.pause_mission("backend link lost")
+            # Recorded under its own prefix, like the obstacle, navigation and
+            # controller pauses, so /state says which subsystem stopped the run.
+            # The mode is the one the pause just set; only the reason is added.
+            self.state.set_mode(
+                self.state.mode,
+                error=f"backend: link lost for more than {self.cfg.loss_grace_s:g}s",
+            )
         except Exception:
             logger.exception("Failed to pause mission after backend loss")
 

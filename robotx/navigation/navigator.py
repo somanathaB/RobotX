@@ -11,7 +11,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from robotx.config.logging_setup import log_event
 from robotx.navigation.route_planner import PlannerConfig, RoutePlanner
@@ -121,6 +121,11 @@ class Navigator:
         self.planner = planner or RoutePlanner(self.cfg.to_planner_config())
         self._state = NavigationState()
         self._last_status: Optional[NavigationStatus] = None
+        # (timestamp, lat/lon) of the last fix the planner was advanced with.
+        # The agent ticks at 10 Hz on a ~1 Hz receiver, so most ticks see the
+        # same fix again; feeding it every tick would count one bad fix ten
+        # times toward an off-route verdict meant to need several.
+        self._last_fix_ts: Optional[Tuple[float, LatLon]] = None
 
     @property
     def state(self) -> NavigationState:
@@ -131,6 +136,7 @@ class Navigator:
 
         route: List[LatLon] = [(float(lat), float(lon)) for lat, lon in waypoints]
         self.planner.set_route(route)
+        self._last_fix_ts = None
         log_event(
             logger,
             "navigation.route_set",
@@ -149,6 +155,7 @@ class Navigator:
         log_event(logger, "navigation.route_cleared")
         self._state = NavigationState(status=NavigationStatus.IDLE)
         self._last_status = None
+        self._last_fix_ts = None
         return self._state
 
     def position_issue(self, position: Optional[Position]) -> Optional[str]:
@@ -202,7 +209,10 @@ class Navigator:
             return self._state
 
         here = position.lat_lon
-        self.planner.update_position(here)
+        fix_key = (position.timestamp, here)
+        if fix_key != self._last_fix_ts:
+            self.planner.update_position(here)
+            self._last_fix_ts = fix_key
 
         target = self.planner.next_waypoint()
         distance_to_target = None if target is None else haversine_m(here, target)

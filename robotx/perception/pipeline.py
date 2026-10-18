@@ -15,12 +15,14 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
-from typing import Any, Optional, Protocol, Sequence
+from typing import Any, Deque, Optional, Protocol, Sequence, Tuple
 
 from robotx.config.logging_setup import log_event
 from robotx.perception.object_detector import DetectorConfig, ObjectDetector
 from robotx.perception.types import (
+    BBox,
     Detection,
     FrameMetadata,
     PerceptionResult,
@@ -30,6 +32,19 @@ from robotx.perception.types import (
 
 
 logger = logging.getLogger(__name__)
+
+# The label the decision layer stops for at once; never held back for confirmation.
+PERSON_LABEL = "person"
+
+
+def _iou(a: BBox, b: BBox) -> float:
+    """Intersection over union of two (x1, y1, x2, y2) boxes."""
+
+    ix = max(0, min(a[2], b[2]) - max(a[0], b[0]))
+    iy = max(0, min(a[3], b[3]) - max(a[1], b[1]))
+    inter = ix * iy
+    union = (a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - inter
+    return inter / union if union > 0 else 0.0
 
 
 class FrameSource(Protocol):
@@ -56,6 +71,15 @@ class PipelineConfig:
     stale_after_s: float = 3.0
     # Camera frames older than this mean capture has stalled.
     frame_stale_after_s: float = 2.0
+    # A non-person detection is reported only once it has appeared, with
+    # overlapping boxes, in this many consecutive cycles (1: at once). A
+    # `person` is always reported on its first frame.
+    confirm_cycles: int = 2
+    confirm_iou: float = 0.3
+
+    def __post_init__(self) -> None:
+        if self.confirm_cycles < 1:
+            raise ValueError(f"confirm_cycles must be >= 1, got {self.confirm_cycles}")
 
     @classmethod
     def from_settings(cls, settings: Any) -> "PipelineConfig":
@@ -65,6 +89,7 @@ class PipelineConfig:
             inference_height=settings.detection_inference_height,
             stale_after_s=settings.perception_stale_after_s,
             frame_stale_after_s=settings.camera_stale_after_s,
+            confirm_cycles=settings.detection_confirm_cycles,
         )
 
 
@@ -87,6 +112,9 @@ class PerceptionPipeline:
             backend=getattr(detector, "backend", "none"),
         )
         self._prev_largest_area = 0
+        # Non-person boxes of the last `confirm_cycles - 1` cycles, newest last.
+        # Emptied by any cycle that produced no result: a gap is not consecutive.
+        self._recent_boxes: Deque[Tuple[BBox, ...]] = deque(maxlen=max(0, cfg.confirm_cycles - 1))
         self._running = False
         self._thread: Optional[threading.Thread] = None
         self._last_status: Optional[PerceptionStatus] = None
@@ -243,10 +271,11 @@ class PerceptionPipeline:
             )
 
         processing_ms = (time.monotonic() - started) * 1000.0
-        largest = max((d.area_px for d in detections), default=0)
         # Guarded: step_once() may be called from a bench script while the
-        # pipeline thread is running, and this is a read-modify-write.
+        # pipeline thread is running, and these are read-modify-writes.
         with self._lock:
+            detections = self._confirmed(detections)
+            largest = max((d.area_px for d in detections), default=0)
             delta = largest - self._prev_largest_area
             self._prev_largest_area = largest
 
@@ -301,9 +330,34 @@ class PerceptionPipeline:
             )
         return tuple(out)
 
+    def _confirmed(self, detections: Sequence[Detection]) -> Tuple[Detection, ...]:
+        """This cycle's detections that may be acted on. Lock held.
+
+        A person always. Anything else only when a box overlapping it (IoU >=
+        `confirm_iou`) was also seen in each of the previous `confirm_cycles - 1`
+        cycles, so one noisy frame does not stop the rover. Every non-person
+        box of this cycle, confirmed or not, is remembered for the next.
+        """
+
+        boxes = tuple(d.bbox for d in detections if d.label != PERSON_LABEL)
+        history = list(self._recent_boxes)
+        enough = len(history) >= self.cfg.confirm_cycles - 1
+        kept = tuple(
+            d
+            for d in detections
+            if d.label == PERSON_LABEL
+            or (enough and all(any(_iou(d.bbox, b) >= self.cfg.confirm_iou for b in past) for past in history))
+        )
+        if self._recent_boxes.maxlen:
+            self._recent_boxes.append(boxes)
+        return kept
+
     def _publish(self, result: PerceptionResult) -> None:
         with self._lock:
             self._result = result
+            if result.status is not PerceptionStatus.OK:
+                # A cycle that saw nothing usable breaks the run of frames.
+                self._recent_boxes.clear()
 
         # Log only on transition, never per frame.
         if result.status is not self._last_status:

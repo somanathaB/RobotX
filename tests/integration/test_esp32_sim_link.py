@@ -653,7 +653,7 @@ class TestBringUpAgainstRealFirmware(unittest.TestCase):
         self.assertEqual(alive, [], "link or simulator-reader thread still running after stop()")
 
     def test_operator_reset_clears_the_latch_without_reboot_or_resume(self):
-        """Obstacle -> GATED -> safety_stop -> PAUSED -> RESET -> clear, still PAUSED -> RESUME -> gated again."""
+        """Obstacle -> GATED -> safety_stop -> PAUSED -> RESET -> clear, still PAUSED -> RESUME -> held, no DRIVE."""
 
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
@@ -702,8 +702,18 @@ class TestBringUpAgainstRealFirmware(unittest.TestCase):
                    DRIVE_TIMEOUT_S, "mission driving with output applied")
         self.assertIs(agent.state.mode, OperatingMode.AUTO)
 
-        # ── 4-9: obstacle -> firmware gates DRIVE -> safety_stop -> Pi pauses ──
+        # ── 4-9: an obstacle inside the ESP32 gate before the Pi can react ->
+        #    firmware gates DRIVE -> safety_stop -> Pi pauses. The Pi now stops
+        #    for its own, further range limit (RX-07), so an obstacle that
+        #    appears this close only reaches the latch if a DRIVE is already in
+        #    flight: the agent does not tick while DRIVEs go straight to the link,
+        #    as they would from a Pi that has not yet read the new TELEMETRY. ──
         set_front(20)
+        deadline = time.monotonic() + DRIVE_TIMEOUT_S
+        while not [a for a in port.acks("DRIVE") if a["result"] == "GATED"]:
+            self.assertLess(time.monotonic(), deadline, "the firmware never gated a DRIVE")
+            self.link.submit(fx.decision(MotionIntent.forward(FORWARD_SPEED)))
+            time.sleep(0.05)
         tick_until(lambda s: agent.state.mode is OperatingMode.PAUSED, DRIVE_TIMEOUT_S,
                    "mission paused by the ESP32 safety stop")
         gated = [a for a in port.acks("DRIVE") if a["result"] == "GATED"]
@@ -748,22 +758,103 @@ class TestBringUpAgainstRealFirmware(unittest.TestCase):
         self.assertEqual(len(port.commands("DRIVE")), drives_before_reset)
         self.assertEqual(len(port.commands("RESET")), 1)
 
-        # ── 17-18: explicit RESUME; the obstacle is still there, so the firmware
-        #    gates the DRIVE again, re-latches, and the Pi pauses again ──
-        resumed_at = time.time()
+        # ── 17-18: explicit RESUME; the obstacle is still there and the firmware
+        #    still reports it, so the Pi holds: no DRIVE into it, no new latch ──
         agent.resume_mission("integration test")
-        tick_until(lambda s: (agent.state.mode is OperatingMode.PAUSED
-                              and telemetry_after(resumed_at)(s)
-                              and s.controller.telemetry.safety_stop),
-                   DRIVE_TIMEOUT_S, "DRIVE gated again and the mission re-paused")
-        self.assertGreater(len(port.commands("DRIVE")), drives_before_reset)
-        since_reset = port.acks("DRIVE")[drive_acks_before_reset:]
-        self.assertTrue(since_reset, "no DRIVE was answered after the RESUME")
-        self.assertEqual({a["result"] for a in since_reset}, {"GATED"})
-        self.assertEqual({(a["applied_left"], a["applied_right"]) for a in since_reset}, {(0, 0)})
-        tel = self.link.status().controller.telemetry
-        self.assertEqual((tel.left_applied, tel.right_applied), (0, 0))
+        for _ in range(10):                                  # a second of normal ticking
+            agent.tick()
+            time.sleep(0.1)
+        self.assertIs(agent.state.mode, OperatingMode.AUTO)
+        self.assertEqual(agent.state.snapshot().safety.rule, "obstacle")
+        self.assertEqual(len(port.commands("DRIVE")), drives_before_reset)
+        self.assertEqual(len(port.acks("DRIVE")), drive_acks_before_reset)
+        held = self.link.status()
+        self.assertTrue(held.controller.telemetry.front_obstacle)
+        self.assertFalse(held.controller.telemetry.safety_stop)
         self.assertEqual(len(port.commands("RESET")), 1)     # never re-sent on its own
+
+        # ── 19: the obstacle goes; the leg resumes only after the clear hold,
+        #    and the firmware accepts the DRIVE ──
+        set_front(150)
+        cleared_at = time.monotonic()
+        tick_until(lambda s: s.controller.telemetry.left_applied > 0, DRIVE_TIMEOUT_S + 3.0,
+                   "the leg resumed once the path was clear")
+        self.assertGreaterEqual(time.monotonic() - cleared_at, agent.obstacles.cfg.clear_hold_s)
+        since_reset = port.acks("DRIVE")[drive_acks_before_reset:]
+        self.assertTrue(since_reset)
+        self.assertEqual({a["result"] for a in since_reset}, {"ACCEPTED"})
+        self.assertIs(agent.state.mode, OperatingMode.AUTO)
+
+        self._stop_and_assert_clean()
+
+    def test_the_pi_stops_for_its_range_limit_before_the_esp32_gate(self):
+        """Obstacle between the ESP32's 40 cm gate and the Pi's limit -> Pi STOP, no GATED, no latch -> resume."""
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        front_file = os.path.join(tmp.name, "front_cm.txt")
+
+        def set_front(cm):
+            with open(front_file, "w") as f:
+                f.write(f"{cm}\n")
+
+        set_front(150)
+        self.sim_env["SIM_FRONT_CM_FILE"] = front_file
+        self.port_class = RecordingSimulatorPort
+
+        agent = RobotAgent(agent_settings(ROBOTX_DEADRECKON_ENABLED="1"))
+        agent.esp32 = self.link
+        agent.perception = _ClearScenePerception()
+        pi_stop_cm = agent.safety.cfg.stop_distance_cm
+        between = 70
+        self.assertGreater(pi_stop_cm, between)
+        self.assertGreater(between, 40)                      # ESP32 config.h SAFETY_STOP_DISTANCE_CM
+
+        def tick_for(seconds):
+            end = time.monotonic() + seconds
+            while time.monotonic() < end:
+                agent.tick()
+                time.sleep(0.1)
+
+        def tick_until(predicate, timeout_s, what):
+            deadline = time.monotonic() + timeout_s
+            while time.monotonic() < deadline:
+                agent.tick()
+                s = self.link.status()
+                if predicate(s):
+                    return s
+                time.sleep(0.1)
+            self.fail(f"{what}: not reached in {timeout_s} s: mode={agent.state.mode.value} "
+                      f"telemetry={self.link.status().controller.telemetry.to_dict()}")
+
+        self.link.start()
+        self._wait_until_up_and_motion_ready()
+        port = self.ports[0]
+        agent.start_mission([(0.0, 0.0005)])
+        tick_until(lambda s: s.controller.telemetry.left_applied > 0, DRIVE_TIMEOUT_S, "mission driving")
+
+        set_front(between)
+        tick_until(lambda s: (s.controller.telemetry.left_applied == 0
+                              and s.controller.telemetry.front_left_cm is not None
+                              and s.controller.telemetry.front_left_cm <= pi_stop_cm),
+                   DRIVE_TIMEOUT_S, "the Pi stopped for the near range")
+        drives_at_stop = len(port.commands("DRIVE"))
+        tick_for(1.5)
+        tel = self.link.status().controller.telemetry
+        self.assertEqual(len(port.commands("DRIVE")), drives_at_stop, "DRIVE toward the obstacle")
+        self.assertFalse(tel.front_obstacle)                 # the ESP32 gate never engaged ...
+        self.assertFalse(tel.safety_stop)                    # ... and nothing latched
+        self.assertEqual([a for a in port.acks("DRIVE") if a["result"] == "GATED"], [])
+        self.assertIs(agent.state.mode, OperatingMode.AUTO)
+        self.assertEqual(agent.state.snapshot().safety.rule, "obstacle")
+
+        set_front(150)
+        cleared_at = time.monotonic()
+        tick_until(lambda s: s.controller.telemetry.left_applied > 0, DRIVE_TIMEOUT_S + 3.0,
+                   "the leg resumed once the path was clear")
+        self.assertGreaterEqual(time.monotonic() - cleared_at, agent.obstacles.cfg.clear_hold_s)
+        self.assertEqual({a["result"] for a in port.acks("DRIVE")}, {"ACCEPTED"})
+        self.assertEqual(port.commands("RESET"), [])
 
         self._stop_and_assert_clean()
 

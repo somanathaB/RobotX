@@ -180,8 +180,7 @@ class TestNoNegativeWheelCommands(unittest.TestCase):
 # --- the agent on a short route over a fake ESP32 ---------------------------------
 
 
-HEALTHY = dict(motor_drive_available=True, front_obstacle=False, forward_blocked=False,
-               state="IDLE", block_reason="NONE")
+HEALTHY = dict(fx.CLEAR_FRONT, motor_drive_available=True, state="IDLE", block_reason="NONE")
 
 
 class Rig:

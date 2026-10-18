@@ -34,7 +34,7 @@ from robotx.config.settings import Settings
 from robotx.control.decision import DecisionConfig, DecisionMaker
 from robotx.control.motion import MotionIntent
 from robotx.control.obstacle_recovery import ObstacleRecovery, ObstacleRecoveryConfig
-from robotx.control.safety import SafetyConfig, SafetyDecision, SafetyGate
+from robotx.control.safety import RangeReading, RangeStatus, SafetyConfig, SafetyDecision, SafetyGate
 from robotx.diagnostics.health import (
     ComponentHealth,
     HealthConfig,
@@ -42,6 +42,7 @@ from robotx.diagnostics.health import (
     HealthStatus,
 )
 from robotx.localization.esp32_gps import Esp32GpsReader
+from robotx.esp32.front_range import check_stop_distance, front_range
 from robotx.esp32.link import Esp32Config, Esp32Link, Esp32Status
 from robotx.esp32.sim_transport import HostSimulatorPort
 from robotx.hardware.camera import CameraConfig, CameraError, CameraStatus, CameraStream
@@ -59,6 +60,7 @@ from robotx.navigation.navigator import (
     NavigationStatus,
     Navigator,
 )
+from robotx.navigation.progress import ProgressConfig, ProgressMonitor
 from robotx.perception.pipeline import PerceptionPipeline
 from robotx.perception.types import PerceptionResult, PerceptionStatus
 from robotx.localization.local_frame import (
@@ -184,6 +186,8 @@ class RobotAgent:
         self.safety = SafetyGate(SafetyConfig.from_settings(settings))
         # When an obstacle-stopped rover may move again, and when it asks for help.
         self.obstacles = ObstacleRecovery(ObstacleRecoveryConfig.from_settings(settings))
+        # When a navigation hold or a drive that gets nowhere asks for help.
+        self.progress = ProgressMonitor(ProgressConfig.from_settings(settings))
         self.health = HealthMonitor(HealthConfig.from_settings(settings))
         # DEMO battery simulation, only when explicitly enabled; otherwise the
         # battery stays UNAVAILABLE exactly as before.
@@ -431,6 +435,9 @@ class RobotAgent:
             return
         try:
             cfg = Esp32Config.from_settings(self.settings)
+            # The ESP32's front sensors are this rover's forward range, and the
+            # Pi must stop for them before the ESP32 gate latches (RX-07).
+            check_stop_distance(self.settings.safety_stop_distance_cm)
         except ValueError as e:
             # Same stance as a bad backend config: the robot still comes up,
             # with no motor link -- which is the safe state -- and says why.
@@ -472,6 +479,24 @@ class RobotAgent:
             self._esp32_reboots_handled = status.controller.reboot_count
             self.emergency_stop(f"ESP32 rebooted: {status.detail}")
         return status
+
+    def _front_range(self, status: Optional[Esp32Status]) -> Optional[RangeReading]:
+        """The ESP32's front range for the safety gate, or None with no link attached.
+
+        Judged on the same status this tick's link check used, with the link's
+        own freshness limit (`robotx.esp32.front_range`).
+        """
+
+        if self.esp32 is None:
+            return None
+        if status is None:
+            return RangeReading(RangeStatus.UNKNOWN)
+        return front_range(
+            status.controller.telemetry,
+            status.controller.telemetry_age_s,
+            link_up=status.link.is_up,
+            stale_after_s=self.esp32.cfg.stale_after_s,
+        )
 
     def _esp32_interrupted(self, status: Optional[Esp32Status]) -> bool:
         """Whether the link was lost or reopened since the previous tick.
@@ -681,8 +706,9 @@ class RobotAgent:
         # then it may have been turned or carried. A run starts with no heading
         # and establishes one by moving.
         self.position_estimator.reset()
-        # An obstacle episode belongs to the run it happened in.
+        # An obstacle episode, or a stall, belongs to the run it happened in.
         self.obstacles.reset()
+        self.progress.reset()
 
     def stop_mission(self, reason: str = "operator stop") -> None:
         """Halt: clear the route, drop to STOPPED, and publish a stop intent."""
@@ -696,6 +722,7 @@ class RobotAgent:
         self.missions.abandon(reason)
         self.state.update_mission(self.missions.active)
         self.obstacles.reset()
+        self.progress.reset()
         self.state.set_mode(OperatingMode.STOPPED)
         self.state.update_motion_intent(MotionIntent.stop(reason))
         log_event(logger, "mission.stopped", reason=reason)
@@ -736,6 +763,9 @@ class RobotAgent:
         if self.navigator.planner.route_length() == 0:
             self.navigator.set_route(route)
         self.obstacles.restart()
+        # An operator RESUME gives navigation a fresh allowance; the reasons it
+        # stopped still have to clear before anything moves.
+        self.progress.reset()
         self.state.clear_error()
         self.state.set_mode(OperatingMode.AUTO)
         log_event(logger, "mission.resumed", reason=reason)
@@ -979,6 +1009,9 @@ class RobotAgent:
             if interrupted and esp32.motion_ready:
                 why = "the link was lost and re-proven since the last tick; now " + why
             self.pause_mission(f"ESP32 cannot carry motion: {why}")
+            # Recorded like the obstacle and navigation pauses, under its own
+            # prefix, so /state and health say which subsystem stopped the run.
+            self.state.set_mode(OperatingMode.PAUSED, error=f"controller: ESP32 cannot carry motion: {why}")
 
         # 2c. Backend link (Y4): its loss policy runs on this loop's own cadence,
         #     before anything decides, so neither a reconnect backoff nor a
@@ -1020,13 +1053,19 @@ class RobotAgent:
         #     ESP32 link read -- an intent the gate refused must never be
         #     visible anywhere as though it were going to happen.
         #
-        #     No range reading is passed: this rover has no working forward
-        #     range sensor yet, and `SafetyConfig.require_range_sensor` is
-        #     where that absence is handled honestly rather than here.
+        #     The forward range is the ESP32's front ultrasonic pair (RX-07),
+        #     read from the TELEMETRY sampled in step 2b. With a link attached
+        #     it is required: stale, invalid or missing never reads as clear.
+        #     Without one (a bench Pi) no range is passed, and
+        #     `SafetyConfig.require_range_sensor` decides what that means.
+        front = self._front_range(esp32)
+        range_expected = self.esp32 is not None
         safety = self.safety.evaluate(
             proposed,
             mission_active=mode.mission_active,
             perception=perception,
+            obstacle=front,
+            range_expected=range_expected,
         )
 
         # 5b'. Obstacle recovery (RX-08). An obstacle stop -- the decision
@@ -1040,17 +1079,40 @@ class RobotAgent:
             active=mode.mission_active,
             obstacle=mode.mission_active and _is_obstacle_stop(safety.intent),
             perception_usable=perception.is_usable,
+            range_usable=not range_expected or (front is not None and front.status is RangeStatus.VALID),
         )
         if recovery.hold and not safety.intent.is_stop:
             safety = self.safety.evaluate(
                 MotionIntent.stop(recovery.reason),
                 mission_active=mode.mission_active,
                 perception=perception,
+                obstacle=front,
+                range_expected=range_expected,
             )
         if recovery.assist:
             why = f"blocked for {recovery.blocked_for_s:.0f}s: operator assistance needed"
             self.pause_mission(f"obstacle: {why}")
             self.state.set_mode(OperatingMode.PAUSED, error=f"obstacle: {why}")
+
+        # 5b''. Bounded navigation stops: a hold for no usable position or off
+        #       route, or a drive that gets no closer, ends in a pause with its
+        #       reason instead of going on silently (robotx.navigation.progress).
+        #       A pause here turns this tick's intent into a stop before the
+        #       ESP32 link sees it.
+        stall = self.progress.update(
+            active=self.state.mode.mission_active,
+            navigation=navigation,
+            moving=not safety.intent.is_stop,
+        )
+        if stall.assist:
+            self.pause_mission(stall.reason)
+            self.state.set_mode(OperatingMode.PAUSED, error=stall.reason)
+            if not safety.intent.is_stop:
+                safety = self.safety.evaluate(
+                    MotionIntent.stop(stall.reason),
+                    mission_active=False,
+                    perception=perception,
+                )
         intent = safety.intent
         self.state.update_safety(safety)
         self.state.update_motion_intent(intent)

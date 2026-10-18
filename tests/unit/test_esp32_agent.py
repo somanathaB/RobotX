@@ -49,7 +49,7 @@ def agent_with_link(*, motion=False, drive_available=False, **env):
     link, clock = fx.make_link(port, motion_enabled=motion)
     agent.esp32 = link
     link.poll_once()
-    port.feed(fx.telemetry(motor_drive_available=drive_available, last_seq=None))
+    port.feed(fx.telemetry(motor_drive_available=drive_available, last_seq=None, **fx.CLEAR_FRONT))
     link.poll_once()
     port.feed(fx.ack(1) + fx.REAL_DIAG_SYSTEM + fx.REAL_DIAG_FRONT)   # one read
     link.poll_once()
@@ -112,7 +112,7 @@ class TestTelemetryIntoState(unittest.TestCase):
         payload = build_telemetry(agent.tick())
         ctrl = payload["controller"]
         self.assertEqual(ctrl["telemetry"]["motor"]["drive_available"], False)
-        self.assertEqual(ctrl["telemetry"]["front"]["left_cm"], 37.9)
+        self.assertEqual(ctrl["telemetry"]["front"]["left_cm"], fx.CLEAR_FRONT["front_left_cm"])
         self.assertNotIn("controller_diag", payload)
         self.assertNotIn("pca_status", str(payload))
 
@@ -325,7 +325,8 @@ class TestControllerSafetyFaults(unittest.TestCase):
     def report(self, link, port, **fields):
         """One fresh TELEMETRY frame, otherwise healthy, with `fields` applied."""
 
-        port.feed(fx.telemetry(motor_drive_available=True, uptime_ms=3590000, **fields))
+        port.feed(fx.telemetry(**{**fx.CLEAR_FRONT, "motor_drive_available": True,
+                                  "uptime_ms": 3590000, **fields}))
         link.poll_once()
 
     def assert_fault_pauses_mission_and_stops_drive(self, fault):

@@ -8,7 +8,8 @@ directly has two problems, and this module is the policy for both:
   into on its absent frames. So once an obstacle has stopped the rover, motion
   resumes only after the path has been seen clear, by USABLE perception,
   continuously for `clear_hold_s`. Unusable perception (stale, no frame,
-  detector error) is not a clear path: it restarts the hold.
+  detector error) is not a clear path: it restarts the hold. Nor is a forward
+  range reading that is not valid and fresh, where a range sensor is fitted.
 - An obstacle that never goes away must not hold the rover silently forever.
   After `assist_after_s` in one blocked episode the agent pauses the mission
   and asks for an operator, through the existing PAUSED -> RESUME flow.
@@ -112,8 +113,15 @@ class ObstacleRecovery:
             self._clear_since = None
             self._assisted = False
 
-    def update(self, *, active: bool, obstacle: bool, perception_usable: bool) -> RecoveryVerdict:
-        """One agent tick. `obstacle`: this tick's gated intent stopped for one."""
+    def update(
+        self, *, active: bool, obstacle: bool, perception_usable: bool, range_usable: bool = True
+    ) -> RecoveryVerdict:
+        """One agent tick. `obstacle`: this tick's gated intent stopped for one.
+
+        `range_usable`: the forward range sensor, where one is fitted, gave a
+        valid fresh reading this tick. Like unusable perception, a range that
+        is not valid is not a clear path and restarts the hold.
+        """
 
         if not active:
             # Paused or idle: nothing moves anyway. An open episode is kept --
@@ -134,6 +142,9 @@ class ObstacleRecovery:
         if not perception_usable:
             self._clear_since = None
             return self._held(now, "path not confirmed clear: perception unusable")
+        if not range_usable:
+            self._clear_since = None
+            return self._held(now, "path not confirmed clear: front range not valid")
 
         if self._clear_since is None:
             self._clear_since = now

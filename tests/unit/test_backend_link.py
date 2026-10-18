@@ -1627,6 +1627,8 @@ class TestLinkLossPolicy(AsyncTestCase):
         link._disconnected_since = time.monotonic() - 10
         link._apply_loss_policy()
         self.assertEqual(agent.calls[0][0], "pause")
+        # The reason is recorded under the backend's own prefix.
+        self.assertTrue(link.state.snapshot().last_error.startswith("backend: link lost"))
 
     def test_pause_policy_waits_out_a_brief_blip(self):
         agent = FakeAgent(mode=OperatingMode.AUTO)

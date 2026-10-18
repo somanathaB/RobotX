@@ -41,6 +41,7 @@ testable without a robot.
 from __future__ import annotations
 
 import logging
+import math
 import threading
 from dataclasses import dataclass, replace
 from enum import Enum
@@ -75,6 +76,7 @@ class RangeStatus(str, Enum):
     """
 
     VALID = "VALID"                # fresh, in-range measurement
+    INVALID = "INVALID"            # fresh, but the producer says it is not trustworthy
     TIMEOUT = "TIMEOUT"            # triggered, no echo came back in time
     OUT_OF_RANGE = "OUT_OF_RANGE"  # an implausible reading
     ERROR = "ERROR"                # the sensor raised while measuring
@@ -101,6 +103,9 @@ class RangeReading:
     status: RangeStatus
     distance_cm: Optional[float] = None
     age_s: Optional[float] = None
+    # The producer itself reports an obstacle (the ESP32's confirmed front
+    # latch), whatever the distance or status say: always a veto.
+    obstacle_reported: bool = False
 
 
 class SafetyVerdict(str, Enum):
@@ -162,12 +167,12 @@ class SafetyConfig:
 
     # Whether a forward range sensor is expected to be present and reporting.
     #
-    # False today, and that is a statement about hardware rather than about
-    # risk appetite: this rover has no working range sensor (the HC-SR04 driver
-    # cannot run on a Pi 5, and the ESP32 link does not exist), so a gate that
-    # vetoed every intent for a missing sensor would just be a rover that never
-    # moves. Set this true the moment one is actually wired -- from then on a
-    # silent sensor stops the robot instead of being ignored.
+    # False by default because a bench Pi has no range source. The rover's
+    # source is the ESP32's front ultrasonic pair, and while an ESP32 link is
+    # attached the agent requires it on every evaluation (`range_expected`),
+    # whatever this says. Setting it true requires a range source even without
+    # an ESP32 link -- a silent sensor then stops the robot instead of being
+    # ignored.
     require_range_sensor: bool = False
 
     # Whether an intent may drive either side backwards (a reverse or an
@@ -251,6 +256,7 @@ class SafetyGate:
         mission_active: bool,
         perception: PerceptionResult,
         obstacle: Optional[RangeReading] = None,
+        range_expected: bool = False,
         now: Optional[float] = None,
     ) -> SafetyDecision:
         """Decide what, if anything, may be sent downstream.
@@ -262,7 +268,9 @@ class SafetyGate:
 
         `obstacle` is optional because a range sensor genuinely may not be
         fitted. See `SafetyConfig.require_range_sensor` for how that is handled
-        rather than assumed.
+        rather than assumed. `range_expected` says a range source is wired for
+        this evaluation (the agent's ESP32 link), so its silence vetoes as if
+        `require_range_sensor` were set. It can only add vetoes.
         """
 
         decision = self._evaluate(
@@ -270,6 +278,7 @@ class SafetyGate:
             mission_active=mission_active,
             perception=perception,
             obstacle=obstacle,
+            range_required=self.cfg.require_range_sensor or range_expected,
             now=now,
         )
 
@@ -297,6 +306,7 @@ class SafetyGate:
         mission_active: bool,
         perception: PerceptionResult,
         obstacle: Optional[RangeReading],
+        range_required: bool,
         now: Optional[float],
     ) -> SafetyDecision:
         # Rules are ordered by authority, and the first match wins.
@@ -336,7 +346,7 @@ class SafetyGate:
                 f"intent is {age:.2f}s old (limit {self.cfg.max_intent_age_s:.2f}s)",
             )
 
-        range_veto = self._range_veto(obstacle)
+        range_veto = self._range_veto(obstacle, range_required)
         if range_veto is not None:
             return range_veto
 
@@ -356,40 +366,50 @@ class SafetyGate:
             reason=intent.reason or "no safety condition applies",
         )
 
-    def _range_veto(self, obstacle: Optional[RangeReading]) -> Optional[SafetyDecision]:
+    def _range_veto(
+        self, obstacle: Optional[RangeReading], range_required: bool
+    ) -> Optional[SafetyDecision]:
         """Veto from the forward range sensor, if there is one.
 
-        Three cases, kept apart deliberately:
+        Four cases, kept apart deliberately:
 
-        - a VALID reading at or inside the stop distance is a *measured*
-          obstacle, and always vetoes;
-        - any other status means the sensor did not answer, which vetoes only
+        - an obstacle the sensor itself reports, or any finite distance at or
+          inside the stop distance -- whatever the status -- always vetoes:
+          stopping on a near reading the producer does not yet trust is safe;
+        - a VALID reading with a finite distance beyond the stop distance is
+          the only thing that reads as clear;
+        - anything else means the sensor did not answer, which vetoes only
           when a sensor is expected -- "the sensor is broken" must never be
           read as "the path is clear";
         - no reading at all means no sensor is fitted, which cannot veto unless
           one was required. The gate must not invent a sensor this rover does
           not have.
+
+        The word "obstacle" in the two obstacle reasons is load-bearing: the
+        agent's obstacle recovery recognises range stops by it.
         """
 
         if obstacle is None:
-            if self.cfg.require_range_sensor:
+            if range_required:
                 return self._veto(
                     "range_missing", "a forward range sensor is required but none reported"
                 )
             return None
 
-        if obstacle.status is RangeStatus.VALID and obstacle.distance_cm is not None:
-            if obstacle.distance_cm <= self.cfg.stop_distance_cm:
-                # The word "obstacle" in this reason is load-bearing: the agent
-                # feeds obstacle-caused stops back into route planning.
-                return self._veto(
-                    "obstacle",
-                    f"obstacle at {obstacle.distance_cm:.0f}cm "
-                    f"(limit {self.cfg.stop_distance_cm:.0f}cm)",
-                )
+        distance = obstacle.distance_cm
+        finite = distance is not None and math.isfinite(distance)
+        if obstacle.obstacle_reported:
+            where = f" at {distance:.0f}cm" if finite else ""
+            return self._veto("obstacle", f"obstacle reported by the range sensor{where}")
+        if finite and distance <= self.cfg.stop_distance_cm:
+            return self._veto(
+                "obstacle",
+                f"obstacle at {distance:.0f}cm (limit {self.cfg.stop_distance_cm:.0f}cm)",
+            )
+        if obstacle.status is RangeStatus.VALID and finite:
             return None
 
-        if self.cfg.require_range_sensor:
+        if range_required:
             return self._veto(
                 "range_unreliable",
                 f"forward range sensor is not reporting ({obstacle.status.value})",

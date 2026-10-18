@@ -63,6 +63,12 @@ def payload_of(line: bytes) -> Dict[str, Any]:
 
 REAL_TELEMETRY_FIELDS = payload_of(REAL_TELEMETRY)
 
+# TELEMETRY front fields for nothing ahead: both sensors valid with an echo well
+# beyond the Pi's stop distance. REAL_TELEMETRY was captured with an object at
+# 38 cm (front_obstacle, forward_blocked), which the Pi now stops for.
+CLEAR_FRONT = dict(front_left_cm=150.0, front_right_cm=150.0, front_valid=True,
+                   front_obstacle=False, front_warning=False, forward_blocked=False)
+
 
 def frame(obj: Union[Dict[str, Any], str, bytes], *, crc: Optional[int] = None) -> bytes:
     """Frame an arbitrary payload with a valid (or the given) CRC."""
