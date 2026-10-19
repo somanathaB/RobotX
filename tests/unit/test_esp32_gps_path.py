@@ -339,7 +339,10 @@ class TestAgentGpsPath(unittest.TestCase):
         self.feed(link, port, gps_line(hacc_mm=15_000))
         agent.tick()
         self.assertEqual(agent.assess_offer(parsed_offer()).reason, "NO_POSITION_FIX")
-        self.feed(link, port, gps_line())
+        # An accurate fix where the offer's pathToPickup starts (route admission).
+        from tests.fixtures.task_assign import START
+
+        self.feed(link, port, gps_line(lat_e7=round(START[0] * 1e7), lon_e7=round(START[1] * 1e7)))
         agent.tick()
         agent.state.update_communication(esp32=Esp32LinkStatus.UP)
         from robotx.communication.engine import OfferVerdict

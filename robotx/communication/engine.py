@@ -226,8 +226,11 @@ def _render(field: str, raw: Mapping[str, Any]) -> str:
 def canonical_string(raw: Mapping[str, Any]) -> str:
     """The exact string the backend signs (`commandSigning.js`, handoff §6).
 
-    Three renderings follow the handoff's words but should be pinned by a
-    test vector generated on the backend before this is trusted in the field:
+    Three renderings follow the handoff's words, and all three are pinned by
+    the backend's own test vector (`docs/contracts/fixtures/offer-signature-
+    test-vector.json`, produced by its real OFFER path; copied to
+    `tests/fixtures/backend_offer_signature_vector.json` and checked byte for
+    byte in `tests/unit/test_delivery_telemetry.py`):
 
     - `notValidAfter` is rendered as the bare ISO string, without the quotes
       `JSON.stringify` would add (the handoff lists it separately from

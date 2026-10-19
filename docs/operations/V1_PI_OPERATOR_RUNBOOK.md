@@ -261,6 +261,18 @@ So:
 operator-hold fact for physical robots, lease renewal. Not yet exercised end to
 end with the physical robot.)
 
+**Update (Pi, 2026-10-19; backend `feature/dashboard` 35092e8):**
+
+- An emergency stop or ESP32 reboot that catches a mission now reports
+  TELEMETRY `status: "PAUSED"` (stopped with the Leg on board), not `IDLE`. It
+  therefore has the same backend consequence as a PAUSE. A STOP that abandons
+  the mission still reports `IDLE`.
+- In that backend revision, `POST /api/robots/:id/clear-fault` also lifts a
+  `PAUSED` hold (P7-D1): after RESUME, once the unit itself reports
+  `ACTIVE`/`IDLE`, behind the QUARANTINE_OVERRIDE gate (elevated role, reason,
+  second approver). Whether the deployed Render backend runs that revision is
+  not verified from the Pi; check before relying on it.
+
 ---
 
 ## Normal startup
@@ -556,8 +568,12 @@ physical disconnect.
   resort: cut drive power.
 - **Expected:** `{"emergency_stopped": true}`; `/state` `.safety.rule ==
   "estop"`, `mode: "STOPPED"`; `safety.estop_engaged` in the log. **The mission
-  is not abandoned**: the lease keeps being renewed while the backend link is up,
-  so the Leg stays with this robot until you clear and resume, or STOP.
+  is not abandoned** -- it is held with `mission.interrupted_by` set -- but
+  (from branch `test/mission-injection-harness`, after 77e92fb) **HEARTBEAT stops
+  renewing its lease** (`backend.lease_not_renewed`): a latched robot cannot
+  deliver, so if the latch is not cleared within the backend's lease window
+  (60 s) the backend may recover the Leg. RESUME, RETURN and `/mission/idle` are
+  refused while latched; PAUSE leaves it STOPPED.
 - **Failure:** the rover keeps moving.
 - **Escalation:** cut power. Report it. Note: **a service restart (or a reboot)
   clears the software e-stop**, and an ESP32 reboot latches it automatically
@@ -571,11 +587,14 @@ physical disconnect.
 - **Action:** `curl -s -X POST "$S/safety/clear" "${AUTH[@]}"` (`AUTH` as in
   Access, matching this robot's configuration)
 - **Expected:** `{"emergency_stopped": false, "was_engaged": true}`. Nothing
-  resumes: `mode` stays `STOPPED`. Clearing also acknowledges an ESP32 reboot; the
+  resumes. With no mission held, `mode` stays `STOPPED`. With a mission held
+  (from branch `test/mission-injection-harness`), `mode` becomes `PAUSED`
+  (`last_error` `recovery: ...`), the route is kept and the lease is renewed
+  again -- never `AUTO`. Clearing also acknowledges an ESP32 reboot; the
   ESP32 link then re-proves itself before carrying motion (`motion_ready`).
   Then decide, using the PAUSE decision table (custody matters):
-  - **continue the current leg:** `curl -s -X POST $S/mission/pause` (`mode:
-    "PAUSED"`, route kept), then the full **RESUME** procedure. This is a
+  - **continue the current leg:** the full **RESUME** procedure (on 77e92fb,
+    first `curl -s -X POST $S/mission/pause` to reach `PAUSED`). This is a
     PAUSE, so the robot leaves new assignment afterwards (PAUSE semantics);
   - **the robot cannot safely continue:** STOP / Out of service / Stranded goods,
     according to custody, as the table says.
@@ -584,10 +603,11 @@ physical disconnect.
   `AUTH` without its header file: no request was sent); 401/403 (operator
   token or `Origin`: see Access) — in each case the latch is untouched.
 - **Escalation:** **never use `POST /mission/idle` while a mission is active.**
-  It puts the robot in IDLE with the mission still held: the lease keeps being
-  renewed, the robot never moves, and RESUME is refused because it is not
-  PAUSED. If that has happened: `POST /mission/pause`, then RESUME procedure, or
-  STOP.
+  On 77e92fb it puts the robot in IDLE with the mission still held: the lease
+  keeps being renewed, the robot never moves, and RESUME is refused because it
+  is not PAUSED. If that has happened: `POST /mission/pause`, then RESUME
+  procedure, or STOP. From branch `test/mission-injection-harness` the route
+  answers 409 while a mission is held instead.
 
 ## Stranded goods
 

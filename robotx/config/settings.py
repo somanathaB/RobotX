@@ -203,6 +203,14 @@ class Settings:
     # talks to that process over stdin/stdout instead of opening any serial
     # device: software-only runs (Gate 3) with no UART and no motors.
     esp32_simulator_exe: str = ""
+    # Applied-motion monitor (robotx.control.applied_motion): while a mission
+    # drives, this long of DRIVE ACKs GATED, or of fresh TELEMETRY reporting 0
+    # applied output on every side driven at or beyond the deadband, pauses the
+    # mission with the reason; a DRIVE ACK REJECTED pauses it at once. Bounded
+    # to [0.5, 5.0] s. The deadband is the ESP32's (PROTOCOL.md section 9: |v| <
+    # 40 DRIVE units is output as 0), in [0, 254].
+    motion_applied_timeout_s: float = 1.5
+    motion_deadband_units: int = 40
 
     # --- Custody ------------------------------------------------------------
     # How a parcel handover is known. "none" (default): nothing on this rover
@@ -211,6 +219,15 @@ class Settings:
     # local API (POST /mission/custody); reported as OPERATOR_CONFIRMED, never
     # as a sensor reading.
     custody_confirmation: str = "none"
+
+    # --- Mission admission (robotx.mission.admission) --------------------------
+    # Checked on every offer (and test injection) against the measured position:
+    # pathToPickup must start within the first, the pickup lie within the second
+    # (straight line), and each path end meet its stop within the third. Metres;
+    # refused at startup outside [5, 200] / [5, 5000] / [5, 200].
+    mission_max_start_offset_m: float = 25.0
+    mission_max_pickup_distance_m: float = 300.0
+    mission_max_endpoint_offset_m: float = 50.0
 
     # --- Test-only mission injection ----------------------------------------
     # OFF unless explicitly enabled. When on, POST /test/mission/inject hands a
@@ -239,6 +256,9 @@ class Settings:
     position_heading_min_move_m: float = 1.5
     # Minimum speed-over-ground (m/s) before the NMEA track angle is trusted.
     position_heading_min_speed_mps: float = 0.5
+    # A GPS-track heading also needs this many times the fix's stated
+    # horizontal accuracy of movement (0 disables; refused outside [0, 10]).
+    position_heading_hacc_factor: float = 2.0
 
     # --- Navigation ---------------------------------------------------------
     nav_waypoint_arrival_m: float = 8.0
@@ -506,6 +526,15 @@ class Settings:
             esp32_command_max_age_s=_get_float(e, "ROBOTX_ESP32_COMMAND_MAX_AGE_S", d.esp32_command_max_age_s),
             esp32_reconnect_max_s=_get_float(e, "ROBOTX_ESP32_RECONNECT_MAX_S", d.esp32_reconnect_max_s),
             esp32_simulator_exe=_get_str(e, "ROBOTX_ESP32_SIMULATOR_EXE", d.esp32_simulator_exe),
+            mission_max_start_offset_m=_get_float(e, "ROBOTX_MISSION_MAX_START_OFFSET_M", d.mission_max_start_offset_m),
+            mission_max_pickup_distance_m=_get_float(
+                e, "ROBOTX_MISSION_MAX_PICKUP_DISTANCE_M", d.mission_max_pickup_distance_m
+            ),
+            mission_max_endpoint_offset_m=_get_float(
+                e, "ROBOTX_MISSION_MAX_ENDPOINT_OFFSET_M", d.mission_max_endpoint_offset_m
+            ),
+            motion_applied_timeout_s=_get_float(e, "ROBOTX_MOTION_APPLIED_TIMEOUT_S", d.motion_applied_timeout_s),
+            motion_deadband_units=_get_int(e, "ROBOTX_MOTION_DEADBAND_UNITS", d.motion_deadband_units),
             custody_confirmation=_get_str(e, "ROBOTX_CUSTODY_CONFIRMATION", d.custody_confirmation),
             test_injection_enabled=_get_bool(e, "ROBOTX_TEST_INJECTION_ENABLED", d.test_injection_enabled),
             test_injection_token_sha256=_get(e, "ROBOTX_TEST_INJECTION_TOKEN_SHA256",
@@ -514,6 +543,7 @@ class Settings:
             operator_token_sha256=_get(e, "ROBOTX_OPERATOR_TOKEN_SHA256", d.operator_token_sha256),
             position_heading_min_move_m=_get_float(e, "ROBOTX_HEADING_MIN_MOVE_M", d.position_heading_min_move_m),
             position_heading_min_speed_mps=_get_float(e, "ROBOTX_HEADING_MIN_SPEED_MPS", d.position_heading_min_speed_mps),
+            position_heading_hacc_factor=_get_float(e, "ROBOTX_HEADING_HACC_FACTOR", d.position_heading_hacc_factor),
             nav_waypoint_arrival_m=_get_float(e, "ROBOTX_NAV_WAYPOINT_ARRIVAL_M", d.nav_waypoint_arrival_m),
             nav_off_route_m=_get_float(e, "ROBOTX_NAV_OFF_ROUTE_M", d.nav_off_route_m),
             nav_reroute_after_n=_get_int(e, "ROBOTX_NAV_REROUTE_AFTER_N", d.nav_reroute_after_n),

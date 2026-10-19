@@ -6,10 +6,12 @@
 Everything comes from the agent that is already running, so nothing here
 competes for the ESP32 UART, the camera or the backend session:
 
-- `GET /health /state /config /backend /test/injection` on 127.0.0.1 -- an
-  allowlist; any other path or method is refused by `LoopbackClient` itself
-  (no POST, no /camera). `/test/injection` answers 404 while injection is off.
-- `systemctl is-active robotx-agent` and `timedatectl show` (read-only).
+- `GET /health /state /config /backend /readiness /test/injection` on
+  127.0.0.1 -- an allowlist; any other path or method is refused by
+  `LoopbackClient` itself (no POST, no /camera). `/test/injection` answers 404
+  while injection is off; `/readiness` answers 404 on an agent that predates it.
+- `systemctl is-active robotx-agent`, `timedatectl show`, `vcgencmd
+  get_throttled` and `git rev-parse HEAD` of the deployed checkout (read-only).
 
 No serial port is opened, no command reaches the ESP32, no service is touched.
 
@@ -39,9 +41,17 @@ from tests.mission_injection.fixture import FixtureError, MissionFixture, load_f
 EXPECTED_BACKEND_URL = "https://robotx-admin-dashboard.onrender.com"
 EXPECTED_SERVICE = "robotx-agent"
 API_BASE = "http://127.0.0.1:8000"
-READ_PATHS = ("/health", "/state", "/config", "/backend", "/test/injection")
-# Absent (404) when the agent's test injection is disabled: an answer, not an error.
-OPTIONAL_PATHS = ("/test/injection",)
+READ_PATHS = ("/health", "/state", "/config", "/backend", "/readiness", "/test/injection")
+# Absent (404) when the agent's test injection is disabled, or (/readiness) on an
+# agent that predates the route: an answer, not an error.
+OPTIONAL_PATHS = ("/test/injection", "/readiness")
+DEPLOYED_CHECKOUT = "/opt/robotx/RobotX-Pi"
+# vcgencmd get_throttled: bits 0-3 are conditions present NOW (under-voltage,
+# frequency capped, throttled, soft temperature limit); bits 16-19 the same
+# since boot.
+THROTTLED_NOW_MASK = 0xF
+CPU_TEMP_LIMIT_C = 80.0
+DISK_LIMIT_PERCENT = 90.0
 
 
 class Result(str, Enum):
@@ -131,6 +141,9 @@ def collect(client: Optional[LoopbackClient] = None,
             observed[key] = None
             observed["errors"][path] = f"{type(e).__name__}: {e}"
     observed["service_active"] = run(["systemctl", "is-active", EXPECTED_SERVICE])
+    observed["throttled"] = run(["vcgencmd", "get_throttled"])
+    observed["deployed_revision"] = run(["git", "-c", f"safe.directory={DEPLOYED_CHECKOUT}", "-C",
+                                         DEPLOYED_CHECKOUT, "rev-parse", "--short=12", "HEAD"])
     ntp = run(["timedatectl", "show", "-p", "NTPSynchronized", "--value"])
     observed["clock_synchronized"] = None if ntp is None else ntp == "yes"
     observed["collected_at"] = time.time()
@@ -209,6 +222,34 @@ def evaluate(observed: Dict[str, Any], *, fixture: Optional[MissionFixture] = No
     add("robot_identity", Result.PASS if len(set(ids.values())) == 1 and None not in ids.values() else Result.FAIL,
         ", ".join(f"{k}={v!r}" for k, v in ids.items()))
 
+    # Pi host health: thermal, power, memory, disk. Blocks only on what it measured.
+    system = _get(health, "health", "system") or {}
+    temp, disk = system.get("cpu_temp_c"), system.get("disk_used_percent")
+    if system:
+        hot = isinstance(temp, (int, float)) and temp >= CPU_TEMP_LIMIT_C
+        full = isinstance(disk, (int, float)) and disk >= DISK_LIMIT_PERCENT
+        add("pi_host_health", Result.FAIL if hot or full else Result.PASS,
+            f"cpu_temp_c={temp!r} (limit {CPU_TEMP_LIMIT_C:g}) load_1m={system.get('load_avg_1m')!r} "
+            f"memory_used={system.get('memory_used_percent')!r}% available_mb={system.get('memory_available_mb')!r} "
+            f"disk_used={disk!r}% (limit {DISK_LIMIT_PERCENT:g}) uptime_s={system.get('uptime_s')!r}")
+    else:
+        add("pi_host_health", Result.NOT_TESTED, "the agent reported no host metrics", required=False)
+    throttled = observed.get("throttled")
+    try:
+        bits = int(str(throttled).split("=", 1)[1], 16)
+    except (IndexError, ValueError):
+        bits = None
+    if bits is None:
+        add("pi_power_throttling", Result.NOT_TESTED, f"vcgencmd get_throttled: {throttled!r}", required=False)
+    else:
+        add("pi_power_throttling", Result.FAIL if bits & THROTTLED_NOW_MASK else Result.PASS,
+            f"{throttled} (now: {bits & THROTTLED_NOW_MASK:#x}, since boot: {(bits >> 16) & 0xF:#x}; "
+            "under-voltage or throttling now blocks)")
+    revision = observed.get("deployed_revision") or None
+    add("deployed_revision", Result.PASS if revision else Result.NOT_TESTED,
+        f"{DEPLOYED_CHECKOUT} HEAD={revision!r}" + ("" if revision else
+            " (git metadata not readable as this user; this preflight does not escalate)"), required=False)
+
     # ESP32 link and UART.
     comm = state.get("communication") or {}
     controller = state.get("controller") or {}
@@ -225,6 +266,11 @@ def evaluate(observed: Dict[str, Any], *, fixture: Optional[MissionFixture] = No
         f"gps_source={config.get('gps_source')!r}); this preflight opened no port. Exclusive ownership on the "
         "Pi needs root to verify, and the ESP32's UART0 is also wired to its USB bridge on the laptop -- a "
         "laptop serial session must be idle (no TX) before any hardware test.")
+    latched = controller.get("reboot_latched")
+    add("esp32_reboot_latch",
+        Result.PASS if latched is False else (Result.FAIL if latched else Result.NOT_TESTED),
+        f"reboot_latched={latched!r} reboot_count={controller.get('reboot_count')!r}: a latched reboot holds "
+        "motion (and the Pi e-stop) until an operator clears it; this preflight never clears it")
     diag_system = _get(state, "controller_diag", "SYSTEM") or {}
     add("controller_firmware", Result.PASS if diag_system.get("fw_build") else Result.NOT_TESTED,
         f"fw_build={diag_system.get('fw_build')!r} built {diag_system.get('fw_build_utc')!r}; "
@@ -245,6 +291,14 @@ def evaluate(observed: Dict[str, Any], *, fixture: Optional[MissionFixture] = No
         f"Esp32Link motion_ready={controller.get('motion_ready')!r} (the agent's own gate: motion enabled, "
         "link UP, fresh TELEMETRY with drive available and no controller fault)")
 
+    counters = controller.get("counters") or {}
+    ack = controller.get("last_drive_ack")
+    add("applied_motion_feedback", Result.PASS if isinstance(ack, dict) else Result.NOT_TESTED,
+        f"last DRIVE ACK={None if not isinstance(ack, dict) else (ack.get('result'), ack.get('reason'), ack.get('applied'))!r} "
+        f"drive_acks={counters.get('drive_acks')!r} gated={counters.get('drive_gated')!r} "
+        f"rejected={counters.get('drive_rejected')!r} applied L/R={motor.get('left_applied')!r}/"
+        f"{motor.get('right_applied')!r}: what the firmware outputs, never proof a wheel turned", required=False)
+
     # Front sensing.
     front = tel.get("front") or {}
     diag_front = _get(state, "controller_diag", "FRONT") or {}
@@ -261,6 +315,14 @@ def evaluate(observed: Dict[str, Any], *, fixture: Optional[MissionFixture] = No
              and closest > stop_cm)
     add("front_path_clear", Result.PASS if clear else Result.BLOCKED,
         f"closest={closest!r} cm, obstacle={front.get('obstacle')!r}, stop distance={stop_cm!r} cm")
+
+    gates = tel.get("gates") or {}
+    add("obstacle_gates",
+        Result.BLOCKED if gates.get("forward_blocked") or front.get("obstacle") else
+        (Result.PASS if gates else Result.NOT_TESTED),
+        f"forward_blocked={gates.get('forward_blocked')!r} reverse_blocked={gates.get('reverse_blocked')!r} "
+        f"front_obstacle={front.get('obstacle')!r} rear_obstacle={(tel.get('rear') or {}).get('obstacle')!r} "
+        "(the ESP32's own gates; a forward block stops any DRIVE there)")
 
     # Rear sensing.
     rear = tel.get("rear") or {}
@@ -296,7 +358,6 @@ def evaluate(observed: Dict[str, Any], *, fixture: Optional[MissionFixture] = No
     # Safety and mission.
     safety = state.get("safety") or {}
     estop = safety.get("rule") == "estop"
-    gates = tel.get("gates") or {}
     add("safety_state",
         Result.FAIL if estop or state.get("mode") == "ERROR" or gates.get("safety_stop") else Result.PASS,
         f"mode={state.get('mode')!r} verdict={safety.get('verdict')!r} rule={safety.get('rule')!r} "
@@ -310,10 +371,32 @@ def evaluate(observed: Dict[str, Any], *, fixture: Optional[MissionFixture] = No
         Result.PASS if config.get("custody_confirmation") == "operator" else Result.BLOCKED,
         f"ROBOTX_CUSTODY_CONFIRMATION={config.get('custody_confirmation')!r}; the agent refuses any custody "
         "mission (NO_CUSTODY_SENSING) unless it is 'operator'")
+    readiness = observed.get("readiness")
+    if isinstance(readiness, dict):
+        blockers = readiness.get("blockers")
+        add("agent_readiness", Result.PASS if blockers == [] else Result.BLOCKED,
+            f"blockers={blockers!r} estop_reason={readiness.get('estop_reason')!r} "
+            f"lease_renewable={readiness.get('mission_lease_renewable')!r} (the agent's own assess_offer checks)")
+        faults = readiness.get("faults")
+        if isinstance(faults, list):
+            # What TELEMETRY faults[] carries. Informational: blockers and the
+            # checks above already decide readiness.
+            add("agent_faults", Result.PASS if not faults else Result.BLOCKED,
+                "active=" + (", ".join(f"{f.get('code')}({f.get('severity')})" for f in faults) or "none"),
+                required=False)
+        if readiness.get("perception_usable") is False:
+            add("perception", Result.BLOCKED,
+                "perception is not usable: the agent refuses every offer (PERCEPTION_UNAVAILABLE)")
+    else:
+        add("agent_readiness", Result.NOT_TESTED,
+            f"GET /readiness: {observed.get('readiness_http_status')!r} (an agent that predates the route)",
+            required=False)
     mission = state.get("mission")
     active = isinstance(mission, dict) and mission.get("status") not in (None, "COMPLETE", "ABORTED")
     add("mission_state", Result.BLOCKED if active else Result.PASS,
-        f"mission={None if mission is None else (mission.get('task_id'), mission.get('status'))!r}")
+        f"mission={None if mission is None else (mission.get('task_id'), mission.get('status'))!r} "
+        f"interrupted_by={None if not isinstance(mission, dict) else mission.get('interrupted_by')!r} "
+        f"mode={state.get('mode')!r}")
 
     # Not observable here.
     add("physical_estop", Result.NOT_TESTED,

@@ -234,7 +234,7 @@ class TestGeoMath(unittest.TestCase):
                 self.assertLessEqual(error, 180.001)
 
 
-def fix_reading(lat, lon, *, speed=None, track=None):
+def fix_reading(lat, lon, *, speed=None, track=None, h_acc=None):
     return GpsReading(
         status=GPSStatus.FIX,
         fix=GpsFix(
@@ -243,6 +243,7 @@ def fix_reading(lat, lon, *, speed=None, track=None):
             timestamp=time.time(),
             speed_mps=speed,
             track_deg=track,
+            h_acc_m=h_acc,
         ),
         age_s=0.1,
     )
@@ -360,6 +361,67 @@ class TestPositionEstimator(unittest.TestCase):
             held = self.estimator.update(fix_reading(51.5000500, -0.1))
         self.assertAlmostEqual(held.heading_deg, 0.0, delta=1.0)
         self.assertIs(held.heading_source, HeadingSource.GPS_TRACK)
+
+
+class TestHeadingFromFixWander(unittest.TestCase):
+    """A stationary receiver's fixes wander; that wander must never become a heading.
+
+    Live on 2026-10-19 the rover's NEO-9M (h_acc 1.5 m) produced a GPS_TRACK
+    heading while parked. Navigation would have steered the next leg on it.
+    """
+
+    def setUp(self):
+        self.estimator = PositionEstimator(PositionConfig(heading_min_move_m=1.5, heading_min_speed_mps=0.5))
+
+    def test_undriven_wander_never_yields_a_heading_however_far_it_drifts(self):
+        lat = 51.5
+        for _ in range(40):                                   # ~0.6 m per fix, 24 m in all
+            lat += 0.0000055
+            position = self.estimator.update(fix_reading(lat, -0.1), driven=False)
+        self.assertIsNone(position.heading_deg)
+        self.assertIs(position.heading_source, HeadingSource.NONE)
+
+    def test_undriven_wander_does_not_add_up_into_the_first_driven_track(self):
+        # Parked, the fix wanders 4 m north; then the rover drives 2 m east.
+        self.estimator.update(fix_reading(51.5000000, -0.1), driven=False)
+        self.estimator.update(fix_reading(51.5000360, -0.1), driven=False)   # +4 m north: wander
+        east = self.estimator.update(fix_reading(51.5000360, -0.0999710), driven=True)  # +2 m east
+        self.assertIs(east.heading_source, HeadingSource.GPS_TRACK)
+        self.assertAlmostEqual(east.heading_deg, 90.0, delta=1.0)
+
+    def test_a_held_heading_survives_standing_still_undriven(self):
+        self.estimator.update(fix_reading(51.5000000, -0.1), driven=True)
+        self.estimator.update(fix_reading(51.5000500, -0.1), driven=True)     # drove north
+        for _ in range(5):
+            held = self.estimator.update(fix_reading(51.5000500, -0.0999000), driven=False)  # wander east
+        self.assertAlmostEqual(held.heading_deg, 0.0, delta=1.0)
+        self.assertIs(held.heading_source, HeadingSource.GPS_TRACK)
+
+    def test_a_track_must_exceed_twice_the_stated_accuracy(self):
+        self.estimator.update(fix_reading(51.5000000, -0.1, h_acc=1.5), driven=True)
+        short = self.estimator.update(fix_reading(51.5000230, -0.1, h_acc=1.5), driven=True)  # ~2.6 m < 3 m
+        self.assertIs(short.heading_source, HeadingSource.NONE)
+        longer = self.estimator.update(fix_reading(51.5000300, -0.1, h_acc=1.5), driven=True)  # ~3.3 m
+        self.assertIs(longer.heading_source, HeadingSource.GPS_TRACK)
+        self.assertAlmostEqual(longer.heading_deg, 0.0, delta=1.0)
+
+    def test_a_fix_without_stated_accuracy_uses_the_minimum_move(self):
+        self.estimator.update(fix_reading(51.5000000, -0.1), driven=True)
+        moved = self.estimator.update(fix_reading(51.5000160, -0.1), driven=True)  # ~1.8 m
+        self.assertIs(moved.heading_source, HeadingSource.GPS_TRACK)
+
+    def test_a_moving_receivers_own_course_is_not_gated_on_driven(self):
+        # Course over ground at walking speed is real movement, even when the
+        # rover is being pushed: it says which way it went, not where it faces.
+        moving = self.estimator.update(fix_reading(51.5, -0.1, speed=1.2, track=45.0), driven=False)
+        self.assertEqual((moving.heading_deg, moving.heading_source), (45.0, HeadingSource.NMEA_TRACK))
+
+    def test_accuracy_factor_is_bounded(self):
+        for bad in (-0.1, 10.5):
+            with self.assertRaises(ValueError):
+                PositionConfig(heading_hacc_factor=bad)
+        PositionConfig(heading_hacc_factor=0.0)
+        PositionConfig(heading_hacc_factor=10.0)
 
 
 if __name__ == "__main__":

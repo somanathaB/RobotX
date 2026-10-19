@@ -1405,7 +1405,15 @@ class TestBackendUnavailable(ContractTestCase):
                 )
                 await link.start()
                 await asyncio.sleep(0.6)
+                # Sampled between attempts: each retry reports CONNECTING while
+                # it is in flight (truthfully), and a fixed instant caught one
+                # under load ~3% of the time. A link that never settles back
+                # to DISCONNECTED still fails below.
+                deadline = time.monotonic() + 3.0
                 described = link.describe()
+                while described["status"] != LinkStatus.DISCONNECTED.value and time.monotonic() < deadline:
+                    await asyncio.sleep(0.01)
+                    described = link.describe()
                 await link.stop()
             return described, agent
 

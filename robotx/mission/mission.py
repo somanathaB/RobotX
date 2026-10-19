@@ -66,6 +66,10 @@ class MissionRejectReason(str, Enum):
     DUPLICATE_TASK = "DUPLICATE_TASK"          # this taskId has already been run
     MISSION_ACTIVE = "MISSION_ACTIVE"          # another mission is still running
     ESTOP_ENGAGED = "ESTOP_ENGAGED"            # latched stop; the Rover cannot drive
+    # Route admission against the Rover's position (robotx.mission.admission).
+    ROUTE_INCONSISTENT = "ROUTE_INCONSISTENT"    # path ends and stops do not meet
+    ROUTE_START_TOO_FAR = "ROUTE_START_TOO_FAR"  # pathToPickup does not start where the Rover is
+    PICKUP_TOO_FAR = "PICKUP_TOO_FAR"            # beyond the configured pickup distance
 
 
 class MissionRejected(Exception):
@@ -352,6 +356,12 @@ class ActiveMission:
     custody_acquired_at: Optional[float] = None
     custody_released_at: Optional[float] = None
     drop_reached_at: Optional[float] = None
+    # Set when an emergency stop (an operator's, or the latch an ESP32 reboot
+    # engages) caught this mission in progress; cleared only by an explicit
+    # RESUME. While set, the mission is held but suspended: nothing drives it,
+    # and clearing the stop leaves it PAUSED rather than resuming it.
+    interrupted_by: Optional[str] = None
+    interrupted_at: Optional[float] = None
 
     @property
     def task_id(self) -> str:
@@ -374,6 +384,10 @@ class ActiveMission:
     @property
     def is_active(self) -> bool:
         return self.status.is_active
+
+    @property
+    def interrupted(self) -> bool:
+        return self.interrupted_by is not None
 
     @property
     def arrivals_measured(self) -> bool:
@@ -402,5 +416,7 @@ class ActiveMission:
             "custody_acquired_at": self.custody_acquired_at,
             "custody_released_at": self.custody_released_at,
             "drop_reached_at": self.drop_reached_at,
+            "interrupted_by": self.interrupted_by,
+            "interrupted_at": self.interrupted_at,
             "mission": self.mission.to_dict(),
         }

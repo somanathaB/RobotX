@@ -31,10 +31,12 @@ from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from robotx.config.logging_setup import log_event, setup_logging
 from robotx.config.settings import Settings
+from robotx.control.applied_motion import AppliedMotionConfig, AppliedMotionMonitor
 from robotx.control.decision import DecisionConfig, DecisionMaker
 from robotx.control.motion import MotionIntent
 from robotx.control.obstacle_recovery import ObstacleRecovery, ObstacleRecoveryConfig
 from robotx.control.safety import RangeReading, RangeStatus, SafetyConfig, SafetyDecision, SafetyGate
+from robotx.diagnostics.faults import Fault, FaultTracker, active_faults
 from robotx.diagnostics.health import (
     ComponentHealth,
     HealthConfig,
@@ -47,6 +49,7 @@ from robotx.esp32.link import Esp32Config, Esp32Link, Esp32Status
 from robotx.esp32.sim_transport import HostSimulatorPort
 from robotx.hardware.camera import CameraConfig, CameraError, CameraStatus, CameraStream
 from robotx.hardware.gps import GPSConfig, GPSReader, GpsReading, GPSStatus
+from robotx.mission.admission import AdmissionConfig, check_route_consistency, check_start_position
 from robotx.mission.manager import MissionAssignment, MissionManager
 from robotx.mission.mission import (
     ActiveMission,
@@ -85,6 +88,11 @@ from robotx.state.telemetry import build_telemetry
 
 
 logger = logging.getLogger(__name__)
+
+# OFFER_REJECT reason for a Rover whose perception is not usable. Outside the
+# readiness vocabulary on purpose (protocol.READINESS_BLOCKERS is the backend's,
+# and has no such code): the backend handles it as a per-Leg refusal.
+PERCEPTION_UNAVAILABLE = "PERCEPTION_UNAVAILABLE"
 
 # A loop that has not completed a tick for this long is not alive, and the
 # backend heartbeat stops. Well inside the backend's ~10 s freshness budget, so
@@ -188,7 +196,20 @@ class RobotAgent:
         self.obstacles = ObstacleRecovery(ObstacleRecoveryConfig.from_settings(settings))
         # When a navigation hold or a drive that gets nowhere asks for help.
         self.progress = ProgressMonitor(ProgressConfig.from_settings(settings))
+        # When the ESP32 reports it is not applying the DRIVE being sent.
+        self.applied_motion = AppliedMotionMonitor(AppliedMotionConfig.from_settings(settings))
+        # Whether the previous tick's gated intent moved the wheels: what the
+        # applied-motion monitor judges the ESP32's feedback against.
+        self._intent_moving = False
+        # The ESP32's state as of the previous tick's link check, for the one
+        # consumer that must read it before this tick's check runs: the GPS
+        # heading (see `_wheels_driven`).
+        self._last_controller: Optional[Any] = None
+        # Route admission against where the Rover stands (robotx.mission.admission).
+        self.admission = AdmissionConfig.from_settings(settings)
         self.health = HealthMonitor(HealthConfig.from_settings(settings))
+        # When each active fault began, for TELEMETRY faults[] (`fault_report`).
+        self._fault_tracker = FaultTracker()
         # DEMO battery simulation, only when explicitly enabled; otherwise the
         # battery stays UNAVAILABLE exactly as before.
         self.demo_battery: Optional[DemoBatterySimulator] = self._build_demo_battery(settings)
@@ -321,6 +342,7 @@ class RobotAgent:
             agent_alive=self.is_alive,
             telemetry_sent=self.battery_telemetry_sent if self.demo_battery is not None else None,
             readiness=self.readiness_blockers,
+            faults=self.fault_report,
         )
         await self.backend.start()
 
@@ -468,6 +490,7 @@ class RobotAgent:
         if self.esp32 is None:
             return None
         status = self.esp32.status()
+        self._last_controller = status.controller
         self.state.update_communication(
             esp32=status.link,
             esp32_detail=status.detail,
@@ -479,6 +502,28 @@ class RobotAgent:
             self._esp32_reboots_handled = status.controller.reboot_count
             self.emergency_stop(f"ESP32 rebooted: {status.detail}")
         return status
+
+    def _wheels_driven(self) -> bool:
+        """Whether the wheels were driven forward since the previous tick.
+
+        The only displacement a GPS-track heading may be derived from: the
+        previous tick's gated intent drove the wheels and -- with an ESP32
+        attached -- its latest TELEMETRY reports forward output actually
+        applied. A rover the controller held still has not moved, whatever
+        its fixes wander; a heading taken from that wander would steer the
+        next leg in a random direction.
+        """
+
+        if not self._intent_moving:
+            return False
+        if self.esp32 is None:
+            return True
+        controller = self._last_controller
+        telemetry = controller.telemetry if controller is not None else None
+        if telemetry is None:
+            return False
+        left, right = telemetry.left_applied, telemetry.right_applied
+        return min(left, right) >= 0 and max(left, right) > 0
 
     def _front_range(self, status: Optional[Esp32Status]) -> Optional[RangeReading]:
         """The ESP32's front range for the safety gate, or None with no link attached.
@@ -602,7 +647,10 @@ class RobotAgent:
             return OfferDecision.reject("NO_EXECUTABLE_PATH")
         try:
             mission = offer_to_mission(offer)
+            check_route_consistency(mission, self.admission)
         except MissionRejected as e:
+            log_event(logger, "offer.route_refused", e.detail, level=logging.WARNING,
+                      task_id=e.task_id, reason=e.reason.value)
             return OfferDecision.reject(f"UNSUPPORTED_MISSION: {e.reason.value}")
 
         snapshot = self.state.snapshot()
@@ -616,6 +664,21 @@ class RobotAgent:
             return OfferDecision.reject("MISSION_IN_PROGRESS")
         if blockers:
             return OfferDecision.reject(blockers[0])
+        # Not a readiness code (the backend's vocabulary has none for it), but a
+        # Rover that cannot see cannot drive: the decision layer stops for
+        # unusable perception on every tick, so accepting would hold a Leg the
+        # Rover will sit on. The faults[] report names it beside the refusal.
+        if not snapshot.perception.is_usable:
+            return OfferDecision.reject(f"{PERCEPTION_UNAVAILABLE}: {snapshot.perception.status.value}")
+        # Only now is there a measured, navigable position to judge it from
+        # (and if somehow not, check_start_position refuses rather than guess).
+        here = snapshot.position.lat_lon if snapshot.position is not None else None
+        try:
+            check_start_position(mission, here, self.admission)
+        except MissionRejected as e:
+            log_event(logger, "offer.route_refused", e.detail, level=logging.WARNING,
+                      task_id=e.task_id, reason=e.reason.value)
+            return OfferDecision.reject(f"UNSUPPORTED_MISSION: {e.reason.value}")
         return OfferDecision.accept(mission)
 
     def readiness_blockers(self, snapshot: Optional[Any] = None) -> List[str]:
@@ -661,6 +724,31 @@ class RobotAgent:
         if not self.custody_sensing_available():
             blockers.append("NO_CUSTODY_SENSING")
         return blockers
+
+    def active_faults(self, snapshot: Optional[Any] = None) -> List[Fault]:
+        """Every fault active right now (robotx.diagnostics.faults), from one snapshot."""
+
+        snapshot = self.state.snapshot() if snapshot is None else snapshot
+        cfg = getattr(self.esp32, "cfg", None)
+        controller = snapshot.controller
+        if cfg is not None:
+            motion_enabled = bool(cfg.motion_enabled)
+        else:
+            motion_enabled = bool(controller is not None and controller.motion_enabled)
+        return active_faults(
+            snapshot,
+            estop_engaged=self.safety.estop_engaged,
+            esp32_attached=self.esp32 is not None,
+            esp32_config_error=self._esp32_config_error,
+            motion_enabled=motion_enabled,
+            controller_max_age_s=float(getattr(cfg, "stale_after_s", 1.0)),
+            position_issue=self.navigator.position_issue(snapshot.position),
+        )
+
+    def fault_report(self, snapshot: Optional[Any] = None) -> List[Dict[str, Any]]:
+        """TELEMETRY `faults[]`: the active set, each with the instant it began."""
+
+        return self._fault_tracker.report(self.active_faults(snapshot))
 
     def custody_sensing_available(self) -> bool:
         """Whether a parcel handover on this Rover can be truthfully reported.
@@ -709,6 +797,7 @@ class RobotAgent:
         # An obstacle episode, or a stall, belongs to the run it happened in.
         self.obstacles.reset()
         self.progress.reset()
+        self.applied_motion.reset()
 
     def stop_mission(self, reason: str = "operator stop") -> None:
         """Halt: clear the route, drop to STOPPED, and publish a stop intent."""
@@ -735,6 +824,13 @@ class RobotAgent:
         tick -- pausing does not depend on anything downstream noticing a flag.
         """
 
+        if self.safety.estop_engaged and self.state.mode is OperatingMode.STOPPED:
+            # Already held harder than a pause holds it. Demoting STOPPED to
+            # PAUSED here would let a RESUME reach AUTO with the latch still on.
+            self.state.update_motion_intent(MotionIntent.stop(reason))
+            log_event(logger, "mission.pause_while_estopped",
+                      "emergency stop is latched; the mission stays STOPPED", reason=reason)
+            return
         self.state.set_mode(OperatingMode.PAUSED)
         self.state.update_motion_intent(MotionIntent.stop(reason))
         log_event(logger, "mission.paused", reason=reason, waypoints=len(self._mission_route))
@@ -753,6 +849,9 @@ class RobotAgent:
         rover, and a link that cannot carry motion pauses the mission again.
         """
 
+        if self.safety.estop_engaged:
+            # Never AUTO under a latch: clearing it is a separate operator act.
+            raise MissionRefused("emergency stop is latched; clear it before resuming")
         # The mission manager is asked first: on the drop leg it holds the
         # route being driven, while `_mission_route` may still describe the
         # pickup leg that finished before the pause.
@@ -766,6 +865,11 @@ class RobotAgent:
         # An operator RESUME gives navigation a fresh allowance; the reasons it
         # stopped still have to clear before anything moves.
         self.progress.reset()
+        self.applied_motion.reset()
+        active = self.missions.active
+        if active is not None and active.interrupted:
+            # This RESUME is the explicit decision the interruption waited for.
+            self.state.update_mission(self.missions.clear_interruption())
         self.state.clear_error()
         self.state.set_mode(OperatingMode.AUTO)
         log_event(logger, "mission.resumed", reason=reason)
@@ -780,6 +884,8 @@ class RobotAgent:
         could do.
         """
 
+        if self.safety.estop_engaged:
+            raise MissionRefused("emergency stop is latched; clear it before returning to base")
         home = self._home_position()
         if home is None:
             raise MissionRefused(
@@ -827,6 +933,11 @@ class RobotAgent:
         self.safety.engage_estop(reason)
         self.state.set_mode(OperatingMode.STOPPED, error=f"emergency stop: {reason}")
         self.state.update_motion_intent(MotionIntent.stop(f"safety: {reason}"))
+        # A mission caught by the stop is kept -- the operator decides its fate
+        # -- but marked interrupted, so neither its lease nor a clear of the
+        # latch can carry it on as though nothing happened.
+        if self.missions.has_active_mission:
+            self.state.update_mission(self.missions.interrupt(f"emergency stop: {reason}"))
         log_event(logger, "mission.emergency_stop", reason, level=logging.CRITICAL)
 
     def clear_emergency_stop(self, reason: str = "operator clear") -> bool:
@@ -845,7 +956,29 @@ class RobotAgent:
         # still has to re-prove itself with a fresh PING before carrying motion.
         if self.esp32 is not None:
             self.esp32.acknowledge_reboot()
+        # Recovery: a mission the stop interrupted goes STOPPED -> PAUSED, never
+        # AUTO. Its route is kept, its lease may be renewed again, and only an
+        # explicit RESUME (or a STOP that abandons it) decides what happens next.
+        if released and self.missions.has_active_mission and self.state.mode is OperatingMode.STOPPED:
+            why = "emergency stop cleared; the interrupted mission is PAUSED until an explicit RESUME"
+            self.state.set_mode(OperatingMode.PAUSED, error=f"recovery: {why}")
+            self.state.update_motion_intent(MotionIntent.stop(why))
+            log_event(logger, "mission.recovered_paused", why, level=logging.WARNING,
+                      task_id=self.missions.active.task_id if self.missions.active else None)
         return released
+
+    def mission_lease_renewable(self) -> bool:
+        """Whether a held mission's lease may be renewed right now.
+
+        Only while the Rover could carry the mission on without an operator
+        first clearing something: mode AUTO or PAUSED (a pause ends with a
+        RESUME), and no emergency stop latched. STOPPED under a latch, or
+        ERROR, is a Rover that cannot deliver; renewing would tell the backend
+        it is still on the job while the lease's whole purpose is to let the
+        backend recover a Leg from a Rover that is not.
+        """
+
+        return not self.safety.estop_engaged and self.state.mode in (OperatingMode.AUTO, OperatingMode.PAUSED)
 
     @property
     def emergency_stopped(self) -> bool:
@@ -886,8 +1019,19 @@ class RobotAgent:
                   level=logging.WARNING, reason=reason, mode=mode.value)
 
     def resume_idle(self) -> None:
-        """Leave STOPPED/ERROR and go back to IDLE, clearing the last error."""
+        """Leave STOPPED/ERROR and go back to IDLE, clearing the last error.
 
+        Refused (`MissionRefused`) while a mission is still held: IDLE would
+        orphan it, still active, with a route loaded and nothing ever driving or
+        ending it. Stop it (which abandons it) or resume it instead.
+        """
+
+        active = self.missions.active
+        if active is not None and active.is_active:
+            raise MissionRefused(
+                f"task {active.task_id} is still held ({active.status.value}); "
+                "stop it (abandons it) or resume it before going IDLE"
+            )
         self.state.clear_error()
         self.state.set_mode(OperatingMode.IDLE)
         self.state.update_motion_intent(MotionIntent.hold("idle"))
@@ -958,7 +1102,7 @@ class RobotAgent:
             if self.gps is not None
             else _gps_unavailable()
         )
-        position = self.position_estimator.update(gps_reading)
+        position = self.position_estimator.update(gps_reading, driven=self._wheels_driven())
 
         # A real fix always wins. Dead reckoning is only ever consulted when
         # GPS produced nothing, so attaching a receiver is all it takes to stop
@@ -1012,6 +1156,21 @@ class RobotAgent:
             # Recorded like the obstacle and navigation pauses, under its own
             # prefix, so /state and health say which subsystem stopped the run.
             self.state.set_mode(OperatingMode.PAUSED, error=f"controller: ESP32 cannot carry motion: {why}")
+
+        # 2b'. Applied motion: what the ESP32 reports it did with the DRIVEs
+        #      the Pi has been sending (ACK GATED/REJECTED, applied outputs).
+        #      A bounded disagreement pauses the mission with the reason
+        #      (robotx.control.applied_motion); a fault never resumes anything.
+        if link is not None and esp32 is not None and link.cfg.motion_enabled:
+            applied = self.applied_motion.update(
+                commanding=self.state.mode.mission_active and self._intent_moving,
+                controller=esp32.controller,
+                stale_after_s=link.cfg.stale_after_s,
+            )
+            if applied.fault:
+                why = f"controller: {applied.reason}"
+                self.pause_mission(why)
+                self.state.set_mode(OperatingMode.PAUSED, error=why)
 
         # 2c. Backend link (Y4): its loss policy runs on this loop's own cadence,
         #     before anything decides, so neither a reconnect backoff nor a
@@ -1103,6 +1262,7 @@ class RobotAgent:
             active=self.state.mode.mission_active,
             navigation=navigation,
             moving=not safety.intent.is_stop,
+            sensing_issue=_sensing_issue(perception, front, range_expected=range_expected),
         )
         if stall.assist:
             self.pause_mission(stall.reason)
@@ -1114,6 +1274,7 @@ class RobotAgent:
                     perception=perception,
                 )
         intent = safety.intent
+        self._intent_moving = not intent.is_stop
         self.state.update_safety(safety)
         self.state.update_motion_intent(intent)
 
@@ -1382,6 +1543,23 @@ class RobotAgent:
         return ComponentHealth(
             "backend", HealthStatus.DEGRADED, f"backend link is not streaming; {detail}"
         )
+
+
+def _sensing_issue(
+    perception: PerceptionResult, front: Optional[RangeReading], *, range_expected: bool
+) -> Optional[str]:
+    """Why the rover cannot sense its way forward right now, or None.
+
+    Each is a stop the decision layer or the safety gate already makes on its
+    own; naming it lets the progress monitor bound it (`ProgressMonitor`).
+    """
+
+    if not perception.is_usable:
+        return f"perception unavailable ({perception.status.value})"
+    if range_expected and (front is None or front.status is not RangeStatus.VALID):
+        status = "missing" if front is None else front.status.value
+        return f"forward range sensor not reporting ({status})"
+    return None
 
 
 def _gps_unavailable() -> GpsReading:

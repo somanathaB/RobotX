@@ -34,6 +34,8 @@ from robotx.hardware.gps import GpsFix, GpsReading, GPSStatus
 from robotx.localization.position import Position, PositionSource
 from robotx.mission.mission import ActiveMission, MissionSegment, MissionStatus
 from robotx.state.robot_state import Esp32LinkStatus, OperatingMode, RobotState
+from tests.fixtures.task_assign import START
+from tests.unit.test_agent import FakePerception
 from tests.unit.test_backend_link import FakeAgent, FakeSio, MemoryTokenStore, connect_and_auth, state_with_fix
 from tests.unit.test_demo_battery import simulated_power
 from tests.unit.test_engine_offer import parsed_offer, real_agent
@@ -72,9 +74,12 @@ def give_fix(agent, *, h_acc_m=1.5, source=PositionSource.GPS, status=GPSStatus.
     """SIMULATED fix, injected into state the way the offer tests do."""
 
     now = time.time()
+    # Where the offer fixture's pathToPickup starts, so route admission
+    # (robotx.mission.admission) is not what an offer is refused for.
+    lat, lon = START
     agent.state.update_gps(
-        GpsReading(status=status, fix=GpsFix(latitude=12.9, longitude=77.5, timestamp=now), age_s=0.1),
-        Position(latitude=12.9, longitude=77.5, timestamp=now, source=source,
+        GpsReading(status=status, fix=GpsFix(latitude=lat, longitude=lon, timestamp=now), age_s=0.1),
+        Position(latitude=lat, longitude=lon, timestamp=now, source=source,
                  fix_type="3D", h_acc_m=h_acc_m),
     )
 
@@ -86,6 +91,11 @@ def ready_agent():
     agent.state.update_communication(esp32=Esp32LinkStatus.UP)
     agent.esp32 = _Esp32(motion_ready=True)
     give_fix(agent)
+    # A Rover that cannot see is refused every offer (PERCEPTION_UNAVAILABLE),
+    # outside the readiness vocabulary; see TestPerceptionIsAnOfferRefusal.
+    seeing = FakePerception()
+    seeing.set_clear()
+    agent.state.update_perception(seeing.latest())
     return agent
 
 
@@ -251,6 +261,34 @@ class TestSameChecksAsAssessOffer(unittest.TestCase):
 def frame(snapshot=None, **kwargs):
     snapshot = snapshot if snapshot is not None else state_with_fix().snapshot()
     return build_telemetry_payload(snapshot, sequence=3, max_position_age_s=5.0, **kwargs).payload
+
+
+class TestPerceptionIsAnOfferRefusal(unittest.TestCase):
+    """Unusable perception refuses an offer, but is not a readiness blocker.
+
+    The backend's readiness vocabulary (READINESS_BLOCKERS) has no code for it,
+    so `readiness.blockers` stays `[]` and the refusal is a per-Leg one. The
+    TELEMETRY `faults[]` set names it (PERCEPTION_<status>, BLOCKING, CAMERA).
+    """
+
+    def test_a_rover_that_cannot_see_refuses_with_the_reason(self):
+        from robotx.perception.types import PerceptionResult, PerceptionStatus
+
+        agent = ready_agent()
+        agent.state.update_perception(PerceptionResult.unavailable(PerceptionStatus.NO_FRAME))
+        self.assertEqual(agent.readiness_blockers(), [])
+        decision = agent.assess_offer(parsed_offer())
+        self.assertIs(decision.verdict, OfferVerdict.REJECT)
+        self.assertEqual(decision.reason, "PERCEPTION_UNAVAILABLE: NO_FRAME")
+        self.assertIn("PERCEPTION_NO_FRAME", [f.code for f in agent.active_faults()])
+
+    def test_the_rover_level_blockers_still_come_first(self):
+        from robotx.perception.types import PerceptionResult, PerceptionStatus
+
+        agent = ready_agent()
+        agent.state.update_perception(PerceptionResult.unavailable(PerceptionStatus.DISABLED))
+        agent.emergency_stop("test")
+        self.assertEqual(agent.assess_offer(parsed_offer()).reason, "ESTOP_LATCHED")
 
 
 class TestReadinessOnTheWire(unittest.TestCase):

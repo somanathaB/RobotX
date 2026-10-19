@@ -17,7 +17,12 @@ one for a real orientation sensor:
   trusted above `heading_min_speed_mps`, because a stationary receiver's course
   field is noise.
 - `GPS_TRACK`   -- bearing between two consecutive fixes at least
-  `heading_min_move_m` apart. Same limitation, computed locally.
+  `heading_min_move_m` apart -- and at least `heading_hacc_factor` times the
+  receiver's stated horizontal accuracy, so the wander of a fix cannot pass
+  for movement. Same limitation, computed locally. When the caller says
+  whether the wheels were driven (`update(driven=...)`), only displacement
+  accumulated while they were counts: a stationary receiver's fixes drift by
+  metres over minutes, and that drift has no direction worth steering on.
 - `NONE`        -- stationary, or not enough movement yet. Heading is `None`.
 
 Both describe the direction the robot *moved*, not the direction it *faces*.
@@ -149,12 +154,21 @@ class Position:
 class PositionConfig:
     heading_min_move_m: float = 1.5
     heading_min_speed_mps: float = 0.5
+    # A GPS-track heading needs a displacement of at least this many times the
+    # receiver's stated horizontal accuracy (when it states one), as well as
+    # `heading_min_move_m`. 0 disables the accuracy term. Bounded to [0, 10].
+    heading_hacc_factor: float = 2.0
+
+    def __post_init__(self) -> None:
+        if not 0.0 <= self.heading_hacc_factor <= 10.0:
+            raise ValueError(f"heading_hacc_factor must be in [0, 10], got {self.heading_hacc_factor}")
 
     @classmethod
     def from_settings(cls, settings: Any) -> "PositionConfig":
         return cls(
             heading_min_move_m=settings.position_heading_min_move_m,
             heading_min_speed_mps=settings.position_heading_min_speed_mps,
+            heading_hacc_factor=settings.position_heading_hacc_factor,
         )
 
 
@@ -188,8 +202,14 @@ class PositionEstimator:
         self._last_heading_source = HeadingSource.NONE
         self._heading_anchor = None
 
-    def update(self, reading: GpsReading) -> Optional[Position]:
-        """Return the current position, or None when there is no usable fix."""
+    def update(self, reading: GpsReading, *, driven: Optional[bool] = None) -> Optional[Position]:
+        """Return the current position, or None when there is no usable fix.
+
+        `driven`: whether the wheels were driven forward since the previous
+        fix. False means any displacement is fix wander (or the rover being
+        moved by hand), never a track to derive a heading from; None means
+        the caller cannot say, and displacement alone decides as before.
+        """
 
         if reading.status is not GPSStatus.FIX or reading.fix is None:
             return None
@@ -197,7 +217,9 @@ class PositionEstimator:
         fix = reading.fix
         point = (fix.latitude, fix.longitude)
 
-        heading, source = self._estimate_heading(point, fix.speed_mps, fix.track_deg)
+        heading, source = self._estimate_heading(
+            point, fix.speed_mps, fix.track_deg, h_acc_m=fix.h_acc_m, driven=driven
+        )
 
         return Position(
             latitude=fix.latitude,
@@ -217,6 +239,9 @@ class PositionEstimator:
         point: LatLon,
         speed_mps: Optional[float],
         track_deg: Optional[float],
+        *,
+        h_acc_m: Optional[float] = None,
+        driven: Optional[bool] = None,
     ) -> Tuple[Optional[float], HeadingSource]:
         # Preferred: the receiver's own course over ground, but only while
         # actually moving -- a stationary receiver's course field is noise.
@@ -231,10 +256,12 @@ class PositionEstimator:
             return self._last_heading, HeadingSource.NMEA_TRACK
 
         # Fallback: bearing between fixes far enough apart to be movement
-        # rather than GPS wander.
-        if self._heading_anchor is None:
+        # rather than GPS wander. Undriven, the anchor follows the fix: what
+        # the receiver wandered while the rover stood still is not a track,
+        # and must not add up to one the moment the wheels turn.
+        if self._heading_anchor is None or driven is False:
             self._heading_anchor = point
-        elif haversine_m(self._heading_anchor, point) >= self.cfg.heading_min_move_m:
+        elif haversine_m(self._heading_anchor, point) >= self._min_track_m(h_acc_m):
             self._last_heading = bearing_deg(self._heading_anchor, point)
             self._last_heading_source = HeadingSource.GPS_TRACK
             self._heading_anchor = point
@@ -243,3 +270,10 @@ class PositionEstimator:
         # Not enough movement: hold the last known heading rather than pretend
         # to a new one. It is stale, and its source says where it came from.
         return self._last_heading, self._last_heading_source
+
+    def _min_track_m(self, h_acc_m: Optional[float]) -> float:
+        """The displacement a GPS-track heading needs, given the fix's stated accuracy."""
+
+        if h_acc_m is None or h_acc_m <= 0:
+            return self.cfg.heading_min_move_m
+        return max(self.cfg.heading_min_move_m, self.cfg.heading_hacc_factor * h_acc_m)

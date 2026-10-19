@@ -201,7 +201,10 @@ class TestAgentBoundedStops(AgentCase):
         # The fake receiver reports the same place however long the rover drives.
         snaps = rig.run(CFG.no_progress_after_s + 2.0)
         paused = next(i for i, s in enumerate(snaps) if s.mode is OperatingMode.PAUSED)
-        self.assertGreaterEqual(paused * TICK_S, CFG.no_progress_after_s - 2 * TICK_S)
+        # Driving began in Rig.start(), 1.0 s before this run, on the same clock.
+        driven_s = 1.0 + (paused + 1) * TICK_S
+        self.assertGreaterEqual(driven_s, CFG.no_progress_after_s - 2 * TICK_S)
+        self.assertLessEqual(driven_s, CFG.no_progress_after_s + 2 * TICK_S)
         self.assertIn("no progress", snaps[paused].last_error)
         self.assertTrue(snaps[paused].motion_intent.is_stop)
         mark = rig.mark()

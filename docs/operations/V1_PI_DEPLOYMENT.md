@@ -877,9 +877,16 @@ stranded-goods procedure instead.
 
    ```bash
    sudo git -C /opt/robotx/RobotX-Pi fetch origin
-   sudo git -C /opt/robotx/RobotX-Pi checkout --detach <target>
+   # umask 022 is required: under 0077 the checkout writes root:root 0600 files
+   # the robotx user cannot import (the 2026-10-19 crash loop).
+   sudo sh -c 'umask 022 && git -C /opt/robotx/RobotX-Pi checkout --detach <target>'
    sudo git -C /opt/robotx/RobotX-Pi rev-parse HEAD        # must print <target>
    sudo git -C /opt/robotx/RobotX-Pi status --porcelain    # must print nothing
+   # Files an earlier checkout left 0600 keep that mode across later checkouts: repair them.
+   sudo find /opt/robotx/RobotX-Pi -path /opt/robotx/RobotX-Pi/venv -prune -o -path /opt/robotx/RobotX-Pi/.git -prune -o \
+     \( -type f ! -perm -o=r -exec chmod a+r {} + \) -o \( -type d ! -perm -o=rx -exec chmod a+rx {} + \)
+   sudo -u robotx sh -c 'cd /opt/robotx/RobotX-Pi && PYTHONDONTWRITEBYTECODE=1 venv/bin/python -c "import robotx.application.main"'
+   #   must succeed before the service is started
    ```
 
 6. Dependencies: if `sudo git -C /opt/robotx/RobotX-Pi diff --stat <from> <target> -- requirements.txt`

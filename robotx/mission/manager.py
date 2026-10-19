@@ -200,6 +200,30 @@ class MissionManager:
         )
         return self._active
 
+    def interrupt(self, reason: str, *, now: Optional[float] = None) -> Optional[ActiveMission]:
+        """Record that an emergency stop caught the active mission. Idempotent.
+
+        The mission is kept -- route, leg, custody and all -- so an operator
+        can still decide its fate; only the first interruption is recorded,
+        because that is the one that explains why it stopped.
+        """
+
+        active = self._active
+        if active is None or active.status.is_terminal or active.interrupted:
+            return active
+        self._active = replace(active, interrupted_by=reason, interrupted_at=time.time() if now is None else now)
+        log_event(logger, "mission.interrupted", reason, level=logging.WARNING,
+                  task_id=active.task_id, status=active.status.value)
+        return self._active
+
+    def clear_interruption(self) -> Optional[ActiveMission]:
+        """An explicit RESUME: the interruption has been dealt with."""
+
+        active = self._active
+        if active is not None and active.interrupted:
+            self._active = replace(active, interrupted_by=None, interrupted_at=None)
+        return self._active
+
     def clear(self) -> None:
         """Forget the mission entirely, finished or not."""
 

@@ -69,8 +69,10 @@ from robotx.esp32.state import (
     ControllerDiag,
     ControllerState,
     ControllerTelemetry,
+    DriveAck,
     Esp32LinkStatus,
     LinkCounters,
+    SentMotion,
 )
 from robotx.esp32.transport import LineAssembler, SerialPort, open_serial
 
@@ -247,6 +249,12 @@ class Esp32Link:
 
         self._motion_slot: Optional[Tuple[str, Dict[str, int], float]] = None
         self._motion_sent = False
+        # Evidence for the applied-motion monitor, never for any decision here:
+        # the last STOP/DRIVE written (cmd, left, right, seq, when) and the last
+        # DRIVE ACK (frame, when). Kept across reconnects -- they are facts about
+        # what was sent and answered, and their ages say how old.
+        self._last_motion: Optional[Tuple[str, int, int, int, float]] = None
+        self._last_drive_ack: Optional[Tuple[Dict[str, Any], float]] = None
         # RX-24 / RX-25. `_recovering`: this connection was proven and lost its
         # proof; it re-proves with a PING. `_unconfirmed_drive`: a DRIVE was
         # written and no ACCEPTED STOP (or RESET) has been ACKed since -- the
@@ -563,6 +571,13 @@ class Esp32Link:
             return
         self._consecutive_timeouts = 0
         cmd, sent_at = entry
+        if cmd == "DRIVE":
+            self._counters["drive_acks"] += 1
+            if data["result"] == "GATED":
+                self._counters["drive_gated"] += 1
+            elif data["result"] == "REJECTED":
+                self._counters["drive_rejected"] += 1
+            self._last_drive_ack = (dict(data), now)
         if cmd == "RESET" and seq == self._reset_seq:
             self._finish_reset(data["result"], data["reason"])
         if data["result"] == "REJECTED" and data["reason"] == "STALE_SEQ":
@@ -724,6 +739,7 @@ class Esp32Link:
 
         seq = self._seq.next()
         self._pending[seq] = ("STOP", now)
+        self._last_motion = ("STOP", 0, 0, seq, now)
         self._counters["recovery_stops"] += 1
         return "STOP", encode_command(seq, "STOP")
 
@@ -771,6 +787,14 @@ class Esp32Link:
         with self._lock:
             self._refresh_status(now)
             age = None if self._telemetry_mono is None else max(0.0, now - self._telemetry_mono)
+            sent = None
+            if self._last_motion is not None:
+                m_cmd, m_left, m_right, m_seq, m_at = self._last_motion
+                sent = SentMotion(m_cmd, m_left, m_right, m_seq, max(0.0, now - m_at))
+            drive_ack = None
+            if self._last_drive_ack is not None:
+                ack_data, ack_at = self._last_drive_ack
+                drive_ack = DriveAck.from_frame(ack_data, age_s=max(0.0, now - ack_at))
             controller = ControllerState(
                 telemetry=self._telemetry,
                 telemetry_age_s=age,
@@ -789,6 +813,8 @@ class Esp32Link:
                 counters=LinkCounters(**self._counters),
                 reset_status=self._reset_status,
                 reset_detail=self._reset_detail,
+                last_motion_sent=sent,
+                last_drive_ack=drive_ack,
             )
             diag = ControllerDiag(
                 sections={k: dict(v) for k, v in self._diag.items()},
@@ -984,6 +1010,7 @@ class Esp32Link:
                     frames.append((cmd, encode_command(seq, cmd, **fields)))
                     self._pending[seq] = (cmd, now)
                     self._motion_sent = True
+                    self._last_motion = (cmd, fields.get("left", 0), fields.get("right", 0), seq, now)
                     if cmd == "DRIVE":
                         self._unconfirmed_drive = True
 

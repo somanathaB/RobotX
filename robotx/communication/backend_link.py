@@ -65,12 +65,13 @@ after `loss_grace_s`, under the `pause` policy.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import random
 import time
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 from urllib.parse import urlparse
 
 import socketio  # type: ignore
@@ -99,7 +100,6 @@ from robotx.communication.engine import (
 )
 from robotx.communication.protocol import (
     AUTH_FAILURE_INVALID_CREDENTIAL,
-    BACKEND_STATUS_FOR_MODE,
     AuthMethod,
     CommandRejection,
     CommandStatus,
@@ -114,6 +114,7 @@ from robotx.communication.protocol import (
     build_status_payload,
     build_task_complete_payload,
     build_telemetry_payload,
+    backend_status,
     now_ms,
     parse_auth_success,
     parse_command,
@@ -143,6 +144,10 @@ _EVENT_DEDUPE_S = 30.0
 _EVENT_MIN_INTERVAL_S = 1.0
 # Engine envelopes held for a sequence gap, across all commitments.
 _MAX_HELD_ENVELOPES = 16
+# Contract section 4: "send one [TELEMETRY] immediately on any safety or fault
+# transition". At most this often, so a flapping sensor cannot crowd the link
+# (the backend allows 50 frames per 5 s, >= 100 ms apart).
+_TRANSITION_MIN_GAP_S = 0.5
 # Y2 -- the least spacing between two emissions of the same report event. The
 # backend drops, silently, a second CUSTODY_EVENT / OFFER_* from one socket
 # within 50 ms (rateLimit.allow minIntervalMs); this keeps a margin above it.
@@ -362,6 +367,8 @@ ClientFactory = Callable[["BackendConfig"], Any]
 AgentAlive = Callable[[], bool]
 # The Rover's readiness blockers for one snapshot (`RobotAgent.readiness_blockers`).
 ReadinessSource = Callable[[Any], Sequence[str]]
+# Produces TELEMETRY `faults[]` entries for a snapshot (`RobotAgent.fault_report`).
+FaultSource = Callable[[Any], Sequence[Dict[str, Any]]]
 
 
 def _default_client_factory(cfg: BackendConfig) -> Any:
@@ -397,8 +404,15 @@ class BackendLink:
         commitment_store: Optional[CommitmentStore] = None,
         telemetry_sent: Optional[Callable[[Dict[str, Any]], None]] = None,
         readiness: Optional[ReadinessSource] = None,
+        faults: Optional[FaultSource] = None,
     ) -> None:
         self.cfg = cfg
+        # Where TELEMETRY's `faults[]` comes from (`RobotAgent.fault_report`).
+        # None means the block is never sent: not measured, never "none active".
+        self._faults = faults
+        # The safety-relevant content of the last TELEMETRY sent: a change to it
+        # sends the next frame at once (`_safety_key`).
+        self._last_safety_key: Optional[Tuple[Any, ...]] = None
         # Where TELEMETRY's `readiness.blockers` come from. None (a link driven
         # directly, as in tests) means the block is never sent: readiness that
         # nothing evaluated is "not reported", never "ready".
@@ -411,6 +425,8 @@ class BackendLink:
         # its own `is_alive`.
         self._agent_alive = agent_alive
         self._heartbeat_suppressed = False
+        # A held mission's lease renewal withheld (see `_publish_heartbeat`); logged on change.
+        self._lease_withheld = False
         self.state = state
         self.executor = CommandExecutor(target)
         self._target = target
@@ -489,6 +505,7 @@ class BackendLink:
             "auth_failures": 0,
             "heartbeats_sent": 0,
             "heartbeats_suppressed": 0,
+            "lease_renewals_withheld": 0,
             "telemetry_sent": 0,
             "positions_sent": 0,
             "positions_omitted": 0,
@@ -1156,6 +1173,8 @@ class BackendLink:
             if now - self._last_telemetry_t >= self.cfg.telemetry_interval_s:
                 await self._publish_telemetry()
                 self._last_telemetry_t = now
+            else:
+                await self._publish_telemetry_on_transition(now)
             # Checked every tick rather than on an interval: a handover or a
             # finished delivery should not wait a telemetry period. Both are
             # no-ops unless mission state records something not yet reported.
@@ -1197,8 +1216,20 @@ class BackendLink:
             log_event(logger, "backend.heartbeat_resumed", "agent loop is ticking again")
 
         # The commitment form renews the mission lease, so it is sent only
-        # while the Rover is genuinely carrying that mission out.
+        # while the Rover is genuinely carrying that mission out -- and could
+        # go on doing so without an operator first clearing an emergency stop.
         held = self._held_mission()
+        if held is not None and not self._lease_renewable():
+            held = None
+            self.stats["lease_renewals_withheld"] += 1
+            if not self._lease_withheld:
+                self._lease_withheld = True
+                log_event(logger, "backend.lease_not_renewed",
+                          "the held mission is stopped (emergency stop or error); HEARTBEAT no longer renews "
+                          "its lease, so the backend can recover the Leg", level=logging.WARNING)
+        elif held is not None and self._lease_withheld:
+            self._lease_withheld = False
+            log_event(logger, "backend.lease_renewed", "HEARTBEAT renews the held mission's lease again")
         payload = (
             build_heartbeat_payload(commitment_id=held[0].commitment_id, fence=held[0].fence_wire)
             if held is not None
@@ -1206,6 +1237,13 @@ class BackendLink:
         )
         if await self._emit(self.cfg.binding.heartbeat, payload):
             self.stats["heartbeats_sent"] += 1
+
+    def _lease_renewable(self) -> bool:
+        """`RobotAgent.mission_lease_renewable`: no lease renewal while the Rover cannot deliver."""
+
+        check = getattr(self._target, "mission_lease_renewable", None)
+        # A target that cannot say (a test double) renews exactly as before.
+        return bool(check()) if callable(check) else True
 
     def _readiness_blockers(self, snapshot: Any) -> Optional[List[str]]:
         """This frame's readiness blockers, or None when they cannot be vouched for.
@@ -1227,16 +1265,53 @@ class BackendLink:
             logger.exception("readiness evaluation failed; readiness omitted from this frame")
             return None
 
-    async def _publish_telemetry(self) -> None:
-        self._telemetry_sequence += 1
+    def _fault_report(self, snapshot: Any) -> Optional[List[Dict[str, Any]]]:
+        """This frame's `faults[]`, or None when it cannot be vouched for.
+
+        The same rule as `_readiness_blockers`: no source, a stalled agent loop
+        or a failed evaluation omits the block. `[]` would say "measured, and
+        nothing is wrong".
+        """
+
+        if self._faults is None:
+            return None
+        if self._agent_alive is not None and not self._agent_alive():
+            return None
+        try:
+            return list(self._faults(snapshot))
+        except Exception:  # noqa: BLE001 - an unevaluable set is "not measured"
+            logger.exception("fault evaluation failed; faults omitted from this frame")
+            return None
+
+    def _build_telemetry_frame(self) -> Any:
+        """The next TELEMETRY frame; its `sequence` is used only if it is sent."""
+
         snapshot = self.state.snapshot()
-        frame = build_telemetry_payload(
+        return build_telemetry_payload(
             snapshot,
-            sequence=self._telemetry_sequence,
+            sequence=self._telemetry_sequence + 1,
             max_position_age_s=self.cfg.max_position_age_s,
             last_position_timestamp=self._last_position_sent,
             readiness_blockers=self._readiness_blockers(snapshot),
+            faults=self._fault_report(snapshot),
         )
+
+    async def _publish_telemetry_on_transition(self, now: float) -> None:
+        """Contract section 4: a safety or fault transition is reported at once."""
+
+        if self._last_safety_key is None or now - self._last_telemetry_t < _TRANSITION_MIN_GAP_S:
+            return
+        frame = self._build_telemetry_frame()
+        if _safety_key(frame.payload) == self._last_safety_key:
+            return
+        await self._publish_telemetry(frame)
+        self._last_telemetry_t = now
+        self.stats["telemetry_on_transition"] = self.stats.get("telemetry_on_transition", 0) + 1
+
+    async def _publish_telemetry(self, frame: Any = None) -> None:
+        if frame is None:
+            frame = self._build_telemetry_frame()
+        self._telemetry_sequence = frame.payload["sequence"]
         if not frame.has_position:
             # Not an error, and never a reason to put something else in lat/lon.
             self.stats["positions_omitted"] += 1
@@ -1244,6 +1319,7 @@ class BackendLink:
         if not await self._emit(self.cfg.binding.telemetry, frame.payload):
             return
         self.stats["telemetry_sent"] += 1
+        self._last_safety_key = _safety_key(frame.payload)
         if self._telemetry_sent is not None:
             try:
                 self._telemetry_sent(frame.payload)
@@ -1687,7 +1763,7 @@ class BackendLink:
             "command": "PROBE",
             "correlationId": correlation,
             "robotId": self.cfg.robot_id,
-            "status": BACKEND_STATUS_FOR_MODE.get(snapshot.mode, "ERROR"),
+            "status": backend_status(snapshot),
         }
         if await self._emit(self.cfg.binding.probe_result, payload):
             self.stats["probes_answered"] = self.stats.get("probes_answered", 0) + 1
@@ -2101,6 +2177,25 @@ class BackendLink:
 
 
 # --- helpers ------------------------------------------------------------------
+
+
+def _safety_key(payload: Mapping[str, Any]) -> Tuple[Any, ...]:
+    """What a TELEMETRY frame says about safety and faults, minus its timing.
+
+    A change here is a "safety or fault transition" (contract section 4):
+    `status`, the `safety` block (less `observedAtMs`), `readiness` and the
+    active fault codes.
+    """
+
+    safety = {k: v for k, v in (payload.get("safety") or {}).items() if k != "observedAtMs"}
+    readiness = payload.get("readiness")
+    faults = payload.get("faults")
+    return (
+        payload.get("status"),
+        json.dumps(safety, sort_keys=True),
+        None if readiness is None else tuple(readiness.get("blockers", ())),
+        None if faults is None else tuple(f["code"] for f in faults),
+    )
 
 
 def _safe_url(url: str) -> str:

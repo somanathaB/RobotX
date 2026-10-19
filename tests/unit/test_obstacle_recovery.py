@@ -24,8 +24,9 @@ from robotx.perception.types import (
     PerceptionResult,
     PerceptionStatus,
 )
-from robotx.state.robot_state import Esp32LinkStatus as S, OperatingMode
+from robotx.state.robot_state import Esp32LinkStatus as S, MissionRefused, OperatingMode
 from tests.fixtures import esp32 as fx
+from tests.fixtures.esp32_sim import FirmwareModel
 from tests.unit.test_agent import HERE, NORTH, FakeGPS, FakePerception, headless_settings
 
 
@@ -189,6 +190,11 @@ class Rig:
     One `step()` is one 200 ms agent tick: the ESP32 (while `alive`) answers
     every command written so far and sends fresh TELEMETRY, in one read; the
     agent ticks; the link writes whatever the agent submitted.
+
+    The ESP32's answers come from `FirmwareModel` (SIMULATED): ACKs with
+    req/gated/applied and TELEMETRY whose commanded and applied outputs follow
+    the last DRIVE/STOP, so the applied-motion monitor -- on this rig's clock --
+    sees what a healthy controller would report.
     """
 
     def __init__(self):
@@ -201,10 +207,17 @@ class Rig:
         self.link, self.clock = fx.make_link(self.port, motion_enabled=True)
         self.agent.esp32 = self.link
         self.agent.obstacles.clock = self.clock
+        self.agent.applied_motion.clock = self.clock
+        # On the same clock from the first tick: a monitor that ticked on the
+        # host's monotonic clock and then moved to this one would count the gap
+        # between the two as time spent (it did, on a Pi up for under ~17 min).
+        self.agent.progress.clock = self.clock
+        self.firmware = FirmwareModel()
         self.fields = dict(HEALTHY)
         self.alive = True
         self.uptime = 3_600_000
         self.answered = set()
+        self.answered_upto = 0
 
         self.link.poll_once()
         self.port.feed(fx.telemetry(last_seq=None, uptime_ms=self.uptime, **self.fields))
@@ -214,13 +227,16 @@ class Rig:
 
     def esp32(self, telemetry=True):
         out = b""
-        for c in self.port.commands():
-            if c["seq"] not in self.answered:
-                self.answered.add(c["seq"])
-                out += fx.ack(c["seq"], cmd=c["cmd"])
+        # By position in the write log, not by seq: after an ESP32 reboot the
+        # link legitimately starts its sequence again from 1.
+        commands = self.port.commands()
+        for c in commands[self.answered_upto:]:
+            self.answered.add(c["seq"])
+            out += self.firmware.execute(c, self.fields)
+        self.answered_upto = len(commands)
         if telemetry:
             self.uptime += int(TICK_S * 1000)
-            out += fx.telemetry(uptime_ms=self.uptime, **self.fields)
+            out += fx.telemetry(uptime_ms=self.uptime, **{**self.firmware.telemetry_fields(), **self.fields})
         if out:
             self.port.feed(out)
         self.link.poll_once()
@@ -534,7 +550,10 @@ class TestResumeNeedsEveryReadinessCondition(AgentCase):
     def test_estop_latched(self):
         rig, mark = self.paused()
         rig.agent.emergency_stop("test")
-        rig.agent.resume_mission("operator")                     # mode only; the latch holds
+        # Refused outright now (it once changed the mode only, the latch holding).
+        with self.assertRaises(MissionRefused):
+            rig.agent.resume_mission("operator")
+        self.assertIs(rig.agent.mode, OperatingMode.STOPPED)
         rig.run(2.0)
         self.assertEqual(rig.drives(mark), [])
         self.assertTrue(rig.agent.emergency_stopped)

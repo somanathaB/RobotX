@@ -16,6 +16,10 @@ clears anything:
 - one navigation hold (`NO_POSITION`, `REROUTE_NEEDED`) lasting
   `hold_assist_after_s` escalates. A hold that ends sooner -- the fix comes
   back -- is forgotten, and navigation simply resumes on the valid fix;
+- so does one sensing hold the caller names (`sensing_issue`: perception not
+  usable, the forward range not reporting) while there is a route to drive:
+  the decision layer and the safety gate stop the rover for each, correctly,
+  and without this nothing would ever end the stop;
 - `no_progress_after_s` of *commanded* motion (time spent stopped for any
   reason does not count) without the distance to the current waypoint ever
   improving by `min_progress_m` on its best so far escalates. Reaching the
@@ -100,8 +104,21 @@ class ProgressMonitor:
         self._stalled_s = 0.0
         self._stall_assisted = False
 
-    def update(self, *, active: bool, navigation: NavigationState, moving: bool) -> ProgressVerdict:
-        """One agent tick. `moving`: this tick's gated intent drives the wheels."""
+    def update(
+        self,
+        *,
+        active: bool,
+        navigation: NavigationState,
+        moving: bool,
+        sensing_issue: Optional[str] = None,
+    ) -> ProgressVerdict:
+        """One agent tick. `moving`: this tick's gated intent drives the wheels.
+
+        `sensing_issue`: why the rover cannot sense its way forward this tick,
+        or None. Timed like a navigation hold, and only while navigation has a
+        waypoint to drive to (`NAVIGATING`): a rover standing at a stop for a
+        handover is not held by its sensing.
+        """
 
         if not active:
             # Paused or idle: no time passes for either timer.
@@ -111,14 +128,16 @@ class ProgressMonitor:
         dt = 0.0 if self._last_t is None else max(0.0, now - self._last_t)
         self._last_t = now
 
-        verdict = self._hold(navigation, dt)
+        verdict = self._hold(navigation, dt, sensing_issue)
         progress = self._progress(navigation, moving, dt)
         return verdict if verdict.assist else progress
 
-    def _hold(self, navigation: NavigationState, dt: float) -> ProgressVerdict:
+    def _hold(self, navigation: NavigationState, dt: float, sensing_issue: Optional[str] = None) -> ProgressVerdict:
         cause = _HOLD_CAUSES.get(navigation.status)
         if cause is not None and navigation.position_issue:
             cause = "GPS fix not accurate enough to navigate"
+        if cause is None and sensing_issue and navigation.status is NavigationStatus.NAVIGATING:
+            cause = sensing_issue
         if cause is None:
             self._hold_cause, self._hold_s, self._hold_assisted = None, 0.0, False
             return CLEAR

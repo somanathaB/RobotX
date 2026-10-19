@@ -366,6 +366,24 @@ BACKEND_STATUS_FOR_MODE = {
 }
 
 
+def backend_status(snapshot: RobotSnapshot) -> str:
+    """TELEMETRY / PROBE_RESULT `status` for this snapshot.
+
+    By mode (`BACKEND_STATUS_FOR_MODE`), with one exception: STOPPED while a
+    mission is still held. That is an emergency stop (or an ESP32 reboot)
+    caught mid-mission -- the run is not over, it is stopped with the Leg on
+    board, and only an operator decides its fate. "IDLE" would tell the
+    dashboard the Rover is free; it is the unit's own stop report, which the
+    backend records as an operator hold (PAUSED, P7-D1). An operator STOP
+    abandons the mission, so that STOPPED is still IDLE.
+    """
+
+    mission = snapshot.mission
+    if snapshot.mode is OperatingMode.STOPPED and mission is not None and mission.is_active:
+        return "PAUSED"
+    return BACKEND_STATUS_FOR_MODE.get(snapshot.mode, "ERROR")
+
+
 @dataclass(frozen=True)
 class TelemetryFrame:
     """One `TELEMETRY` payload, and whether it carries a position fix.
@@ -402,16 +420,87 @@ def _stop_latch_block(snapshot: RobotSnapshot, controller_max_age_s: float) -> O
     records it as such.
     """
 
-    controller = snapshot.controller
-    telemetry = controller.telemetry if controller is not None else None
-    age = controller.telemetry_age_s if controller is not None else None
-    if telemetry is None or age is None or age > controller_max_age_s:
+    telemetry = _fresh_controller_telemetry(snapshot, controller_max_age_s)
+    if telemetry is None:
         return None
     pi_latched = snapshot.safety.rule == ESTOP_RULE
     return {
         "engaged": bool(pi_latched or telemetry.safety_stop),
         "components": {"piEmergencyStop": bool(pi_latched), "esp32SafetyStop": bool(telemetry.safety_stop)},
     }
+
+
+def _fresh_controller_telemetry(snapshot: RobotSnapshot, controller_max_age_s: float) -> Optional[Any]:
+    controller = snapshot.controller
+    telemetry = controller.telemetry if controller is not None else None
+    age = controller.telemetry_age_s if controller is not None else None
+    if telemetry is None or age is None or age > controller_max_age_s:
+        return None
+    return telemetry
+
+
+def safety_block(snapshot: RobotSnapshot, controller_max_age_s: float) -> Optional[Dict[str, Any]]:
+    """TELEMETRY `safety` (contract section 4 / handoff section 17), or None.
+
+    Present only while the ESP32's TELEMETRY is fresh, as `stopLatch` always
+    was: without it the Pi knows nothing about the controller's safety state,
+    and the whole block is omitted rather than any of it reported as safe
+    (P2B-1 item 9: nothing safety-related goes on the wire unmeasured). Then:
+
+    - `estop: {"present": false}`: this Rover has no e-stop circuit, a fact
+      of its build (handoff section 16);
+    - `observedAtMs` (when the Pi received that frame), `safetyStop`
+      (`active`: a confirmed front/rear obstacle is latched right now;
+      `latched`: the firmware's sticky `safety_stop`, cleared only by RESET;
+      `reason`: FRONT_OBSTACLE / REAR_OBSTACLE, or null), `motorDriveAvailable`
+      and `commandTimeout`, and `stopLatch` (`_stop_latch_block`).
+
+    `safetyStop` is the ESP32's PROXIMITY stop and is never an e-stop.
+    """
+
+    telemetry = _fresh_controller_telemetry(snapshot, controller_max_age_s)
+    if telemetry is None:
+        return None
+    front, rear = bool(telemetry.front_obstacle), bool(telemetry.rear_obstacle)
+    block: Dict[str, Any] = {"estop": {"present": False}}
+    block.update({
+        "observedAtMs": now_ms(telemetry.received_at),
+        "safetyStop": {
+            "active": front or rear,
+            "latched": bool(telemetry.safety_stop),
+            "reason": "FRONT_OBSTACLE" if front else ("REAR_OBSTACLE" if rear else None),
+        },
+        "motorDriveAvailable": bool(telemetry.motor_drive_available),
+        "commandTimeout": bool(telemetry.command_timeout),
+    })
+    stop_latch = _stop_latch_block(snapshot, controller_max_age_s)
+    if stop_latch is not None:
+        block["stopLatch"] = stop_latch
+    return block
+
+
+# TELEMETRY `faults[]` entry vocabulary (contract section 4).
+FAULT_SEVERITIES = ("INFO", "DEGRADED", "BLOCKING", "CRITICAL")
+FAULT_COMPONENTS = ("PI", "ESP32", "LINK", "SENSOR", "CAMERA", "MOTOR", "GNSS", "POWER")
+
+
+def faults_block(faults: Optional[Sequence[Mapping[str, Any]]]) -> Optional[List[Dict[str, Any]]]:
+    """`faults[]` for TELEMETRY, or None when the set was not measured.
+
+    `[]` means measured and nothing active, so None (not evaluated) must
+    never become `[]`. An entry outside the contract's vocabulary is a
+    programming error, not something to send.
+    """
+
+    if faults is None:
+        return None
+    out: List[Dict[str, Any]] = []
+    for fault in faults:
+        if fault.get("severity") not in FAULT_SEVERITIES or fault.get("component") not in FAULT_COMPONENTS:
+            raise ValueError(f"{fault!r} is not a contract fault entry")
+        out.append({"code": str(fault["code"]), "severity": fault["severity"], "component": fault["component"],
+                    "active": True, "sinceMs": int(fault["sinceMs"])})
+    return out
 
 
 # `readiness.blockers` (ROBOTX_PI_READINESS_HANDOFF P-1, contract §4): the
@@ -466,6 +555,7 @@ def build_telemetry_payload(
     now: Optional[float] = None,
     controller_max_age_s: float = 1.0,
     readiness_blockers: Optional[Sequence[str]] = None,
+    faults: Optional[Sequence[Mapping[str, Any]]] = None,
 ) -> TelemetryFrame:
     """`TELEMETRY` to the handoff (§5, §16): measured fields only, the rest omitted.
 
@@ -490,9 +580,15 @@ def build_telemetry_payload(
       list -- the caller's statement that it evaluated every check
       (`RobotAgent.readiness_blockers`). None omits the block: an unevaluated
       Rover is "not reported", never `[]` (ready).
-    - no `heading`, `distanceTravelled`, `faults`, `localisation` or any
-      other `energy` field: nothing on this Pi measures them, so they are
-      omitted rather than asserted.
+    - `safety` (`safety_block`) only while the ESP32's TELEMETRY is fresh.
+    - `faults` only when `faults` is a list (`RobotAgent.fault_report`), the
+      complete active set; None omits it, never `[]`.
+    - `status` from `backend_status`: PAUSED for a Rover stopped with a
+      mission still held.
+    - no `heading`, `distanceTravelled`, `localisation` or any other
+      `energy` field: `heading` here is GPS course over ground, not where the
+      Rover faces, and nothing measures the others, so they are omitted
+      rather than asserted.
 
     `timestamp` (epoch ms) is the instant of measurement: the fix's own time
     when the frame carries one, otherwise the instant the status was read. It
@@ -508,14 +604,17 @@ def build_telemetry_payload(
     now = time.time() if now is None else now
     payload: Dict[str, Any] = {
         "sequence": int(sequence),
-        "status": BACKEND_STATUS_FOR_MODE.get(snapshot.mode, "ERROR"),
+        "status": backend_status(snapshot),
     }
-    stop_latch = _stop_latch_block(snapshot, controller_max_age_s)
-    if stop_latch is not None:
-        payload["safety"] = {"stopLatch": stop_latch}
+    safety = safety_block(snapshot, controller_max_age_s)
+    if safety is not None:
+        payload["safety"] = safety
     readiness = readiness_block(readiness_blockers)
     if readiness is not None:
         payload["readiness"] = readiness
+    fault_list = faults_block(faults)
+    if fault_list is not None:
+        payload["faults"] = fault_list
     battery, charging = demo_battery_report(snapshot)
     if battery is not None:
         payload["battery"] = battery

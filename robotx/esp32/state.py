@@ -193,9 +193,86 @@ class LinkCounters:
     link_losses: int = 0          # a proven link lost its proof (STALE / unanswered commands)
     reprobe_pings: int = 0        # PINGs sent to re-prove a link after a loss
     recovery_stops: int = 0       # STOPs written behind a possibly-buffered DRIVE during recovery
+    drive_acks: int = 0           # ACKs matched to a DRIVE the link wrote
+    drive_gated: int = 0          # ... of which GATED: executed, output limited by the ESP32
+    drive_rejected: int = 0       # ... of which REJECTED: not executed
 
     def to_dict(self) -> Dict[str, int]:
         return dict(self.__dict__)
+
+
+def _opt_int(value: Any) -> Optional[int]:
+    """An integer ACK field, or None when absent or not an integer (never guessed)."""
+
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+@dataclass(frozen=True)
+class DriveAck:
+    """The ESP32's ACK for the most recent DRIVE the link wrote (PROTOCOL.md section 9).
+
+    `req_*` is what the DRIVE asked for, `gated_*` what the ESP32's safety and
+    availability gates permitted, `applied_*` what its motor layer actually
+    outputs. The three pairs are optional on the wire: one the frame did not
+    carry (or carried as a non-integer) is None, not 0.
+    """
+
+    seq: int
+    result: str                    # ACCEPTED | GATED | REJECTED | DUPLICATE
+    reason: str
+    req_left: Optional[int] = None
+    req_right: Optional[int] = None
+    gated_left: Optional[int] = None
+    gated_right: Optional[int] = None
+    applied_left: Optional[int] = None
+    applied_right: Optional[int] = None
+    age_s: Optional[float] = None  # since the ACK was parsed, on the link's clock
+
+    @classmethod
+    def from_frame(cls, data: Mapping[str, Any], *, age_s: Optional[float] = None) -> "DriveAck":
+        return cls(
+            seq=data["seq"],
+            result=data["result"],
+            reason=data["reason"],
+            req_left=_opt_int(data.get("req_left")),
+            req_right=_opt_int(data.get("req_right")),
+            gated_left=_opt_int(data.get("gated_left")),
+            gated_right=_opt_int(data.get("gated_right")),
+            applied_left=_opt_int(data.get("applied_left")),
+            applied_right=_opt_int(data.get("applied_right")),
+            age_s=age_s,
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "seq": self.seq,
+            "result": self.result,
+            "reason": self.reason,
+            "req": [self.req_left, self.req_right],
+            "gated": [self.gated_left, self.gated_right],
+            "applied": [self.applied_left, self.applied_right],
+            "age_s": None if self.age_s is None else round(self.age_s, 3),
+        }
+
+
+@dataclass(frozen=True)
+class SentMotion:
+    """The last motion command the link actually wrote: STOP, or DRIVE with its units."""
+
+    cmd: str                       # STOP | DRIVE
+    left: int = 0
+    right: int = 0
+    seq: Optional[int] = None
+    age_s: Optional[float] = None  # since it was written, on the link's clock
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "cmd": self.cmd,
+            "left": self.left,
+            "right": self.right,
+            "seq": self.seq,
+            "age_s": None if self.age_s is None else round(self.age_s, 3),
+        }
 
 
 @dataclass(frozen=True)
@@ -222,6 +299,10 @@ class ControllerState:
     # An ACCEPTED RESET is not proof of health: TELEMETRY still decides that.
     reset_status: str = "NONE"
     reset_detail: str = ""
+    # What the link last wrote as motion, and the ESP32's ACK for the last DRIVE.
+    # Both None until one exists; read by the applied-motion monitor.
+    last_motion_sent: Optional[SentMotion] = None
+    last_drive_ack: Optional[DriveAck] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -244,6 +325,8 @@ class ControllerState:
             "counters": self.counters.to_dict(),
             "reset_status": self.reset_status,
             "reset_detail": self.reset_detail,
+            "last_motion_sent": None if self.last_motion_sent is None else self.last_motion_sent.to_dict(),
+            "last_drive_ack": None if self.last_drive_ack is None else self.last_drive_ack.to_dict(),
         }
 
 

@@ -50,7 +50,7 @@ class FakeGPS:
     def get_reading(self):
         return self.reading
 
-    def set_fix(self, lat, lon, *, speed=None, track=None):
+    def set_fix(self, lat, lon, *, speed=None, track=None, fix_type=None, h_acc=None):
         self.reading = GpsReading(
             status=GPSStatus.FIX,
             fix=GpsFix(
@@ -59,6 +59,8 @@ class FakeGPS:
                 timestamp=time.time(),
                 speed_mps=speed,
                 track_deg=track,
+                fix_type=fix_type,
+                h_acc_m=h_acc,
             ),
             age_s=0.1,
         )

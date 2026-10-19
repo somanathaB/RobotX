@@ -12,6 +12,21 @@ Two kinds of test live here, and they are not interchangeable.
 
 ---
 
+## Quick start: the test runner
+
+```bash
+cd /home/pi/Desktop/RobotX-Pi
+venv/bin/python -m scripts.run_tests                  # every offline suite: PASS / FAIL / SKIP / NOT TESTED
+venv/bin/python -m scripts.run_tests delivery         # a genuine signed OFFER end to end, SIMULATED backend + hardware
+venv/bin/python -m scripts.run_tests navigation telemetry
+venv/bin/python -m scripts.simulated_mission          # a TEST-INJECTED mission end to end, SIMULATED hardware
+venv/bin/python -m scripts.run_tests --live preflight # read-only report on the running agent
+```
+
+Suites, statuses, the simulated scenarios, the live preflight and the
+interrupted-mission recovery rules: `docs/operations/TESTING_AND_RECOVERY.md`.
+Simulated runs are never hardware evidence; the runner says so on every run.
+
 ## Automated tests
 
 Stdlib `unittest`. No pytest, no network, no hardware, no new dependencies.

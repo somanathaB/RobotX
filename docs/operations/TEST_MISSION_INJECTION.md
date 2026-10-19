@@ -154,7 +154,17 @@ sudo git -c safe.directory=/opt/robotx/RobotX-Pi \
   -C /opt/robotx/RobotX-Pi \
   fetch /home/pi/Desktop/RobotX-Pi test/mission-injection-harness
 sudo git -c safe.directory=/opt/robotx/RobotX-Pi -C /opt/robotx/RobotX-Pi rev-parse FETCH_HEAD   # must print <COMMIT>
-sudo git -c safe.directory=/opt/robotx/RobotX-Pi -C /opt/robotx/RobotX-Pi checkout --detach <COMMIT>
+# umask 022 is REQUIRED: a checkout under a 0077 umask writes the new files
+# root:root 0600, the robotx service user cannot import them, and the agent
+# crash-loops (what happened to the 2026-10-19 16:30 attempt).
+sudo sh -c 'umask 022 && git -c safe.directory=/opt/robotx/RobotX-Pi -C /opt/robotx/RobotX-Pi checkout --detach <COMMIT>'
+# Repair anything an earlier checkout left unreadable, then prove it as the service user:
+sudo find /opt/robotx/RobotX-Pi -path /opt/robotx/RobotX-Pi/venv -prune -o -path /opt/robotx/RobotX-Pi/.git -prune -o \
+  \( -type f ! -perm -o=r -exec chmod a+r {} + \) -o \( -type d ! -perm -o=rx -exec chmod a+rx {} + \)
+sudo find /opt/robotx/RobotX-Pi -path /opt/robotx/RobotX-Pi/venv -prune -o -path /opt/robotx/RobotX-Pi/.git -prune -o ! -perm -o=r -print
+#   must print nothing
+sudo -u robotx sh -c 'cd /opt/robotx/RobotX-Pi && PYTHONDONTWRITEBYTECODE=1 venv/bin/python -c "import robotx.application.main, robotx.diagnostics.faults; print(\"import ok\")"'
+#   must print: import ok (before any restart)
 sudo git -c safe.directory=/opt/robotx/RobotX-Pi -C /opt/robotx/RobotX-Pi rev-parse HEAD          # must print <COMMIT>
 sudo git -c safe.directory=/opt/robotx/RobotX-Pi -C /opt/robotx/RobotX-Pi status --porcelain      # must print nothing
 sudo git -c safe.directory=/opt/robotx/RobotX-Pi -C /opt/robotx/RobotX-Pi diff --stat 77e92fb <COMMIT> -- requirements.txt
@@ -220,7 +230,8 @@ Disable injection only (keeps the code):
 4. Expect `GET /test/injection` → 404 and `/config .test_injection_enabled == false`.
 
 Return to the previous release (removes the code): deployment guide section 24
-with target `77e92fb` and the backed-up environment file. That code has no
+with target `77e92fb` and the backed-up environment file -- with the checkout
+under `umask 022` and the same permission check as section 4. That code has no
 operator guard and no Origin rule: the four release routes are then open to
 any local caller and browser page again.
 

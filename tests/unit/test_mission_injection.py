@@ -320,7 +320,8 @@ def live_like_observation():
             "safety": {"verdict": "ALLOWED", "rule": "stop", "reason": "no active mission"},
             "communication": {"esp32": "UP", "esp32_detail": "bidirectional", "backend": "STREAMING"},
             "controller": {"telemetry": tel, "telemetry_age_s": 0.18, "bidirectional": True,
-                           "motion_enabled": False, "motion_ready": False},
+                           "motion_enabled": False, "motion_ready": False,
+                           "reboot_latched": False, "reboot_count": 0},
             "controller_diag": {
                 "FRONT": {"front_health": "OK", "sensor_map_verified": False},
                 "REAR": {"rear_backend": "TCA9548A_NOT_FOUND", "rear_sensor_status": ["UNINITIALISED"] * 3},

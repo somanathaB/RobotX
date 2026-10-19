@@ -66,6 +66,12 @@ class HookedSio(FakeSio):
             await hook()
 
 
+def efx_start():
+    from tests.fixtures.task_assign import START
+
+    return START
+
+
 class TestConcurrencyWithBackendOffers(Case):
     """Exactly one mission wins; nothing is ever claimed for the one that lost."""
 
@@ -98,6 +104,10 @@ class TestConcurrencyWithBackendOffers(Case):
     def test_offer_first_then_injection_is_refused_and_the_engine_mission_stands(self):
         rig, link, sio = self.rig_and_link()
         gate = self.gate()
+
+        # The rig stands where the OFFER fixture's pathToPickup starts (route admission).
+        rig.agent.gps.set_fix(*efx_start())
+        rig.run(0.6)
 
         async def scenario():
             await connect_and_auth(link)

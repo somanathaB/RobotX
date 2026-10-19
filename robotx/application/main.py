@@ -145,6 +145,31 @@ async def config() -> Dict[str, Any]:
     return SETTINGS.public_summary()
 
 
+@app.get("/readiness")
+async def readiness() -> Dict[str, Any]:
+    """Every reason this Rover would refuse an offer right now, and whether a held lease is renewed.
+
+    Read-only: the same `readiness_blockers` and `faults` (the active fault set,
+    `robotx.diagnostics.faults`) the agent sends in TELEMETRY and applies in
+    `assess_offer`, plus the e-stop latch, the lease predicate and perception
+    (an offer-level refusal the readiness vocabulary has no code for).
+    """
+
+    agent = get_agent()
+    snapshot = agent.state.snapshot()
+    mission = snapshot.mission
+    return {
+        "blockers": agent.readiness_blockers(snapshot),
+        "faults": agent.fault_report(snapshot),
+        "perception_usable": snapshot.perception.is_usable,
+        "estop_engaged": agent.emergency_stopped,
+        "estop_reason": agent.safety.estop_reason,
+        "mission_lease_renewable": agent.mission_lease_renewable(),
+        "mission": None if mission is None else {
+            "task_id": mission.task_id, "status": mission.status.value, "interrupted_by": mission.interrupted_by},
+    }
+
+
 @app.get("/backend")
 async def backend_link() -> Dict[str, Any]:
     """Backend link state: connection, authentication, binding and counters.
@@ -357,8 +382,13 @@ async def confirm_custody(body: Dict[str, Any]) -> Dict[str, Any]:
 
 @app.post("/mission/idle", dependencies=OPERATOR)
 async def resume_idle() -> Dict[str, Any]:
+    """Leave STOPPED/ERROR for IDLE; 409 while a mission is still held (stop or resume it)."""
+
     agent = get_agent()
-    agent.resume_idle()
+    try:
+        agent.resume_idle()
+    except MissionRefused as e:
+        raise HTTPException(status_code=409, detail=str(e)) from None
     return {"mode": agent.state.mode.value}
 
 
