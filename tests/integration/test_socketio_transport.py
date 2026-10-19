@@ -1436,13 +1436,29 @@ class TestBackendUnavailable(ContractTestCase):
                     backoff_initial_s=0.05,
                     backoff_max_s=0.2,
                 )
+                state = state_with_fix()
+                # Every status the link reports, in order: _set_status writes
+                # each one through RobotState.update_communication.
+                reported = []
+                update = state.update_communication
+
+                def record(**fields):
+                    if "backend" in fields:
+                        reported.append(fields["backend"])
+                    return update(**fields)
+
+                state.update_communication = record
                 link = BackendLink(
-                    cfg, state_with_fix(), FakeAgent(),
+                    cfg, state, FakeAgent(),
                     token_store=TokenStore(os.path.join(tmp, "s.json")),
                 )
                 await link.start()
-                await asyncio.sleep(0.4)
-                down_status = link.status
+                # Not a fixed sleep and one sample -- a retrying link is CONNECTING
+                # for part of every cycle. Wait until it has really failed twice
+                # (down, and retrying), then judge everything it reported.
+                retried = await wait_for(lambda: link.stats["connect_failures"] >= 2, timeout=5.0)
+                down_reported = list(reported)
+                down_connected = link.connected
 
                 # The backend comes up on the same port. No restart of the Pi.
                 later = ContractServer()
@@ -1458,10 +1474,14 @@ class TestBackendUnavailable(ContractTestCase):
                 finally:
                     await link.stop()
                     await later_app_runner.cleanup()
-            return down_status, came_up, got_telemetry
+            return retried, down_reported, down_connected, came_up, got_telemetry
 
-        down_status, came_up, got_telemetry = asyncio.run(scenario())
-        self.assertIs(down_status, LinkStatus.DISCONNECTED)
+        retried, down_reported, down_connected, came_up, got_telemetry = asyncio.run(scenario())
+        self.assertTrue(retried, "the link never retried while the backend was absent")
+        self.assertFalse(down_connected)
+        # A refused connection is reported DISCONNECTED -- never AUTH_FAILED, never up.
+        self.assertIn(LinkStatus.DISCONNECTED, down_reported)
+        self.assertLessEqual(set(down_reported), {LinkStatus.CONNECTING, LinkStatus.DISCONNECTED}, down_reported)
         self.assertTrue(came_up)
         self.assertTrue(got_telemetry)
 

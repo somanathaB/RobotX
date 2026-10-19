@@ -15,21 +15,29 @@ With the backend link enabled RobotX admits missions, so the two routes that
 put the robot into AUTO -- `/mission/start` and `/mission/resume` -- refuse
 (409) and a RESUME comes only through the backend (see
 `refuse_local_admission_in_engine_mode`).
+
+One test-only exception, off by default: with `ROBOTX_TEST_INJECTION_ENABLED`
+`POST /test/mission/inject` accepts a locally supplied `TEST-INJECTED-` task,
+on loopback only and behind a bearer token, and hands it to the agent's own
+`assess_offer` / `assign_mission` (see `robotx.application.injection`).
 """
 
 from __future__ import annotations
 
 import asyncio
 import ipaddress
+import json
 import logging
 from contextlib import asynccontextmanager
 from typing import Any, AsyncGenerator, Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from robotx.application.agent import RobotAgent
+from robotx.application.injection import MAX_BODY_BYTES, InjectionGate, InjectionRejected
+from robotx.application.operator_access import OperatorAccess
 from robotx.config.logging_setup import log_event, setup_logging
 from robotx.config.settings import SETTINGS, Settings
 from robotx.diagnostics.health import HealthStatus
@@ -48,6 +56,8 @@ class AppState:
     """Holds the single agent instance for the lifetime of the process."""
 
     agent: Optional[RobotAgent] = None
+    injection: Optional[InjectionGate] = None
+    operator_access: Optional[OperatorAccess] = None
 
 
 state = AppState()
@@ -62,6 +72,11 @@ def get_agent() -> RobotAgent:
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     setup_logging(SETTINGS.log_level)
+    state.operator_access = OperatorAccess.from_settings(SETTINGS)
+    if state.operator_access.problem is not None:
+        log_event(logger, "api.operator_access_misconfigured", state.operator_access.problem,
+                  level=logging.ERROR)
+    state.injection = InjectionGate.from_settings(SETTINGS)
 
     agent = RobotAgent(SETTINGS)
     try:
@@ -83,6 +98,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         yield
     finally:
         state.agent = None
+        state.injection = None
+        state.operator_access = None
         await agent.stop()
 
 
@@ -152,6 +169,42 @@ async def backend_link() -> Dict[str, Any]:
 
 
 # --- mission control ----------------------------------------------------------
+
+
+BROWSER_REFUSAL = "browser requests are refused on this route"
+
+
+def require_operator(request: Request) -> None:
+    """Guard for the routes that release a stop or advance a mission. Never on a stop route.
+
+    Always: a request carrying `Origin` is refused. Browsers send it on every
+    POST -- a cross-site page's no-preflight "simple" request and a DNS-rebinding
+    page alike -- while the documented operator procedure (curl over SSH) never
+    does. Without this, any web page open on the Pi could clear the e-stop.
+
+    Opt-in on top (`ROBOTX_OPERATOR_TOKEN_SHA256`, see
+    `robotx.application.operator_access`): a bearer token and a loopback Host.
+    """
+
+    if request.headers.get("origin") is not None:
+        log_event(logger, "api.operator_refused", BROWSER_REFUSAL, level=logging.WARNING,
+                  route=request.url.path, status=403)
+        raise HTTPException(status_code=403, detail=BROWSER_REFUSAL)
+    access = state.operator_access
+    if access is None:
+        return
+    refusal = access.refusal(
+        authorization=request.headers.get("authorization"),
+        origin=request.headers.get("origin"),
+        host_header=request.headers.get("host"),
+    )
+    if refusal is not None:
+        log_event(logger, "api.operator_refused", refusal[1], level=logging.WARNING,
+                  route=request.url.path, status=refusal[0])
+        raise HTTPException(status_code=refusal[0], detail=refusal[1])
+
+
+OPERATOR = [Depends(require_operator)]
 
 
 class Waypoint(BaseModel):
@@ -244,7 +297,7 @@ async def emergency_stop() -> Dict[str, Any]:
     return {"mode": agent.state.mode.value, "emergency_stopped": True}
 
 
-@app.post("/safety/clear")
+@app.post("/safety/clear", dependencies=OPERATOR)
 async def clear_emergency_stop() -> Dict[str, Any]:
     """Release the emergency stop latch. Does not resume the mission."""
 
@@ -257,7 +310,7 @@ async def clear_emergency_stop() -> Dict[str, Any]:
     }
 
 
-@app.post("/controller/reset")
+@app.post("/controller/reset", dependencies=OPERATOR)
 async def reset_controller() -> Dict[str, Any]:
     """Ask the ESP32 to clear its safety-stop and command-timeout latches, once.
 
@@ -280,7 +333,7 @@ async def reset_controller() -> Dict[str, Any]:
     }
 
 
-@app.post("/mission/custody")
+@app.post("/mission/custody", dependencies=OPERATOR)
 async def confirm_custody(body: Dict[str, Any]) -> Dict[str, Any]:
     """An operator at the stop confirms a parcel handover: {"kind": ACQUIRED|RELEASED}.
 
@@ -302,11 +355,81 @@ async def confirm_custody(body: Dict[str, Any]) -> Dict[str, Any]:
     return {"kind": kind, "mission": None if active is None else active.to_dict()}
 
 
-@app.post("/mission/idle")
+@app.post("/mission/idle", dependencies=OPERATOR)
 async def resume_idle() -> Dict[str, Any]:
     agent = get_agent()
     agent.resume_idle()
     return {"mode": agent.state.mode.value}
+
+
+# --- test-only mission injection (off by default) -----------------------------
+
+
+def _enabled_injection_gate() -> InjectionGate:
+    """The gate, or the same 404 an unknown route gets: disabled is absent."""
+
+    gate = state.injection
+    if gate is None or not gate.enabled:
+        raise HTTPException(status_code=404, detail="Not Found")
+    return gate
+
+
+def _check_injection_request(gate: InjectionGate, request: Request, method: str) -> None:
+    if request.method != method:
+        raise HTTPException(status_code=405, detail="Method Not Allowed")
+    server = request.scope.get("server")
+    gate.check_origin(
+        client_host=request.client.host if request.client else None,
+        host_header=request.headers.get("host"),
+        origin=request.headers.get("origin"),
+        server_host=server[0] if server else None,
+    )
+
+
+# Every method is routed here so that, while disabled, any request answers the
+# same 404 an unknown path does -- a 405 would say the route exists.
+_ALL_METHODS = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
+
+
+@app.api_route("/test/injection", methods=_ALL_METHODS)
+async def test_injection_status(request: Request) -> Any:
+    """Whether the test-only ingress is available. Read-only; no task details."""
+
+    gate = _enabled_injection_gate()
+    try:
+        _check_injection_request(gate, request, "GET")
+    except InjectionRejected as e:
+        return JSONResponse(status_code=e.status, content=e.to_dict())
+    return gate.status()
+
+
+@app.api_route("/test/mission/inject", methods=_ALL_METHODS)
+async def inject_test_mission(request: Request) -> Any:
+    """Offer a locally supplied TEST-INJECTED- task to the agent. Test-only, off by default.
+
+    200 when the agent accepted it, 409 when the agent (or a conflict check)
+    refused it, 4xx/503 when the request never reached the agent. Nothing here
+    moves the Rover: an accepted task is driven, or not, by the agent loop and
+    every gate it already has.
+    """
+
+    gate = _enabled_injection_gate()
+    try:
+        _check_injection_request(gate, request, "POST")
+        gate.check_available()
+        gate.authorize(request.headers.get("authorization"))
+        body = await request.body()
+        if len(body) > MAX_BODY_BYTES:
+            raise InjectionRejected("TOO_LARGE", f"request body exceeds {MAX_BODY_BYTES} bytes", 413)
+        try:
+            raw = json.loads(body)
+        except ValueError:
+            raise InjectionRejected("MALFORMED", "the request body is not JSON") from None
+        # No await from here to the verdict: the agent loop cannot tick in between.
+        result = gate.inject(get_agent(), raw)
+    except InjectionRejected as e:
+        return JSONResponse(status_code=e.status, content=e.to_dict())
+    return JSONResponse(status_code=200 if result["outcome"] == "ACCEPTED" else 409, content=result)
 
 
 # --- camera stream ------------------------------------------------------------

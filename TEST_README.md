@@ -82,6 +82,64 @@ motors are touched; none exist in the process.
 
 ---
 
+## Test mission injection (`tests/mission_injection/`)
+
+> Operator procedure (tokens, configuration, verification, rollback):
+> `docs/operations/TEST_MISSION_INJECTION.md`. **A green test run here is not
+> hardware readiness**: physical movement needs a fresh, powered preflight and
+> an agreed stopping procedure, and this rover has no physical e-stop.
+
+The RobotX Assignment Engine does not assign tasks to physical robots, so a
+test can supply that one missing input -- and only that -- through the agent's
+opt-in, test-only ingress `POST /test/mission/inject`
+(`robotx/application/injection.py`). It is **off by default**; when enabled it
+answers only on a loopback-bound API, only to loopback peers, only with a bearer
+token whose SHA-256 digest is configured, and it hands the task to the agent's
+own `assess_offer` -> `assign_mission(custody_required=True)`. Every readiness
+and safety gate still applies; nothing moves unless the agent loop and the
+ESP32 link allow it. Task ids must start with `TEST-INJECTED-`; the agent keeps
+an append-only provenance log, and the harness keeps its own ledger
+(`~/.local/state/robotx-test-injection/ledger.jsonl`), every line marked
+`"provenance": {"source": "test_injected", "backend_assigned": false}`. A test
+task has no RobotX commitment, so the Pi sends no OFFER_*, CUSTODY_EVENT or
+TASK_COMPLETE for it, and HEARTBEAT stays `{}`.
+
+```bash
+# Unit and real-process tests (fakes only; no hardware, no backend)
+venv/bin/python -m unittest tests.unit.test_injection_endpoint tests.unit.test_mission_injection -v
+venv/bin/python -m unittest tests.integration.test_injection_process -v
+
+# Non-motion preflight of the running agent: GET-only loopback, no serial, no POST
+venv/bin/python -m tests.mission_injection.preflight [--fixture FILE] [--json]
+
+# Physical injection request -- only after reviewing a READY preflight
+venv/bin/python -m tests.mission_injection.inject --fixture FILE \
+    --authorize-hardware-test --token-file ~/.config/robotx/injection-token [--watch-s 600]
+```
+
+Enabling injection also requires `ROBOTX_OPERATOR_TOKEN_SHA256` (a second,
+different operator token): with it set, `POST /safety/clear`,
+`/controller/reset`, `/mission/idle` and `/mission/custody` need the operator
+token (`curl -H @~/.config/robotx/operator.header`), so a stray local process
+cannot confirm custody or clear the e-stop. Whatever is configured, those four
+routes refuse any request with an `Origin` header, so no browser page can.
+Stop routes are never guarded. The backend cannot distinguish a test-injected
+task in its telemetry; the provenance lives in the Pi's logs only.
+
+Further tests: `tests.unit.test_operator_access`, `tests.unit.test_injection_hardening`
+(races with signed OFFERs, torn log, uvicorn proxy headers),
+`tests.integration.test_injection_backend_process` (real agent process + real
+Socket.IO link against a simulated backend), `tests.integration.test_injection_sandbox`
+(the production unit's hardening, via the systemd user manager; skipped without one).
+
+The inject CLI makes exactly one write (the POST) and never stops, resumes,
+confirms custody or moves the Rover; stopping is the operator's
+(`POST /safety/estop`, `POST /mission/stop`). In engine mode a paused test
+mission cannot be resumed locally (`/mission/resume` stays 409) -- stop it and
+inject a new task id instead.
+
+---
+
 ## Manual hardware verification
 
 None of these are automated, and none should ever be run by a script, CI job,

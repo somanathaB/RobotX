@@ -212,6 +212,28 @@ class Settings:
     # as a sensor reading.
     custody_confirmation: str = "none"
 
+    # --- Test-only mission injection ----------------------------------------
+    # OFF unless explicitly enabled. When on, POST /test/mission/inject hands a
+    # locally supplied TEST-INJECTED- task to assess_offer/assign_mission, on a
+    # loopback-bound API only, with a bearer token whose SHA-256 hex digest is
+    # configured here (never the token). Refuses every request unless four
+    # settings are configured: these three and the separate, different
+    # operator_token_sha256 below. See robotx/application/injection.py.
+    test_injection_enabled: bool = False
+    test_injection_token_sha256: Optional[str] = None
+    test_injection_log_path: Optional[str] = None
+
+    # --- Operator access (opt-in) -------------------------------------------
+    # Always, whatever this is: POST /safety/clear, /controller/reset,
+    # /mission/idle and /mission/custody refuse any request carrying an Origin
+    # header (a browser page). Unset (default): any other local caller may use
+    # them, as before. Set to the SHA-256 hex digest of an operator token:
+    # those four routes then also require that bearer token and a loopback
+    # Host. Stop routes are never guarded. Required when test injection is
+    # enabled.
+    # See robotx/application/operator_access.py.
+    operator_token_sha256: Optional[str] = None
+
     # --- Position estimation ------------------------------------------------
     # Minimum movement between two fixes before a GPS-track heading is derived.
     position_heading_min_move_m: float = 1.5
@@ -485,6 +507,11 @@ class Settings:
             esp32_reconnect_max_s=_get_float(e, "ROBOTX_ESP32_RECONNECT_MAX_S", d.esp32_reconnect_max_s),
             esp32_simulator_exe=_get_str(e, "ROBOTX_ESP32_SIMULATOR_EXE", d.esp32_simulator_exe),
             custody_confirmation=_get_str(e, "ROBOTX_CUSTODY_CONFIRMATION", d.custody_confirmation),
+            test_injection_enabled=_get_bool(e, "ROBOTX_TEST_INJECTION_ENABLED", d.test_injection_enabled),
+            test_injection_token_sha256=_get(e, "ROBOTX_TEST_INJECTION_TOKEN_SHA256",
+                                             d.test_injection_token_sha256),
+            test_injection_log_path=_get(e, "ROBOTX_TEST_INJECTION_LOG_PATH", d.test_injection_log_path),
+            operator_token_sha256=_get(e, "ROBOTX_OPERATOR_TOKEN_SHA256", d.operator_token_sha256),
             position_heading_min_move_m=_get_float(e, "ROBOTX_HEADING_MIN_MOVE_M", d.position_heading_min_move_m),
             position_heading_min_speed_mps=_get_float(e, "ROBOTX_HEADING_MIN_SPEED_MPS", d.position_heading_min_speed_mps),
             nav_waypoint_arrival_m=_get_float(e, "ROBOTX_NAV_WAYPOINT_ARRIVAL_M", d.nav_waypoint_arrival_m),
@@ -603,7 +630,10 @@ class Settings:
 
         # The pairing code is a credential too: it is single-use, but for its
         # 300 second life anyone holding it can enrol as this robot.
-        secret_fields = {"robot_token", "pairing_code", "google_maps_api_key", "command_signing_key"}
+        # The injection and operator token digests are not the tokens, but they
+        # are still not anyone's business: reported as SET/UNSET like the rest.
+        secret_fields = {"robot_token", "pairing_code", "google_maps_api_key", "command_signing_key",
+                         "test_injection_token_sha256", "operator_token_sha256"}
         out: dict[str, Any] = {}
         for f in fields(self):
             value = getattr(self, f.name)

@@ -128,6 +128,13 @@ makes the Pi testable on its own.
 | `POST /safety/estop` | Latch the software emergency stop: no motion intent leaves the Pi until cleared. Not a physical e-stop |
 | `POST /safety/clear` | Release the latch (also acknowledges an ESP32 reboot); resumes nothing |
 | `POST /mission/custody` | Operator custody confirmation `{"kind": "ACQUIRED"\|"RELEASED"}`, only with `ROBOTX_CUSTODY_CONFIRMATION=operator` and only at that measured stop |
+| `POST /controller/reset` | Ask the ESP32 to clear its safety-stop and command-timeout latches once (409 when refused) |
+| `GET /test/injection`, `POST /test/mission/inject` | **Test-only**, 404 unless `ROBOTX_TEST_INJECTION_ENABLED`: see `docs/operations/TEST_MISSION_INJECTION.md` |
+
+The release routes -- `/safety/clear`, `/mission/custody`, `/controller/reset`,
+`/mission/idle` -- refuse any request carrying an `Origin` header (a browser
+page), and with `ROBOTX_OPERATOR_TOKEN_SHA256` set they also need the operator
+bearer token (operator runbook, Access). Stop routes are never restricted.
 
 ```bash
 curl -s http://127.0.0.1:8000/health | jq

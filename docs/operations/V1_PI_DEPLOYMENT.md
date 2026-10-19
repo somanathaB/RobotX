@@ -261,6 +261,14 @@ Must **not** appear in this file:
 | `ROBOTX_ROBOT_TOKEN` | Overrides the stored token and is never discarded, even when the backend rejects it. |
 | `ROBOTX_SOCKET_NAMESPACE` | Read but has no effect. |
 | `ROBOTX_HOME_LAT` / `ROBOTX_HOME_LON` | Not used in V1: RETURN abandons the engine mission it interrupts. |
+| `ROBOTX_TEST_INJECTION_*` | Test deployments only, with the owner's approval: TEST_MISSION_INJECTION.md. A test-injected task is invisible as such to the backend. |
+
+Optional, recommended: `ROBOTX_OPERATOR_TOKEN_SHA256` (mandatory with test
+injection). The four release routes -- `/safety/clear`, `/mission/custody`,
+`/controller/reset`, `/mission/idle` -- then need the operator token
+(runbook, Access); generation and storage: TEST_MISSION_INJECTION.md, section 2.
+Only the digest goes in this file. Whatever is configured, those routes refuse
+browser requests (an `Origin` header).
 
 Rules that the agent does **not** enforce for you ([SW-VERIFIED] in
 `robotx/config/settings.py`):
@@ -824,7 +832,9 @@ able to cut drive power must be within reach for every motion test.
    ESP32 is not reporting its drive as available — look at `/health`
    `components.esp32.detail`.
 6. Software e-stop check, wheels still off the ground: `POST /safety/estop`,
-   confirm `/state` `.safety.rule == "estop"`; then `POST /safety/clear` (runbook).
+   confirm `/state` `.safety.rule == "estop"`; then `POST /safety/clear`, with
+   the runbook's `"${AUTH[@]}"` matching this robot's operator-token
+   configuration (runbook, Access).
 7. First supervised OFFER on the ground: a short route, clear area, an operator
    at the robot with the means to cut power, another at the dashboard. Follow the
    runbook's custody procedure at both stops.
@@ -849,7 +859,10 @@ able to cut drive power must be within reach for every motion test.
 | anything older, `master`, `laptop-pi` | **Not rollback targets.** They lack the link-loss pause and/or drop every OFFER. |
 
 Never roll back while this robot holds a commitment (runbook, "Checking
-commitment ownership"). If goods are on board, follow the runbook's
+commitment ownership"). Disabling or removing test mission injection:
+TEST_MISSION_INJECTION.md, section 7. Rolling back to a commit without it also
+removes the operator guard and the browser (`Origin`) refusal on the release
+routes. If goods are on board, follow the runbook's
 stranded-goods procedure instead.
 
 1. The robot is IDLE and the backend shows no unreleased commitment for it.

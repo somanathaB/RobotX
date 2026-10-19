@@ -52,6 +52,40 @@ Routes:
 | `POST /mission/idle` | **do not use while a mission is active** (see E-stop clear) |
 | `POST /mission/start`, `POST /mission/resume` | always 409 on a V1 robot (engine mode): missions and RESUME come from RobotX |
 
+**Release routes** -- `POST /safety/clear`, `/mission/custody`,
+`/controller/reset`, `/mission/idle` -- refuse any request that carries an
+`Origin` header (403 "browser requests are refused on this route"), whatever
+the configuration: a web page open in a browser on the Pi could otherwise clear
+the e-stop. Use curl, as below; it sends no `Origin`. Stop routes
+(`/safety/estop`, `/mission/stop`, `/mission/pause`) are never restricted.
+
+**Authorization header for the release routes.** Whether these four routes
+also need an operator token depends on this robot's configuration. Check it,
+then set `AUTH` once per SSH session (bash) to the form that matches:
+
+```bash
+curl -s $S/config | jq -r .operator_token_sha256        # prints UNSET or SET
+
+AUTH=()                                                  # UNSET -- the current V1 robot
+# Only when it printed SET:
+AUTH=(-H @"$HOME/.config/robotx/operator.header")
+```
+
+- **UNSET** (`AUTH=()`): no `Authorization` header is sent and none is needed;
+  the routes accept any non-browser caller on the Pi, as before.
+- **SET** (mandatory whenever test mission injection is enabled): the routes
+  answer 401 without the operator token. The header file holds
+  `Authorization: Bearer <operator token>`, mode 0600, owned by you; the token
+  never goes on the command line (generation and storage:
+  TEST_MISSION_INJECTION.md, section 2).
+- **Never use the SET form when the header file does not exist.** curl cannot
+  read it, prints `option -H: error encountered when reading a file`, exits
+  with code 26 and **sends no request**: the e-stop is not cleared and custody
+  is not recorded. curl does not skip a missing header file.
+
+Either way, a host name instead of `127.0.0.1` answers 403 when a token is
+configured. The release-route commands below include `"${AUTH[@]}"`.
+
 ### Quick status
 
 ```bash
@@ -488,8 +522,8 @@ V1 (`ROBOTX_CUSTODY_CONFIRMATION=operator`).
 - **Action:**
 
   ```bash
-  curl -sS -X POST $S/mission/custody -H 'Content-Type: application/json' -d '{"kind":"ACQUIRED"}'
-  curl -sS -X POST $S/mission/custody -H 'Content-Type: application/json' -d '{"kind":"RELEASED"}'
+  curl -sS -X POST "$S/mission/custody" "${AUTH[@]}" -H 'Content-Type: application/json' -d '{"kind":"ACQUIRED"}'
+  curl -sS -X POST "$S/mission/custody" "${AUTH[@]}" -H 'Content-Type: application/json' -d '{"kind":"RELEASED"}'
   ```
 
 - **Expected:** HTTP 200 with the mission; `custody.reported ... kind=ACQUIRED`
@@ -497,7 +531,11 @@ V1 (`ROBOTX_CUSTODY_CONFIRMATION=operator`).
   `task.complete_acked`. If the backend was briefly unreachable, the report is
   kept and sent after the next authentication (`custody.resent`,
   `task.complete_resent`).
-- **Failure:** 409 "operator custody confirmation is not enabled" (configuration);
+- **Failure:** curl exit 26, "error encountered when reading a file" (the SET
+  form of `AUTH` without its header file: nothing was sent -- see Access);
+  401 (a token is configured and was missing or wrong); 403 (an `Origin`
+  header, or a host name instead of `127.0.0.1`);
+  409 "operator custody confirmation is not enabled" (configuration);
   409 "custody can be acquired/released only at a measured ... arrival" (not at
   that stop, or the arrival was not on a measured position); 422 (wrong `kind`);
   `task.complete_withheld` (the robot's own evidence check failed);
@@ -530,7 +568,8 @@ physical disconnect.
 - **Prerequisite:** the cause is understood and removed; a person is at the
   robot; if the latch came from an ESP32 reboot, the reason for the reboot is
   understood.
-- **Action:** `curl -s -X POST $S/safety/clear`
+- **Action:** `curl -s -X POST "$S/safety/clear" "${AUTH[@]}"` (`AUTH` as in
+  Access, matching this robot's configuration)
 - **Expected:** `{"emergency_stopped": false, "was_engaged": true}`. Nothing
   resumes: `mode` stays `STOPPED`. Clearing also acknowledges an ESP32 reboot; the
   ESP32 link then re-proves itself before carrying motion (`motion_ready`).
@@ -541,7 +580,9 @@ physical disconnect.
   - **the robot cannot safely continue:** STOP / Out of service / Stranded goods,
     according to custody, as the table says.
 - **Failure:** `was_engaged: false` (nothing was latched — check you are on the
-  right robot); `.safety.rule` still `"estop"`.
+  right robot); `.safety.rule` still `"estop"`; curl exit 26 (the SET form of
+  `AUTH` without its header file: no request was sent); 401/403 (operator
+  token or `Origin`: see Access) — in each case the latch is untouched.
 - **Escalation:** **never use `POST /mission/idle` while a mission is active.**
   It puts the robot in IDLE with the mission still held: the lease keeps being
   renewed, the robot never moves, and RESUME is refused because it is not
@@ -601,6 +642,9 @@ A service restart, crash or reboot while the robot holds a commitment.
   restart clears the e-stop of option A: re-apply it.
 
 ## Rollback
+
+Test mission injection only (disable it, or remove it with its code):
+TEST_MISSION_INJECTION.md, section 7.
 
 - **Prerequisite:** the robot is IDLE with no unreleased commitment; no goods
   on board.
