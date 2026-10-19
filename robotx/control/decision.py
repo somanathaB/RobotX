@@ -107,6 +107,25 @@ class DecisionMaker:
             self._last_reason = intent.reason
         return intent
 
+    def screen(self, perception: PerceptionResult) -> Optional[MotionIntent]:
+        """The camera's own stop, independent of any route, or None.
+
+        The same checks `decide` makes before driving -- perception usable, no
+        person in view, nothing in the drive corridor -- for a caller that has
+        no route but must not drive past what the camera sees (the bench pulse,
+        `robotx.control.bench_motion`). Never a reason to move.
+        """
+
+        if not perception.is_usable:
+            detail = "no frame metadata" if perception.status is PerceptionStatus.OK else perception.status.value
+            return MotionIntent.stop(f"perception unavailable ({detail})")
+        if perception.has_label(PERSON_LABEL):
+            return MotionIntent.stop("person detected")
+        obstacle = self._blocking_obstacle(perception)
+        if obstacle is not None:
+            return self._avoid(obstacle, perception)
+        return None
+
     def _decide(
         self,
         *,

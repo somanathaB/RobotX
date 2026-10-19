@@ -109,7 +109,7 @@ class TestReadinessRoute(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(body["blockers"][0], "ESTOP_LATCHED")
         self.assertEqual(body["estop_reason"], "preflight test")
-        self.assertFalse(body["mission_lease_renewable"])
+        self.assertIsNone(body["mission_lease_renewable"])   # no mission held: not applicable, not "false"
         codes = [f["code"] for f in body["faults"]]
         self.assertIn("PI_EMERGENCY_STOP_LATCHED", codes)
         self.assertIsInstance(body["perception_usable"], bool)

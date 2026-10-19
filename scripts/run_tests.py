@@ -80,6 +80,7 @@ SUITES: Dict[str, Dict[str, Any]] = {
         "tests.unit.test_safety_gate", "tests.unit.test_mission_recovery", "tests.unit.test_obstacle_recovery",
         "tests.unit.test_navigation_progress", "tests.unit.test_motion_and_decision",
         "tests.unit.test_audit_regressions", "tests.unit.test_operator_access", "tests.unit.test_perception_people",
+        "tests.unit.test_bench_motion",
     ]},
     "esp32": {"modules": [
         "tests.unit.test_esp32_protocol", "tests.unit.test_esp32_link", "tests.unit.test_esp32_agent",
@@ -101,7 +102,7 @@ DEFAULT = ("unit", "mission", "navigation", "telemetry", "delivery", "safety", "
 # Modules added by this work, held to a clean mypy run. The rest of the
 # package has pre-existing mypy findings, reported as a count only.
 MYPY_CLEAN = ("robotx/control/applied_motion.py", "robotx/mission/admission.py", "robotx/esp32/state.py",
-              "robotx/diagnostics/faults.py")
+              "robotx/diagnostics/faults.py", "robotx/control/bench_motion.py", "robotx/application/bench_gate.py")
 
 NOT_TESTED = (
     "physical wheel actuation: no motor was driven; `applied` values are the firmware model's, not the rover's",

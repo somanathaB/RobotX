@@ -42,6 +42,7 @@ class FirmwareModel:
         self.reject_reason: Optional[str] = None   # REJECTED with this reason, not executed
         self.applied_zero = False                  # executed, but the motor layer outputs 0
         self.answer = True                         # False: commands are never ACKed
+        self.applied_override: Optional[Tuple[int, int]] = None  # executed, but this is output instead
         self.executed: list = []
         # TELEMETRY `last_seq`: the last seq answered by an ACK (section 8).
         self.last_seq: Optional[int] = None
@@ -71,6 +72,8 @@ class FirmwareModel:
             elif self.gate_reason:
                 result, reason, gated = "GATED", self.gate_reason, (0, 0)
         applied = tuple(0 if self.applied_zero or abs(v) < self.deadband else v for v in gated)
+        if self.applied_override is not None and name == "DRIVE":
+            applied = self.applied_override
         self.req, self.applied = req, (applied[0], applied[1])
         self.executed.append((name, req, result))
         return fx.ack(seq, cmd=name, result=result, reason=reason,

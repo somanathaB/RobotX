@@ -251,6 +251,21 @@ class Settings:
     # See robotx/application/operator_access.py.
     operator_token_sha256: Optional[str] = None
 
+    # --- Bench motor pulse (robotx.control.bench_motion) ----------------------
+    # OFF by default. When on, POST /test/bench-motion/run (loopback, bearer
+    # token) asks the agent for ONE short forward pulse through the normal
+    # safety gate and ESP32 link, for a rover on blocks. Refused unless
+    # ROBOTX_BENCH_MOTOR_CUTOFF_CONFIRMED=1 states that an independent
+    # motor-power cutoff is fitted (software cannot check it), the operator
+    # token is set, and ROBOTX_ESP32_MOTION_ENABLED=1. Speed is normalized and
+    # bounded to just above the deadband .. 0.35; duration to [0.5, 3.0] s.
+    # See docs/operations/BENCH_MOTION_TEST.md.
+    bench_motion_enabled: bool = False
+    bench_motion_token_sha256: Optional[str] = None
+    bench_motor_cutoff_confirmed: bool = False
+    bench_motion_speed: float = 0.25
+    bench_motion_duration_s: float = 2.0
+
     # --- Position estimation ------------------------------------------------
     # Minimum movement between two fixes before a GPS-track heading is derived.
     position_heading_min_move_m: float = 1.5
@@ -541,6 +556,12 @@ class Settings:
                                              d.test_injection_token_sha256),
             test_injection_log_path=_get(e, "ROBOTX_TEST_INJECTION_LOG_PATH", d.test_injection_log_path),
             operator_token_sha256=_get(e, "ROBOTX_OPERATOR_TOKEN_SHA256", d.operator_token_sha256),
+            bench_motion_enabled=_get_bool(e, "ROBOTX_BENCH_MOTION_ENABLED", d.bench_motion_enabled),
+            bench_motion_token_sha256=_get(e, "ROBOTX_BENCH_MOTION_TOKEN_SHA256", d.bench_motion_token_sha256),
+            bench_motor_cutoff_confirmed=_get_bool(e, "ROBOTX_BENCH_MOTOR_CUTOFF_CONFIRMED",
+                                                   d.bench_motor_cutoff_confirmed),
+            bench_motion_speed=_get_float(e, "ROBOTX_BENCH_MOTION_SPEED", d.bench_motion_speed),
+            bench_motion_duration_s=_get_float(e, "ROBOTX_BENCH_MOTION_DURATION_S", d.bench_motion_duration_s),
             position_heading_min_move_m=_get_float(e, "ROBOTX_HEADING_MIN_MOVE_M", d.position_heading_min_move_m),
             position_heading_min_speed_mps=_get_float(e, "ROBOTX_HEADING_MIN_SPEED_MPS", d.position_heading_min_speed_mps),
             position_heading_hacc_factor=_get_float(e, "ROBOTX_HEADING_HACC_FACTOR", d.position_heading_hacc_factor),
@@ -663,7 +684,7 @@ class Settings:
         # The injection and operator token digests are not the tokens, but they
         # are still not anyone's business: reported as SET/UNSET like the rest.
         secret_fields = {"robot_token", "pairing_code", "google_maps_api_key", "command_signing_key",
-                         "test_injection_token_sha256", "operator_token_sha256"}
+                         "test_injection_token_sha256", "operator_token_sha256", "bench_motion_token_sha256"}
         out: dict[str, Any] = {}
         for f in fields(self):
             value = getattr(self, f.name)

@@ -81,6 +81,7 @@ def active_faults(
     motion_enabled: bool,
     controller_max_age_s: float,
     position_issue: Optional[str] = None,
+    bench_active: bool = False,
 ) -> List[Fault]:
     """Every fault active in `snapshot`, in a fixed order, each code once."""
 
@@ -136,6 +137,10 @@ def active_faults(
         status = perception.status.value
         faults.append(_blocking("PERCEPTION_NO_FRAME_METADATA" if status == "OK" else f"PERCEPTION_{status}",
                                 "CAMERA"))
+
+    # --- an operator bench pulse (robotx.control.bench_motion) --------------------
+    if bench_active:
+        faults.append(Fault("BENCH_MOTION_ACTIVE", "INFO", "MOTOR"))
 
     # --- the mission held ---------------------------------------------------------
     mission = snapshot.mission

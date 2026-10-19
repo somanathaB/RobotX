@@ -32,6 +32,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence
 from robotx.config.logging_setup import log_event, setup_logging
 from robotx.config.settings import Settings
 from robotx.control.applied_motion import AppliedMotionConfig, AppliedMotionMonitor
+from robotx.control.bench_motion import BenchMotion, BenchMotionConfig, BenchOutcome, BenchRefused
 from robotx.control.decision import DecisionConfig, DecisionMaker
 from robotx.control.motion import MotionIntent
 from robotx.control.obstacle_recovery import ObstacleRecovery, ObstacleRecoveryConfig
@@ -93,6 +94,8 @@ logger = logging.getLogger(__name__)
 # readiness vocabulary on purpose (protocol.READINESS_BLOCKERS is the backend's,
 # and has no such code): the backend handles it as a per-Leg refusal.
 PERCEPTION_UNAVAILABLE = "PERCEPTION_UNAVAILABLE"
+# OFFER_REJECT reason while an operator's bench pulse is running (a few seconds).
+BENCH_TEST_ACTIVE = "BENCH_TEST_ACTIVE"
 
 # A loop that has not completed a tick for this long is not alive, and the
 # backend heartbeat stops. Well inside the backend's ~10 s freshness budget, so
@@ -198,6 +201,10 @@ class RobotAgent:
         self.progress = ProgressMonitor(ProgressConfig.from_settings(settings))
         # When the ESP32 reports it is not applying the DRIVE being sent.
         self.applied_motion = AppliedMotionMonitor(AppliedMotionConfig.from_settings(settings))
+        # The operator's bench pulse (robotx.control.bench_motion). Idle unless
+        # `start_bench_motion` is called, which only the guarded, disabled-by-
+        # default bench route does. Never a mission.
+        self.bench = BenchMotion(BenchMotionConfig.from_settings(settings))
         # Whether the previous tick's gated intent moved the wheels: what the
         # applied-motion monitor judges the ESP32's feedback against.
         self._intent_moving = False
@@ -605,6 +612,12 @@ class RobotAgent:
                 "emergency stop is latched; clear it before assigning a task",
                 task_id=mission.task_id,
             )
+        if self.bench.active:
+            raise MissionRejected(
+                MissionRejectReason.MISSION_ACTIVE,
+                "a bench motor pulse is running; no task is assigned until it has stopped",
+                task_id=mission.task_id,
+            )
 
         assignment = self.missions.assign(mission, custody_required=custody_required)
         active = assignment.active
@@ -660,6 +673,8 @@ class RobotAgent:
         # after the e-stop and ERROR, before the motor link.
         if blockers and blockers[0] in ("ESTOP_LATCHED", "AGENT_ERROR"):
             return OfferDecision.reject(blockers[0])
+        if self.bench.active:
+            return OfferDecision.reject(BENCH_TEST_ACTIVE)
         if snapshot.mission is not None and snapshot.mission.is_active:
             return OfferDecision.reject("MISSION_IN_PROGRESS")
         if blockers:
@@ -743,12 +758,71 @@ class RobotAgent:
             motion_enabled=motion_enabled,
             controller_max_age_s=float(getattr(cfg, "stale_after_s", 1.0)),
             position_issue=self.navigator.position_issue(snapshot.position),
+            bench_active=self.bench.active,
         )
 
     def fault_report(self, snapshot: Optional[Any] = None) -> List[Dict[str, Any]]:
         """TELEMETRY `faults[]`: the active set, each with the instant it began."""
 
         return self._fault_tracker.report(self.active_faults(snapshot))
+
+    def start_bench_motion(self, *, speed: float, duration_s: float, source: str) -> Dict[str, Any]:
+        """Start one bench pulse (robotx.control.bench_motion), or raise `BenchRefused`.
+
+        Every precondition is the real one, checked now; none is relaxed for a
+        bench. The pulse then runs on the agent's own tick, through the safety
+        gate and the ESP32 link, and stops on its own.
+        """
+
+        def refuse(code: str, detail: str) -> None:
+            log_event(logger, "bench.refused", detail, level=logging.WARNING, code=code, source=source)
+            raise BenchRefused(code, detail)
+
+        if self.bench.active:
+            refuse("BENCH_RUNNING", "a bench pulse is already running")
+        wait = self.bench.cooling_down()
+        if wait > 0:
+            refuse("COOLDOWN", f"the last pulse ended moments ago; wait {wait:.0f}s")
+        if not (self.bench.cfg.min_speed <= speed <= self.bench.cfg.speed):
+            refuse("BAD_SPEED", f"speed must be in [{self.bench.cfg.min_speed:.3f}, {self.bench.cfg.speed}]")
+        if not (0.5 <= duration_s <= self.bench.cfg.duration_s):
+            refuse("BAD_DURATION", f"duration_s must be in [0.5, {self.bench.cfg.duration_s}]")
+        if self.safety.estop_engaged:
+            refuse("ESTOP_LATCHED", "the emergency stop is latched")
+        snapshot = self.state.snapshot()
+        if snapshot.mode is not OperatingMode.IDLE:
+            refuse("MODE_NOT_IDLE", f"mode is {snapshot.mode.value}; a bench pulse runs only from IDLE")
+        if self.missions.has_active_mission:
+            refuse("MISSION_HELD", "a mission is held")
+        commitments = getattr(self.backend, "commitments", None)
+        if commitments is not None and commitments.held() is not None:
+            refuse("COMMITMENT_HELD", "a backend commitment is held")
+        if self.esp32 is None:
+            refuse("NO_ESP32_LINK", "no ESP32 link is running")
+        assert self.esp32 is not None
+        if not self.esp32.cfg.motion_enabled:
+            refuse("MOTION_DISABLED", "ROBOTX_ESP32_MOTION_ENABLED is off: the link writes no DRIVE")
+        status = self.esp32.status()
+        if not status.motion_ready:
+            tel = status.controller.telemetry
+            faults = ", ".join(tel.safety_faults) if tel is not None and tel.safety_faults else "none"
+            refuse("CONTROLLER_NOT_READY",
+                   f"ESP32 link {status.link.value} ({status.detail}); drive_available="
+                   f"{None if tel is None else tel.motor_drive_available}; controller faults: {faults}; "
+                   f"reboot_latched={status.controller.reboot_latched}")
+        tel = status.controller.telemetry
+        front = self._front_range(status)
+        if front is None or front.status is not RangeStatus.VALID or front.obstacle_reported \
+                or front.distance_cm is None or front.distance_cm <= self.safety.cfg.stop_distance_cm \
+                or (tel is not None and tel.forward_blocked):
+            refuse("FRONT_NOT_CLEAR",
+                   f"the forward range must be valid and beyond {self.safety.cfg.stop_distance_cm:.0f} cm "
+                   f"(status={None if front is None else front.status.value}, "
+                   f"distance={None if front is None else front.distance_cm}, "
+                   f"forward_blocked={None if tel is None else tel.forward_blocked})")
+        if not snapshot.perception.is_usable:
+            refuse("PERCEPTION_UNUSABLE", f"perception is {snapshot.perception.status.value}")
+        return self.bench.start(speed=speed, duration_s=duration_s, source=source)
 
     def custody_sensing_available(self) -> bool:
         """Whether a parcel handover on this Rover can be truthfully reported.
@@ -802,6 +876,7 @@ class RobotAgent:
     def stop_mission(self, reason: str = "operator stop") -> None:
         """Halt: clear the route, drop to STOPPED, and publish a stop intent."""
 
+        self.bench.abort("OPERATOR_STOP", f"stop: {reason}")
         self.navigator.clear_route()
         self._mission_route = []
         # Mark the task abandoned rather than leaving it mid-leg. A mission
@@ -824,6 +899,7 @@ class RobotAgent:
         tick -- pausing does not depend on anything downstream noticing a flag.
         """
 
+        self.bench.abort("OPERATOR_PAUSE", f"pause: {reason}")
         if self.safety.estop_engaged and self.state.mode is OperatingMode.STOPPED:
             # Already held harder than a pause holds it. Demoting STOPPED to
             # PAUSED here would let a RESUME reach AUTO with the latch still on.
@@ -931,6 +1007,7 @@ class RobotAgent:
         """
 
         self.safety.engage_estop(reason)
+        self.bench.abort("ESTOP", f"emergency stop: {reason}")
         self.state.set_mode(OperatingMode.STOPPED, error=f"emergency stop: {reason}")
         self.state.update_motion_intent(MotionIntent.stop(f"safety: {reason}"))
         # A mission caught by the stop is kept -- the operator decides its fate
@@ -1139,6 +1216,7 @@ class RobotAgent:
         link = self.esp32
         esp32 = self._update_esp32()
         interrupted = self._esp32_interrupted(esp32)
+        applied_fault: Optional[str] = None
         if (
             link is not None
             and esp32 is not None
@@ -1163,11 +1241,13 @@ class RobotAgent:
         #      (robotx.control.applied_motion); a fault never resumes anything.
         if link is not None and esp32 is not None and link.cfg.motion_enabled:
             applied = self.applied_motion.update(
-                commanding=self.state.mode.mission_active and self._intent_moving,
+                commanding=(self.state.mode.mission_active or self.bench.driving) and self._intent_moving,
                 controller=esp32.controller,
                 stale_after_s=link.cfg.stale_after_s,
             )
-            if applied.fault:
+            if applied.fault and self.bench.driving:
+                applied_fault = f"controller: {applied.reason}"   # judged by the bench run below
+            elif applied.fault:
                 why = f"controller: {applied.reason}"
                 self.pause_mission(why)
                 self.state.set_mode(OperatingMode.PAUSED, error=why)
@@ -1206,6 +1286,13 @@ class RobotAgent:
             navigation=navigation,
             perception=perception,
         )
+        # The bench pulse replaces the proposal -- never the gate. It is judged
+        # by the same SafetyGate as a mission (perception, range, e-stop, speed),
+        # with no obstacle-recovery hold: a stop ends it, and nothing resumes it.
+        bench_active = self.bench.active
+        if bench_active:
+            proposed = self.decision.screen(perception) or self.bench.intent()
+        gate_active = mode.mission_active or bench_active
 
         # 5b. Safety gate has the last word. What lands in state is the *gated*
         #     intent, because state is what telemetry and (once it exists) the
@@ -1221,7 +1308,7 @@ class RobotAgent:
         range_expected = self.esp32 is not None
         safety = self.safety.evaluate(
             proposed,
-            mission_active=mode.mission_active,
+            mission_active=gate_active,
             perception=perception,
             obstacle=front,
             range_expected=range_expected,
@@ -1273,6 +1360,27 @@ class RobotAgent:
                     mission_active=False,
                     perception=perception,
                 )
+        if bench_active:
+            outcome = self.bench.observe(
+                gated=safety.intent,
+                controller=esp32.controller if esp32 is not None else None,
+                motion_ready=esp32 is not None and esp32.motion_ready,
+                interrupted=interrupted,
+                estop=self.safety.estop_engaged,
+                mode_idle=self.state.mode is OperatingMode.IDLE,
+                mission_held=self.missions.has_active_mission,
+                applied_fault=applied_fault,
+            )
+            if not self.bench.driving and not safety.intent.is_stop:
+                # Ended on this tick: the STOP is what the link writes next.
+                safety = self.safety.evaluate(MotionIntent.stop("bench test: pulse ended"),
+                                              mission_active=False, perception=perception)
+            if outcome is BenchOutcome.STOP_UNCONFIRMED:
+                self.emergency_stop("bench test: the ESP32 never confirmed the STOP")
+            if outcome is not None:
+                # A pulse on blocks moved no rover: no heading, no pose from it.
+                self.position_estimator.reset()
+                self.applied_motion.reset()
         intent = safety.intent
         self._intent_moving = not intent.is_stop
         self.state.update_safety(safety)

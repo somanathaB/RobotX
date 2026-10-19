@@ -36,7 +36,9 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from robotx.application.agent import RobotAgent
+from robotx.application.bench_gate import MAX_BODY_BYTES as BENCH_MAX_BODY_BYTES, BenchGate, BenchRejected
 from robotx.application.injection import MAX_BODY_BYTES, InjectionGate, InjectionRejected
+from robotx.control.bench_motion import BenchRefused
 from robotx.application.operator_access import OperatorAccess
 from robotx.config.logging_setup import log_event, setup_logging
 from robotx.config.settings import SETTINGS, Settings
@@ -57,6 +59,7 @@ class AppState:
 
     agent: Optional[RobotAgent] = None
     injection: Optional[InjectionGate] = None
+    bench: Optional[BenchGate] = None
     operator_access: Optional[OperatorAccess] = None
 
 
@@ -77,6 +80,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         log_event(logger, "api.operator_access_misconfigured", state.operator_access.problem,
                   level=logging.ERROR)
     state.injection = InjectionGate.from_settings(SETTINGS)
+    state.bench = BenchGate.from_settings(SETTINGS, other_token_digests=(SETTINGS.test_injection_token_sha256,))
 
     agent = RobotAgent(SETTINGS)
     try:
@@ -99,6 +103,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     finally:
         state.agent = None
         state.injection = None
+        state.bench = None
         state.operator_access = None
         await agent.stop()
 
@@ -164,7 +169,9 @@ async def readiness() -> Dict[str, Any]:
         "perception_usable": snapshot.perception.is_usable,
         "estop_engaged": agent.emergency_stopped,
         "estop_reason": agent.safety.estop_reason,
-        "mission_lease_renewable": agent.mission_lease_renewable(),
+        # Only meaningful for a held mission: null, not false, when there is none.
+        "mission_lease_renewable": agent.mission_lease_renewable()
+        if mission is not None and mission.is_active else None,
         "mission": None if mission is None else {
             "task_id": mission.task_id, "status": mission.status.value, "interrupted_by": mission.interrupted_by},
     }
@@ -460,6 +467,70 @@ async def inject_test_mission(request: Request) -> Any:
     except InjectionRejected as e:
         return JSONResponse(status_code=e.status, content=e.to_dict())
     return JSONResponse(status_code=200 if result["outcome"] == "ACCEPTED" else 409, content=result)
+
+
+# --- bench motor pulse (off by default) -----------------------------------------
+
+
+def _enabled_bench_gate() -> BenchGate:
+    gate = state.bench
+    if gate is None or not gate.enabled:
+        raise HTTPException(status_code=404, detail="Not Found")
+    return gate
+
+
+def _check_bench_request(gate: BenchGate, request: Request, method: str) -> None:
+    if request.method != method:
+        raise HTTPException(status_code=405, detail="Method Not Allowed")
+    server = request.scope.get("server")
+    gate.check_origin(
+        client_host=request.client.host if request.client else None,
+        host_header=request.headers.get("host"),
+        origin=request.headers.get("origin"),
+        server_host=server[0] if server else None,
+    )
+
+
+@app.api_route("/test/bench-motion", methods=_ALL_METHODS)
+async def bench_motion_status(request: Request) -> Any:
+    """The bench route's availability, limits and the last pulse's result. Read-only."""
+
+    gate = _enabled_bench_gate()
+    try:
+        _check_bench_request(gate, request, "GET")
+    except BenchRejected as e:
+        return JSONResponse(status_code=e.status, content=e.to_dict())
+    return gate.status(get_agent())
+
+
+@app.api_route("/test/bench-motion/run", methods=_ALL_METHODS)
+async def bench_motion_run(request: Request) -> Any:
+    """Ask the agent for ONE bounded forward pulse (robotx.control.bench_motion). Off by default.
+
+    200: the pulse started (it runs on the agent's tick and stops on its own;
+    poll GET /test/bench-motion for the result). 409: the agent refused it, with
+    the precondition that failed. Stop it any time with POST /safety/estop or
+    POST /mission/stop.
+    """
+
+    gate = _enabled_bench_gate()
+    try:
+        _check_bench_request(gate, request, "POST")
+        gate.check_available()
+        gate.authorize(request.headers.get("authorization"))
+        body = await request.body()
+        if len(body) > BENCH_MAX_BODY_BYTES:
+            raise BenchRejected("TOO_LARGE", f"request body exceeds {BENCH_MAX_BODY_BYTES} bytes", 413)
+        try:
+            raw = json.loads(body)
+        except ValueError:
+            raise BenchRejected("MALFORMED", "the request body is not JSON") from None
+        result = gate.run(get_agent(), raw)
+    except BenchRejected as e:
+        return JSONResponse(status_code=e.status, content=e.to_dict())
+    except BenchRefused as e:
+        return JSONResponse(status_code=409, content={"code": e.code, "detail": e.detail})
+    return JSONResponse(status_code=200, content=result)
 
 
 # --- camera stream ------------------------------------------------------------
