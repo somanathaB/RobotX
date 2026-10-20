@@ -35,7 +35,7 @@ venv/bin/python -m scripts.run_tests --json           # machine-readable
 |---|---|
 | `unit` | every test in `tests/unit` |
 | `mission` | OFFER → `assess_offer` → route admission → assignment → navigation → custody → TASK_COMPLETE, including a real Socket.IO link to a simulated backend (`tests/integration/test_simulated_delivery.py`) |
-| `navigation` | GPS heading (fix wander is never a heading), navigator, decision layer, progress/stall and sensing-hold bounds, obstacle recovery |
+| `navigation` | GPS heading (fix wander is never a heading), navigator, decision layer, progress/stall and sensing-hold bounds, obstacle recovery, and the loop closed through a simulated differential-drive rover (`tests/unit/test_gps_navigation_closed_loop.py`, `scripts.gps_navigation_sim`; see [GPS_NAVIGATION_TEST.md](GPS_NAVIGATION_TEST.md)) |
 | `telemetry` | the Pi → backend wire: TELEMETRY `status`/`safety`/`readiness`/`faults[]`, transition frames, HEARTBEAT lease, custody and completion reports, the backend's OFFER signature test vector |
 | `delivery` | a **genuine signed OFFER** over a real Socket.IO link to a simulated backend and simulated ESP32 (`tests/integration/test_simulated_delivery.py`): admission and replay refusal, delivery to completion, WITHDRAW, PAUSE/RESUME, task cancellation, backend loss, ESP32 reboot, perception loss |
 | `safety` | safety gate, e-stop latch, interrupted-mission recovery, obstacle and navigation stops, operator-route guards |

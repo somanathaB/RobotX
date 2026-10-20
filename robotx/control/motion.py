@@ -61,6 +61,12 @@ class MotionIntent:
         return self.command in (MotionCommand.STOP, MotionCommand.HOLD)
 
     @property
+    def turns(self) -> bool:
+        """Whether the two sides differ: the rover's facing changes while this runs."""
+
+        return abs(self.left - self.right) > 1e-9
+
+    @property
     def linear(self) -> float:
         """Mean forward velocity. Negative means reversing."""
 

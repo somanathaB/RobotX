@@ -2,6 +2,7 @@
 
 import time
 import unittest
+from dataclasses import replace
 
 from robotx.control.decision import DecisionConfig, DecisionMaker, center_zone
 from robotx.control.motion import MotionCommand, MotionIntent, age_s
@@ -357,6 +358,96 @@ class TestDecisionMaker(unittest.TestCase):
             {},
         ):
             self.assertTrue(self.decide(**kwargs).reason, kwargs)
+
+
+class TestBoundedTurns(unittest.TestCase):
+    """A heading error becomes one turn sized by the assumed yaw rate, never a
+    steer held on a heading that cannot change until the rover drives on."""
+
+    def setUp(self):
+        self.now = 100.0
+        self.decider = DecisionMaker(DecisionConfig(turn_rate_dps=90.0, max_turn_s=2.0),
+                                     clock=lambda: self.now)
+
+    def decide(self, navigation, perceived=None):
+        return self.decider.decide(mission_active=True, navigation=navigation,
+                                   perception=perceived or perception())
+
+    def turned(self):
+        """No heading: what the agent leaves after every steered tick."""
+        return replace(navigating(), current_heading_deg=None, heading_error_deg=None)
+
+    def sides(self, navigation, perceived=None):
+        intent = self.decide(navigation, perceived)
+        return intent.left, intent.right
+
+    def test_a_right_error_turns_right_for_error_over_rate(self):
+        first = self.decide(navigating(heading_error=45.0))            # 45 deg at 90 deg/s: 0.5 s
+        self.assertEqual((first.left, first.right), (0.45, 0.0))
+        self.now += 0.4
+        mid = self.decide(self.turned())
+        self.assertEqual((mid.left, mid.right), (0.45, 0.0))
+        self.assertIn("turning toward route", mid.reason)
+        self.now += 0.2                                                # 0.6 s: the turn is over
+        after = self.decide(self.turned())
+        self.assertAlmostEqual(after.left, after.right)
+        self.assertIn("no heading", after.reason)
+
+    def test_a_left_error_turns_left(self):
+        first = self.decide(navigating(heading_error=-30.0))
+        self.assertEqual((first.left, first.right), (0.0, 0.45))
+        self.now += 0.2
+        self.assertEqual(self.sides(self.turned()), (0.0, 0.45))
+
+    def test_no_turn_outlasts_max_turn_s(self):
+        self.decide(navigating(heading_error=180.0))                   # 2 s at 90 deg/s, capped at 2 s
+        self.now += 1.9
+        self.assertEqual(self.sides(self.turned()), (0.45, 0.0))
+        self.now += 0.2
+        self.assertIn("no heading", self.decide(self.turned()).reason)
+
+    def test_a_cautious_turn_lasts_longer_at_the_lower_speed(self):
+        busy = perception([detection(area=15000, cx=30)])              # off-corridor: slow speed
+        first = self.decide(navigating(heading_error=45.0), busy)
+        self.assertEqual((first.left, first.right), (0.25, 0.0))
+        self.now += 0.7                                                # 0.5 s x 0.45/0.25 = 0.9 s
+        self.assertEqual(self.decide(self.turned(), busy).right, 0.0)
+        self.now += 0.3
+        self.assertIn("no heading", self.decide(self.turned(), busy).reason)
+
+    def test_any_stop_ends_the_turn(self):
+        self.decide(navigating(heading_error=90.0))
+        stop = self.decide(self.turned(), PerceptionResult.unavailable(PerceptionStatus.NO_FRAME))
+        self.assertTrue(stop.is_stop)
+        self.assertIn("no heading", self.decide(self.turned()).reason)
+
+    def test_a_new_target_ends_the_turn(self):
+        self.decide(navigating(heading_error=90.0))
+        moved_on = replace(self.turned(), target_waypoint=(51.6, -0.1), waypoint_index=1)
+        self.assertIn("no heading", self.decide(moved_on).reason)
+
+    def test_turns_are_forward_only(self):
+        for error in (-179.0, -90.0, -10.0, 10.0, 90.0, 180.0):
+            with self.subTest(error=error):
+                self.decider = DecisionMaker(DecisionConfig(), clock=lambda: self.now)
+                intent = self.decide(navigating(heading_error=error))
+                self.assertIs(intent.command, MotionCommand.FORWARD)
+                self.assertGreaterEqual(min(intent.left, intent.right), 0.0)
+                self.assertTrue(intent.turns)
+
+    def test_on_course_does_not_turn(self):
+        self.assertFalse(self.decide(navigating(heading_error=3.0)).turns)
+
+    def test_turn_limits_are_validated(self):
+        for bad in ({"turn_rate_dps": 0.0}, {"turn_rate_dps": 1000.0}, {"max_turn_s": 0.0}, {"max_turn_s": 11.0}):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                DecisionConfig(**bad)
+
+    def test_turn_limits_come_from_settings(self):
+        from robotx.config.settings import Settings
+        cfg = DecisionConfig.from_settings(Settings.from_env(
+            {"ROBOTX_NAV_TURN_RATE_DPS": "45", "ROBOTX_NAV_MAX_TURN_S": "1.5"}))
+        self.assertEqual((cfg.turn_rate_dps, cfg.max_turn_s), (45.0, 1.5))
 
 
 if __name__ == "__main__":

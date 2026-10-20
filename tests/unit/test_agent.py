@@ -469,6 +469,21 @@ class TestGpsHeadingAfterRotation(AgentTestCase):
         self.assertAlmostEqual(snapshot.position.heading_deg, 0.0, delta=1.0)
         self.assertIsNotNone(snapshot.navigation.heading_error_deg)
 
+    def test_a_steered_tick_drops_the_heading_until_a_new_fix_measures_one(self):
+        # Bounded turns: once the sides differ the rover turns, and the course
+        # it last moved on no longer says where it faces.
+        agent = self.make_agent()
+        agent.perception.set_clear()
+        agent.gps.set_fix(*HERE)
+        agent.start_mission([(HERE[0], HERE[1] + 0.0009)])       # ~60 m east: a right turn
+        agent.tick()
+        agent.gps.set_fix(*self.NORTH_2M)                          # moved north
+        turning = agent.tick()
+        self.assertGreater(turning.motion_intent.left, turning.motion_intent.right)
+        snapshot = agent.tick()                                    # same frame, re-read
+        self.assertIsNone(snapshot.position.heading_deg)
+        self.assertIn("turning toward route", snapshot.motion_intent.reason)
+
     def test_merely_stopping_keeps_the_heading(self):
         agent = self.driving_north()
         agent.perception.set_detection(area=40000, cx=320)      # obstacle ahead: STOP

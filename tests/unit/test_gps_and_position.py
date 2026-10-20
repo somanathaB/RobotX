@@ -2,6 +2,7 @@
 
 import time
 import unittest
+from dataclasses import replace
 
 from robotx.hardware.gps import (
     GPSConfig,
@@ -351,6 +352,37 @@ class TestPositionEstimator(unittest.TestCase):
         self.estimator.invalidate_heading()
         fresh = self.estimator.update(fix_reading(51.5, -0.1, speed=1.0, track=270.0))
         self.assertEqual((fresh.heading_deg, fresh.heading_source), (270.0, HeadingSource.NMEA_TRACK))
+
+    def test_the_frame_from_before_a_turn_cannot_restore_its_course(self):
+        # The receiver reports ~1 Hz and the agent re-reads its last frame every
+        # tick: after a turn that same frame still carries the old course.
+        before = fix_reading(51.5, -0.1, speed=1.0, track=0.0)
+        self.estimator.update(before)
+        self.estimator.invalidate_heading()
+        for _ in range(10):
+            reread = self.estimator.update(before)
+            self.assertEqual((reread.heading_deg, reread.heading_source), (None, HeadingSource.NONE))
+        fresh = self.estimator.update(fix_reading(51.5, -0.1, speed=1.0, track=90.0))
+        self.assertEqual((fresh.heading_deg, fresh.heading_source), (90.0, HeadingSource.NMEA_TRACK))
+
+    def test_a_wall_clock_stepped_back_after_a_turn_does_not_withhold_new_fixes(self):
+        self.estimator.update(fix_reading(51.5, -0.1, speed=1.0, track=0.0))
+        self.estimator.invalidate_heading()
+        stepped = fix_reading(51.5, -0.1, speed=1.0, track=90.0)
+        stepped = GpsReading(status=stepped.status, fix=replace(stepped.fix, timestamp=stepped.fix.timestamp - 3600),
+                             age_s=stepped.age_s)
+        fresh = self.estimator.update(stepped)
+        self.assertEqual((fresh.heading_deg, fresh.heading_source), (90.0, HeadingSource.NMEA_TRACK))
+
+    def test_the_frame_from_before_a_turn_does_not_anchor_the_next_track(self):
+        self.estimator.update(fix_reading(51.5000000, -0.1))
+        before = fix_reading(51.5000500, -0.1)                       # moved ~5.5 m north
+        self.estimator.update(before)
+        self.estimator.invalidate_heading()
+        self.estimator.update(before)                                 # re-read: no anchor from it
+        self.estimator.update(fix_reading(51.5000500, -0.0999700))    # first fix after: the anchor
+        east = self.estimator.update(fix_reading(51.5000500, -0.0999400))
+        self.assertAlmostEqual(east.heading_deg, 90.0, delta=1.0)
 
     def test_merely_stopping_still_holds_the_heading(self):
         # Unchanged behaviour: no rotation, no invalidation -- a stopped robot

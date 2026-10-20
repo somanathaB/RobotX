@@ -290,6 +290,14 @@ class Settings:
     nav_hold_assist_after_s: float = 30.0
     nav_no_progress_after_s: float = 60.0
     nav_progress_min_m: float = 3.0
+    # Bounded turns (robotx.control.decision): the yaw rate assumed while one
+    # side drives at cruise speed and the other is stopped, which sizes each
+    # turn from a measured heading error, and the longest one turn may last.
+    # Assumptions until measured on the ground (GPS_NAVIGATION_TEST.md): too
+    # high a rate under-turns and converges slowly; less than half the real
+    # rate overshoots on every turn.
+    nav_turn_rate_dps: float = 90.0
+    nav_max_turn_s: float = 2.0
 
     # Optional online routing. Without an API key the agent runs on locally
     # supplied waypoint lists only -- it never fabricates a route.
@@ -316,7 +324,9 @@ class Settings:
     obstacle_clear_hold_s: float = 2.0
     # One blocked episode this long pauses the mission for an operator.
     obstacle_assist_after_s: float = 30.0
-    # Steering: full-scale turn at this heading error (degrees).
+    # Steering: full-scale turn at this heading error (degrees). No longer read
+    # by route following (bounded turns, nav_turn_rate_dps); kept so existing
+    # environment files still parse.
     steering_full_scale_deg: float = 45.0
 
     # --- Local frame / dead reckoning ----------------------------------------
@@ -574,6 +584,8 @@ class Settings:
             nav_hold_assist_after_s=_get_positive_float(e, "ROBOTX_NAV_HOLD_ASSIST_AFTER_S", d.nav_hold_assist_after_s),
             nav_no_progress_after_s=_get_positive_float(e, "ROBOTX_NAV_NO_PROGRESS_AFTER_S", d.nav_no_progress_after_s),
             nav_progress_min_m=_get_positive_float(e, "ROBOTX_NAV_PROGRESS_MIN_M", d.nav_progress_min_m),
+            nav_turn_rate_dps=_get_positive_float(e, "ROBOTX_NAV_TURN_RATE_DPS", d.nav_turn_rate_dps),
+            nav_max_turn_s=_get_positive_float(e, "ROBOTX_NAV_MAX_TURN_S", d.nav_max_turn_s),
             google_maps_api_key=_get(e, "ROBOTX_GOOGLE_MAPS_API_KEY", d.google_maps_api_key),
             directions_min_interval_s=_get_float(e, "ROBOTX_DIRECTIONS_MIN_INTERVAL_S", d.directions_min_interval_s),
             directions_cache_ttl_s=_get_float(e, "ROBOTX_DIRECTIONS_CACHE_TTL_S", d.directions_cache_ttl_s),

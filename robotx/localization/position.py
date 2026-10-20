@@ -180,11 +180,19 @@ class PositionEstimator:
         self._last_heading: Optional[float] = None
         self._last_heading_source = HeadingSource.NONE
         self._heading_anchor: Optional[LatLon] = None
+        # Timestamp of the newest fix seen, and of the fix that was current at
+        # the last invalidation: no heading is derived from that fix. Matched
+        # exactly rather than ordered -- fix times are wall time, and an RTC-less
+        # Pi's clock can step.
+        self._last_fix_ts: Optional[float] = None
+        self._stale_through: Optional[float] = None
 
     def reset(self) -> None:
         self._last_heading = None
         self._last_heading_source = HeadingSource.NONE
         self._heading_anchor = None
+        self._last_fix_ts = None
+        self._stale_through = None
 
     def invalidate_heading(self) -> None:
         """Forget the heading: the robot has rotated in a way GPS cannot see.
@@ -194,13 +202,17 @@ class PositionEstimator:
         heading is no longer true -- yet nothing in the fixes would ever say so.
         Until movement derives a new one, the honest heading is None (source
         NONE). The movement anchor goes too, so the next heading comes only from
-        movement after the rotation. Merely standing still does not call this:
-        a robot that has not turned still faces where it last moved.
+        movement after the rotation -- and only from a fix taken after it: the
+        receiver reports about once a second while the agent re-reads its last
+        frame every tick, and that frame's course is the one the rover just
+        turned away from. Merely standing still does not call this: a robot
+        that has not turned still faces where it last moved.
         """
 
         self._last_heading = None
         self._last_heading_source = HeadingSource.NONE
         self._heading_anchor = None
+        self._stale_through = self._last_fix_ts
 
     def update(self, reading: GpsReading, *, driven: Optional[bool] = None) -> Optional[Position]:
         """Return the current position, or None when there is no usable fix.
@@ -216,10 +228,16 @@ class PositionEstimator:
 
         fix = reading.fix
         point = (fix.latitude, fix.longitude)
+        self._last_fix_ts = fix.timestamp
 
-        heading, source = self._estimate_heading(
-            point, fix.speed_mps, fix.track_deg, h_acc_m=fix.h_acc_m, driven=driven
-        )
+        if self._stale_through is not None and fix.timestamp == self._stale_through:
+            # The frame from before the rover last turned, read again: neither
+            # its course nor its position may start the next heading.
+            heading, source = None, HeadingSource.NONE
+        else:
+            heading, source = self._estimate_heading(
+                point, fix.speed_mps, fix.track_deg, h_acc_m=fix.h_acc_m, driven=driven
+            )
 
         return Position(
             latitude=fix.latitude,

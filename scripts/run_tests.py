@@ -11,7 +11,8 @@ Suites (offline ones touch no hardware, no serial port, no backend; loopback onl
   mission     OFFER -> assessment -> assignment -> navigation -> custody -> completion,
               including a real Socket.IO link to a SIMULATED backend
   navigation  localization (GPS heading), navigator, decision layer, progress and
-              obstacle monitors: position + route -> motion intent
+              obstacle monitors: position + route -> motion intent, and that loop
+              closed through a SIMULATED differential-drive rover
   telemetry   Pi -> backend wire: TELEMETRY status/safety/readiness/faults, transition
               frames, HEARTBEAT lease, custody/completion reports, the signature vector
   delivery    a genuine signed OFFER over a real Socket.IO link to a SIMULATED backend
@@ -69,6 +70,7 @@ SUITES: Dict[str, Dict[str, Any]] = {
         "tests.unit.test_gps_and_position", "tests.unit.test_navigation", "tests.unit.test_navigation_synthetic",
         "tests.unit.test_navigation_progress", "tests.unit.test_motion_and_decision", "tests.unit.test_local_frame",
         "tests.unit.test_obstacle_recovery", "tests.unit.test_esp32_gps_path",
+        "tests.unit.test_gps_navigation_closed_loop",
     ]},
     "telemetry": {"modules": [
         "tests.unit.test_protocol", "tests.unit.test_readiness_telemetry", "tests.unit.test_delivery_telemetry",

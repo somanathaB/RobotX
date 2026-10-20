@@ -14,7 +14,8 @@ What is simulated, and how
 - The wheels: the rover advances toward the navigator's target waypoint at a
   speed proportional to the firmware's mean *applied* output while that output
   is forward (no side below 0, one above), and not at all otherwise. Steering is idealised (it heads straight for the
-  target). This is kinematics invented for the test, not a model of the rover.
+  target), so nothing here tests steering or heading: `tests.fixtures.diff_drive_sim` does. This is kinematics
+  invented for the test, not a model of the rover.
 - GPS: a measured 3D fix at the simulated position every tick, with speed and
   track (so a heading exists once it moves), h_acc 1.5 m.
 - Perception: a clear scene every tick, unless `obstacle` (an object dead

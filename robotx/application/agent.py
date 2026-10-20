@@ -1400,10 +1400,11 @@ class RobotAgent:
         if self.dead_reckoner is not None:
             self.dead_reckoner.integrate(linear=intent.linear, angular=intent.angular)
 
-        # The same gated intent tells the GPS heading when it has gone stale: one
-        # side driven forward and the other backward rotates the rover in place,
-        # which no GPS fix can observe. Standing still does not.
-        if intent.left * intent.right < 0:
+        # The same gated intent tells the GPS heading when it has gone stale:
+        # whenever the two sides differ the rover turns, and the held heading --
+        # the direction it last moved -- no longer says where it faces. The next
+        # one comes from straight driving after the turn. Standing still does not.
+        if intent.turns:
             self.position_estimator.invalidate_heading()
 
         # Obstacle stops are no longer fed into the route planner's blocked
