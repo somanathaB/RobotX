@@ -84,6 +84,10 @@ class CommandTarget(Protocol):
 
     def assess_offer(self, offer: Any) -> Any: ...
 
+    # Optional: the engine path calls it for an accepted offer when present,
+    # else `assign_mission(mission, custody_required=True)`.
+    def accept_offer(self, mission: Mission) -> Any: ...
+
 
 @dataclass(frozen=True)
 class CommandOutcome:

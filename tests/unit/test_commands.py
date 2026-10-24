@@ -261,9 +261,10 @@ class TestSafetyBoundary(unittest.TestCase):
         # `assign_mission` takes an already-validated `Mission` (a route to
         # follow), never a speed or a steering value.
         # `assess_offer` answers "can I execute this?" and returns a verdict;
-        # it moves nothing.
+        # it moves nothing. `accept_offer` takes the same validated `Mission`
+        # as `assign_mission` and at most hands it to `assign_mission`.
         allowed = {"mode", "stop_mission", "pause_mission", "resume_mission",
-                   "return_to_base", "assign_mission", "assess_offer"}
+                   "return_to_base", "assign_mission", "assess_offer", "accept_offer"}
         public = {name for name in vars(CommandTarget) if not name.startswith("_")}
         self.assertEqual(public, allowed)
 

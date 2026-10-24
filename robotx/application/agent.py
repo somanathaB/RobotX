@@ -146,6 +146,14 @@ class RobotAgent:
     """Owns every Pi subsystem and the loop that ties them together."""
 
     def __init__(self, settings: Settings) -> None:
+        # The offer-acceptance demonstration relaxes motion prerequisites only
+        # because nothing can move: refused, not quietly corrected, otherwise.
+        if settings.offer_acceptance_demo and (settings.esp32_motion_enabled or settings.bench_motion_enabled):
+            raise ValueError(
+                "ROBOTX_OFFER_ACCEPTANCE_DEMO=1 requires ROBOTX_ESP32_MOTION_ENABLED=0 and "
+                "ROBOTX_BENCH_MOTION_ENABLED=0: the mode accepts offers without driving, so no "
+                "motor command path may be enabled"
+            )
         self.settings = settings
         self.state = RobotState(settings.robot_id)
 
@@ -280,6 +288,14 @@ class RobotAgent:
             robot_id=self.settings.robot_id,
             log_level=self.settings.log_level,
         )
+        if self.settings.offer_acceptance_demo:
+            log_event(
+                logger,
+                "agent.offer_acceptance_demo",
+                "OFFER-ACCEPTANCE DEMONSTRATION: offers are admitted and accepted, no mission is ever "
+                "started and motor commands are disabled",
+                level=logging.WARNING,
+            )
 
         self._start_camera()
         self._start_perception()
@@ -606,6 +622,12 @@ class RobotAgent:
         halfway to the drop back to waypoint zero of the pickup leg.
         """
 
+        if self.settings.offer_acceptance_demo:
+            raise MissionRejected(
+                MissionRejectReason.OFFER_ACCEPTANCE_DEMO,
+                "offer-acceptance demonstration: this Rover starts no missions (ROBOTX_OFFER_ACCEPTANCE_DEMO=1)",
+                task_id=mission.task_id,
+            )
         if self.safety.estop_engaged:
             raise MissionRejected(
                 MissionRejectReason.ESTOP_ENGAGED,
@@ -642,6 +664,30 @@ class RobotAgent:
         return assignment
 
     # --- engine offers and custody -------------------------------------------
+
+    def accept_offer(self, mission: Mission) -> Optional[MissionAssignment]:
+        """Act on an offer `assess_offer` accepted: what accepting means on this Rover.
+
+        Normally that is driving it (`assign_mission`, custody required). In the
+        offer-acceptance demonstration it is only the acceptance: nothing is
+        loaded, the mode is unchanged, and with no mission held no HEARTBEAT
+        renews the lease -- so the backend recovers the Leg instead of believing
+        it is being delivered. Returns None then.
+        """
+
+        if not self.settings.offer_acceptance_demo:
+            return self.assign_mission(mission, custody_required=True)
+        log_event(
+            logger,
+            "offer.accepted_without_motion",
+            "offer-acceptance demonstration: accepted, no mission started",
+            level=logging.WARNING,
+            task_id=mission.task_id,
+            pickup=mission.pickup,
+            drop=mission.drop,
+            mode=self.state.mode.value,
+        )
+        return None
 
     def assess_offer(self, offer: Any) -> Any:
         """Can this Rover genuinely carry out `offer`? Its own answer, nothing more.
@@ -683,7 +729,8 @@ class RobotAgent:
         # Rover that cannot see cannot drive: the decision layer stops for
         # unusable perception on every tick, so accepting would hold a Leg the
         # Rover will sit on. The faults[] report names it beside the refusal.
-        if not snapshot.perception.is_usable:
+        # Not in the offer-acceptance demonstration: nothing is driven, so nothing needs to see.
+        if not self.settings.offer_acceptance_demo and not snapshot.perception.is_usable:
             return OfferDecision.reject(f"{PERCEPTION_UNAVAILABLE}: {snapshot.perception.status.value}")
         # Only now is there a measured, navigable position to judge it from
         # (and if somehow not, check_start_position refuses rather than guess).
@@ -723,9 +770,12 @@ class RobotAgent:
         # TELEMETRY must report its drive available and no controller safety
         # fault (safety_stop, front_valid=false, command_timeout) -- see
         # Esp32Link._motion_ready. `ROBOTX_ESP32_MOTION_ENABLED=false` is
-        # therefore always NO_MOTOR_LINK.
+        # therefore always NO_MOTOR_LINK -- except in the offer-acceptance
+        # demonstration, which never drives and so needs only the UP link (the
+        # ESP32 is still the source of the stop latch the backend's F7 reads).
+        demo = self.settings.offer_acceptance_demo
         if not snapshot.communication.esp32.is_up or (
-            self.esp32 is not None and not self.esp32.status().motion_ready
+            not demo and self.esp32 is not None and not self.esp32.status().motion_ready
         ):
             blockers.append("NO_MOTOR_LINK")
         # A fix navigation will not drive on is no fix.
@@ -736,7 +786,8 @@ class RobotAgent:
             or not self.navigator.usable(snapshot.position)
         ):
             blockers.append("NO_POSITION_FIX")
-        if not self.custody_sensing_available():
+        # No parcel changes hands on a mission that is never started.
+        if not demo and not self.custody_sensing_available():
             blockers.append("NO_CUSTODY_SENSING")
         return blockers
 

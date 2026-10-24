@@ -220,6 +220,19 @@ class Settings:
     # as a sensor reading.
     custody_confirmation: str = "none"
 
+    # --- Offer-acceptance demonstration (opt-in) ------------------------------
+    # OFF by default. When on, the Rover answers RobotX offers to demonstrate
+    # assignment only: a signed OFFER is admitted exactly as always (addressee,
+    # expiry, HMAC, fence, sequence, persist-before-effect, route and start
+    # checks) and ACCEPTed, but no mission is started -- the mode stays IDLE,
+    # no route is loaded, the lease is never renewed. Because nothing will
+    # move, the motion and delivery prerequisites (motor drive ready, custody
+    # sensing, perception) are not readiness blockers; e-stop, ERROR, an UP
+    # ESP32 link and a measured position fix still are. Refused at startup
+    # unless ROBOTX_ESP32_MOTION_ENABLED=0 and ROBOTX_BENCH_MOTION_ENABLED=0.
+    # See docs/operations/OFFER_ACCEPTANCE_DEMO.md.
+    offer_acceptance_demo: bool = False
+
     # --- Mission admission (robotx.mission.admission) --------------------------
     # Checked on every offer (and test injection) against the measured position:
     # pathToPickup must start within the first, the pickup lie within the second
@@ -561,6 +574,7 @@ class Settings:
             motion_applied_timeout_s=_get_float(e, "ROBOTX_MOTION_APPLIED_TIMEOUT_S", d.motion_applied_timeout_s),
             motion_deadband_units=_get_int(e, "ROBOTX_MOTION_DEADBAND_UNITS", d.motion_deadband_units),
             custody_confirmation=_get_str(e, "ROBOTX_CUSTODY_CONFIRMATION", d.custody_confirmation),
+            offer_acceptance_demo=_get_bool(e, "ROBOTX_OFFER_ACCEPTANCE_DEMO", d.offer_acceptance_demo),
             test_injection_enabled=_get_bool(e, "ROBOTX_TEST_INJECTION_ENABLED", d.test_injection_enabled),
             test_injection_token_sha256=_get(e, "ROBOTX_TEST_INJECTION_TOKEN_SHA256",
                                              d.test_injection_token_sha256),

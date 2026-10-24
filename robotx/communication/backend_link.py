@@ -1681,7 +1681,14 @@ class BackendLink:
         accepted = False
         if decision.verdict is OfferVerdict.ACCEPT:
             try:
-                self._target.assign_mission(decision.mission, custody_required=True)
+                # What accepting means is the Rover's (`RobotAgent.accept_offer`:
+                # drive it, or in the offer-acceptance demonstration only accept
+                # it). A target without it is handed the mission as before.
+                accept = getattr(self._target, "accept_offer", None)
+                if callable(accept):
+                    accept(decision.mission)
+                else:
+                    self._target.assign_mission(decision.mission, custody_required=True)
                 accepted = True
             except MissionRejected as e:
                 decision = OfferDecision.reject(f"MISSION_REFUSED: {e.reason.value}")
