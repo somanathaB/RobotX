@@ -13,7 +13,9 @@ Code: `robotx/control/bench_motion.py` (the pulse), `robotx/application/bench_ga
 - **Not a mission.** No route, no taskId, no commitment; nothing is reported to the
   backend as an assignment. TELEMETRY stays `status: IDLE` and `faults[]` carries
   `BENCH_MOTION_ACTIVE` (INFO, MOTOR) while it runs. An OFFER that arrives during a
-  pulse is refused (`BENCH_TEST_ACTIVE`).
+  pulse is refused (`BENCH_TEST_ACTIVE`). The one exception is the bench
+  wheel-test demonstration (`BENCH_WHEEL_DEMO.md`), where a pulse is bound to an
+  offer accepted without a mission.
 - **Not a bypass.** The pulse proposes `forward(speed)` with equal sides. The
   camera's own stops (perception unusable, a person, an object in the corridor),
   then the same `SafetyGate` a mission uses (e-stop, perception, forward range at

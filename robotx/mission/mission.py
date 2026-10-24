@@ -67,6 +67,7 @@ class MissionRejectReason(str, Enum):
     MISSION_ACTIVE = "MISSION_ACTIVE"          # another mission is still running
     ESTOP_ENGAGED = "ESTOP_ENGAGED"            # latched stop; the Rover cannot drive
     OFFER_ACCEPTANCE_DEMO = "OFFER_ACCEPTANCE_DEMO"  # demonstration mode: no mission is ever started
+    BENCH_WHEEL_DEMO = "BENCH_WHEEL_DEMO"        # bench wheel-test mode: no mission is ever started
     # Route admission against the Rover's position (robotx.mission.admission).
     ROUTE_INCONSISTENT = "ROUTE_INCONSISTENT"    # path ends and stops do not meet
     ROUTE_START_TOO_FAR = "ROUTE_START_TOO_FAR"  # pathToPickup does not start where the Rover is

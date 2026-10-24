@@ -1642,6 +1642,14 @@ class BackendLink:
                     self._target.stop_mission(f"engine {envelope.command} ({envelope.commitment_id})")
                 except Exception:
                     logger.exception("Failed to stop the mission for %s", envelope.command)
+            # A bench pulse bound to this commitment (bench wheel-test
+            # demonstration) holds no mission, so it is ended on its own.
+            end_bench = getattr(self._target, "end_bench_task", None)
+            if callable(end_bench):
+                try:
+                    end_bench(envelope.commitment_id, f"engine {envelope.command} ({envelope.commitment_id})")
+                except Exception:
+                    logger.exception("Failed to end the bench pulse for %s", envelope.command)
             self.commitments.update(envelope.commitment_id, tombstoned=True)
             log_event(logger, "engine.commitment_ended", command=envelope.command,
                       commitment_id=envelope.commitment_id)

@@ -233,6 +233,20 @@ class Settings:
     # See docs/operations/OFFER_ACCEPTANCE_DEMO.md.
     offer_acceptance_demo: bool = False
 
+    # --- Bench wheel-test demonstration (opt-in) --------------------------------
+    # OFF by default. A signed OFFER is admitted and ACCEPTed as in the
+    # offer-acceptance demonstration -- no mission, no route, no lease renewal,
+    # and custody sensing and perception are not readiness blockers -- but the
+    # motor link stays a real prerequisite. Accepting moves nothing; the operator
+    # may then run ONE bench pulse (robotx.control.bench_motion) BOUND to that
+    # task: POST /test/bench-motion/run with its task_id. The pulse also ends
+    # when the commitment ends (RECALL, WITHDRAW, ABORT_MISSION) or the backend
+    # link drops. No mission, local route or RETURN is ever driven in this mode.
+    # Refused at startup unless ROBOTX_ESP32_MOTION_ENABLED=1,
+    # ROBOTX_BENCH_MOTION_ENABLED=1, ROBOTX_SOCKET_ENABLED=1 and
+    # ROBOTX_OFFER_ACCEPTANCE_DEMO=0. See docs/operations/BENCH_WHEEL_DEMO.md.
+    bench_wheel_demo: bool = False
+
     # --- Mission admission (robotx.mission.admission) --------------------------
     # Checked on every offer (and test injection) against the measured position:
     # pathToPickup must start within the first, the pickup lie within the second
@@ -575,6 +589,7 @@ class Settings:
             motion_deadband_units=_get_int(e, "ROBOTX_MOTION_DEADBAND_UNITS", d.motion_deadband_units),
             custody_confirmation=_get_str(e, "ROBOTX_CUSTODY_CONFIRMATION", d.custody_confirmation),
             offer_acceptance_demo=_get_bool(e, "ROBOTX_OFFER_ACCEPTANCE_DEMO", d.offer_acceptance_demo),
+            bench_wheel_demo=_get_bool(e, "ROBOTX_BENCH_WHEEL_DEMO", d.bench_wheel_demo),
             test_injection_enabled=_get_bool(e, "ROBOTX_TEST_INJECTION_ENABLED", d.test_injection_enabled),
             test_injection_token_sha256=_get(e, "ROBOTX_TEST_INJECTION_TOKEN_SHA256",
                                              d.test_injection_token_sha256),

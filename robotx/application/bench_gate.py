@@ -18,7 +18,8 @@ post here), a valid bearer token, and a JSON body that re-states, for this run,
 that the wheels are off the ground and the motor cutoff is attended:
 
     {"wheels_off_ground": true, "motor_cutoff_attended": true,
-     "duration_s": <optional, <= configured>, "speed": <optional, <= configured>}
+     "duration_s": <optional, <= configured>, "speed": <optional, <= configured>,
+     "task_id": <required with ROBOTX_BENCH_WHEEL_DEMO=1, refused otherwise>}
 
 Nothing here moves anything: the agent decides (`RobotAgent.start_bench_motion`)
 and every gate it has still applies. A run is never a mission and is never
@@ -46,7 +47,8 @@ MAX_BODY_BYTES = 4096
 MIN_TOKEN_CHARS = 32
 MAX_AUTH_FAILURES = 5
 AUTH_LOCKOUT_S = 300.0
-_ALLOWED_KEYS = {"wheels_off_ground", "motor_cutoff_attended", "duration_s", "speed"}
+_ALLOWED_KEYS = {"wheels_off_ground", "motor_cutoff_attended", "duration_s", "speed", "task_id"}
+MAX_TASK_ID_CHARS = 128
 
 
 class BenchRejected(Exception):
@@ -175,7 +177,7 @@ class BenchGate:
         raise BenchRejected("UNAUTHORIZED", "a valid bearer token is required", 401)
 
     @staticmethod
-    def parse(raw: Any, limits: Any) -> Dict[str, float]:
+    def parse(raw: Any, limits: Any) -> Dict[str, Any]:
         """The run parameters from a request body, or BenchRejected (422)."""
 
         if not isinstance(raw, dict):
@@ -194,12 +196,23 @@ class BenchGate:
                 if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
                     raise BenchRejected("MALFORMED", f"{key} must be a number")
                 out[key] = float(value)
+        if "task_id" in raw:
+            task_id = raw["task_id"]
+            if not isinstance(task_id, str) or not task_id.strip() or len(task_id) > MAX_TASK_ID_CHARS:
+                raise BenchRejected("MALFORMED", f"task_id must be a non-empty string of at most {MAX_TASK_ID_CHARS} characters")
+            out["task_id"] = task_id
         return out
 
     def run(self, agent: Any, raw: Any) -> Dict[str, Any]:
         params = self.parse(raw, agent.bench.cfg)
-        return agent.start_bench_motion(speed=params["speed"], duration_s=params["duration_s"], source="bench_route")
+        # Only a request naming a task passes one, so an agent without the
+        # task binding is called exactly as before.
+        bound = {"task_id": params["task_id"]} if "task_id" in params else {}
+        return agent.start_bench_motion(speed=params["speed"], duration_s=params["duration_s"],
+                                        source="bench_route", **bound)
 
     def status(self, agent: Any) -> Dict[str, Any]:
+        wheel_demo = getattr(agent, "bench_wheel_status", None)
         return {"enabled": self.enabled, "available": self._problem is None, "problem": self._problem,
-                "locked_out": self.clock() < self._locked_until, **agent.bench.status()}
+                "locked_out": self.clock() < self._locked_until, **agent.bench.status(),
+                **({"wheel_demo": wheel_demo()} if callable(wheel_demo) else {})}

@@ -9,6 +9,12 @@ taskId, no commitment, nothing reported to the backend as an assignment, and it
 never starts on its own (`RobotAgent.start_bench_motion` is reached only from
 the guarded, disabled-by-default route in `robotx.application.bench_gate`).
 
+In the bench wheel-test demonstration (`ROBOTX_BENCH_WHEEL_DEMO`) a pulse is
+*bound* to an offer the Rover accepted without starting a mission: it records
+that task and commitment, and the agent ends it when the commitment ends or the
+backend link drops. It is still not a mission: no route, nothing driven toward
+the task, and the binding changes none of the stop conditions below.
+
 What it does not bypass
 -----------------------
 It only *proposes* `MotionIntent.forward(speed)` -- equal sides, forward only.
@@ -147,6 +153,9 @@ class _Run:
     stop_code: Optional[str] = None
     stopping_since: Optional[float] = None
     stop_seq: Optional[int] = None
+    # The accepted task this pulse demonstrates (ROBOTX_BENCH_WHEEL_DEMO), else None.
+    task_id: Optional[str] = None
+    commitment_id: Optional[str] = None
 
 
 class BenchMotion:
@@ -174,6 +183,12 @@ class BenchMotion:
     def driving(self) -> bool:
         return self._phase is BenchPhase.DRIVING
 
+    @property
+    def bound_commitment(self) -> Optional[str]:
+        """The commitment the running pulse is bound to, or None."""
+
+        return self._run.commitment_id if self._run is not None else None
+
     def cooling_down(self, now: Optional[float] = None) -> float:
         """Seconds left before another run may start (0 when it may)."""
 
@@ -188,13 +203,15 @@ class BenchMotion:
             "limits": {"max_speed": self.cfg.speed, "max_units": drive_units(self.cfg.speed),
                        "max_duration_s": self.cfg.duration_s},
             "running": None if run is None else {"units": run.units, "duration_s": run.duration_s,
-                                                 "elapsed_s": round(self.clock() - run.started_at, 2)},
+                                                 "elapsed_s": round(self.clock() - run.started_at, 2),
+                                                 "task_id": run.task_id, "commitment_id": run.commitment_id},
             "last_result": self.last_result,
         }
 
     # --- control -------------------------------------------------------------------
 
-    def start(self, *, speed: float, duration_s: float, source: str) -> Dict[str, Any]:
+    def start(self, *, speed: float, duration_s: float, source: str,
+              task_id: Optional[str] = None, commitment_id: Optional[str] = None) -> Dict[str, Any]:
         """Begin a pulse. The caller has already checked every precondition."""
 
         if self.active:
@@ -205,10 +222,12 @@ class BenchMotion:
             raise ValueError(f"duration_s must be in [{MIN_DURATION_S}, {self.cfg.duration_s}]")
         now = self.clock()
         self._run = _Run(speed=speed, units=drive_units(speed), duration_s=duration_s, source=source,
-                         started_at=now, started_wall=time.time(), deadline=now + duration_s)
+                         started_at=now, started_wall=time.time(), deadline=now + duration_s,
+                         task_id=task_id, commitment_id=commitment_id)
         self._phase = BenchPhase.DRIVING
         log_event(logger, "bench.started", "BENCH forward pulse: wheels must be off the ground",
-                  level=logging.WARNING, units=self._run.units, duration_s=duration_s, source=source)
+                  level=logging.WARNING, units=self._run.units, duration_s=duration_s, source=source,
+                  task_id=task_id, commitment_id=commitment_id)
         return self.status()
 
     def intent(self, now: Optional[float] = None) -> MotionIntent:
@@ -349,6 +368,8 @@ class BenchMotion:
             "stop_code": run.stop_code,
             "stop_reason": run.stop_reason,
             "source": run.source,
+            "task_id": run.task_id,
+            "commitment_id": run.commitment_id,
             "started_at": round(run.started_wall, 3),
             "duration_s": run.duration_s,
             "ran_s": round((run.stopping_since or now) - run.started_at, 2),

@@ -88,6 +88,10 @@ class CommandTarget(Protocol):
     # else `assign_mission(mission, custody_required=True)`.
     def accept_offer(self, mission: Mission) -> Any: ...
 
+    # Optional: the engine path calls it when a commitment ends (RECALL,
+    # WITHDRAW, ABORT_MISSION), to stop a bench pulse bound to it.
+    def end_bench_task(self, commitment_id: Optional[str], reason: str) -> bool: ...
+
 
 @dataclass(frozen=True)
 class CommandOutcome:

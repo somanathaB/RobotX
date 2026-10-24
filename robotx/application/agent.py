@@ -154,6 +154,16 @@ class RobotAgent:
                 "ROBOTX_BENCH_MOTION_ENABLED=0: the mode accepts offers without driving, so no "
                 "motor command path may be enabled"
             )
+        # The bench wheel test is the opposite: a pulse needs the motor path, and
+        # it is bound to an offer from a backend. Never combined with the other demo.
+        if settings.bench_wheel_demo and not (
+            settings.esp32_motion_enabled and settings.bench_motion_enabled and settings.socket_enabled
+            and not settings.offer_acceptance_demo
+        ):
+            raise ValueError(
+                "ROBOTX_BENCH_WHEEL_DEMO=1 requires ROBOTX_ESP32_MOTION_ENABLED=1, "
+                "ROBOTX_BENCH_MOTION_ENABLED=1, ROBOTX_SOCKET_ENABLED=1 and ROBOTX_OFFER_ACCEPTANCE_DEMO=0"
+            )
         self.settings = settings
         self.state = RobotState(settings.robot_id)
 
@@ -213,6 +223,10 @@ class RobotAgent:
         # `start_bench_motion` is called, which only the guarded, disabled-by-
         # default bench route does. Never a mission.
         self.bench = BenchMotion(BenchMotionConfig.from_settings(settings))
+        # Bench wheel-test demonstration: tasks this process accepted without a
+        # mission. A pulse may be bound only to one of these, so a restart makes
+        # every earlier acceptance ineligible.
+        self._bench_wheel_tasks: set = set()
         # Whether the previous tick's gated intent moved the wheels: what the
         # applied-motion monitor judges the ESP32's feedback against.
         self._intent_moving = False
@@ -294,6 +308,14 @@ class RobotAgent:
                 "agent.offer_acceptance_demo",
                 "OFFER-ACCEPTANCE DEMONSTRATION: offers are admitted and accepted, no mission is ever "
                 "started and motor commands are disabled",
+                level=logging.WARNING,
+            )
+        if self.settings.bench_wheel_demo:
+            log_event(
+                logger,
+                "agent.bench_wheel_demo",
+                "BENCH WHEEL-TEST DEMONSTRATION: offers are accepted without a mission; an operator may "
+                "run one bounded wheel pulse per request for an accepted task. Rover must be on a stand.",
                 level=logging.WARNING,
             )
 
@@ -598,6 +620,7 @@ class RobotAgent:
         and giving it one would make the two indistinguishable in telemetry.
         """
 
+        self._refuse_route_in_bench_wheel_demo("a local route")
         if len(waypoints) < 1:
             raise ValueError("a mission needs at least one waypoint")
 
@@ -626,6 +649,12 @@ class RobotAgent:
             raise MissionRejected(
                 MissionRejectReason.OFFER_ACCEPTANCE_DEMO,
                 "offer-acceptance demonstration: this Rover starts no missions (ROBOTX_OFFER_ACCEPTANCE_DEMO=1)",
+                task_id=mission.task_id,
+            )
+        if self.settings.bench_wheel_demo:
+            raise MissionRejected(
+                MissionRejectReason.BENCH_WHEEL_DEMO,
+                "bench wheel-test demonstration: this Rover starts no missions (ROBOTX_BENCH_WHEEL_DEMO=1)",
                 task_id=mission.task_id,
             )
         if self.safety.estop_engaged:
@@ -672,15 +701,22 @@ class RobotAgent:
         offer-acceptance demonstration it is only the acceptance: nothing is
         loaded, the mode is unchanged, and with no mission held no HEARTBEAT
         renews the lease -- so the backend recovers the Leg instead of believing
-        it is being delivered. Returns None then.
+        it is being delivered. Returns None then. The bench wheel-test
+        demonstration accepts the same way, and only remembers the task so an
+        operator may later bind one bench pulse to it (`start_bench_motion`):
+        accepting itself never moves anything.
         """
 
-        if not self.settings.offer_acceptance_demo:
+        if not self._accepts_without_mission:
             return self.assign_mission(mission, custody_required=True)
+        if self.settings.bench_wheel_demo:
+            self._bench_wheel_tasks.add(mission.task_id)
         log_event(
             logger,
             "offer.accepted_without_motion",
-            "offer-acceptance demonstration: accepted, no mission started",
+            "bench wheel-test demonstration: accepted, no mission started, no motion until an operator "
+            "requests a bench pulse" if self.settings.bench_wheel_demo
+            else "offer-acceptance demonstration: accepted, no mission started",
             level=logging.WARNING,
             task_id=mission.task_id,
             pickup=mission.pickup,
@@ -688,6 +724,18 @@ class RobotAgent:
             mode=self.state.mode.value,
         )
         return None
+
+    @property
+    def _accepts_without_mission(self) -> bool:
+        """Either demonstration: an accepted offer starts no mission."""
+
+        return self.settings.offer_acceptance_demo or self.settings.bench_wheel_demo
+
+    def _refuse_route_in_bench_wheel_demo(self, what: str) -> None:
+        """Motion is enabled in the bench wheel test, so nothing may load a route to drive."""
+
+        if self.settings.bench_wheel_demo:
+            raise MissionRefused(f"bench wheel-test demonstration: {what} is never driven (ROBOTX_BENCH_WHEEL_DEMO=1)")
 
     def assess_offer(self, offer: Any) -> Any:
         """Can this Rover genuinely carry out `offer`? Its own answer, nothing more.
@@ -729,8 +777,9 @@ class RobotAgent:
         # Rover that cannot see cannot drive: the decision layer stops for
         # unusable perception on every tick, so accepting would hold a Leg the
         # Rover will sit on. The faults[] report names it beside the refusal.
-        # Not in the offer-acceptance demonstration: nothing is driven, so nothing needs to see.
-        if not self.settings.offer_acceptance_demo and not snapshot.perception.is_usable:
+        # Not in either demonstration: accepting drives nothing, so nothing needs to see
+        # (a bench pulse checks perception itself, when one is requested).
+        if not self._accepts_without_mission and not snapshot.perception.is_usable:
             return OfferDecision.reject(f"{PERCEPTION_UNAVAILABLE}: {snapshot.perception.status.value}")
         # Only now is there a measured, navigable position to judge it from
         # (and if somehow not, check_start_position refuses rather than guess).
@@ -773,6 +822,7 @@ class RobotAgent:
         # therefore always NO_MOTOR_LINK -- except in the offer-acceptance
         # demonstration, which never drives and so needs only the UP link (the
         # ESP32 is still the source of the stop latch the backend's F7 reads).
+        # The bench wheel test drives a pulse, so it keeps the full check.
         demo = self.settings.offer_acceptance_demo
         if not snapshot.communication.esp32.is_up or (
             not demo and self.esp32 is not None and not self.esp32.status().motion_ready
@@ -787,7 +837,7 @@ class RobotAgent:
         ):
             blockers.append("NO_POSITION_FIX")
         # No parcel changes hands on a mission that is never started.
-        if not demo and not self.custody_sensing_available():
+        if not self._accepts_without_mission and not self.custody_sensing_available():
             blockers.append("NO_CUSTODY_SENSING")
         return blockers
 
@@ -817,12 +867,19 @@ class RobotAgent:
 
         return self._fault_tracker.report(self.active_faults(snapshot))
 
-    def start_bench_motion(self, *, speed: float, duration_s: float, source: str) -> Dict[str, Any]:
+    def start_bench_motion(self, *, speed: float, duration_s: float, source: str,
+                           task_id: Optional[str] = None) -> Dict[str, Any]:
         """Start one bench pulse (robotx.control.bench_motion), or raise `BenchRefused`.
 
         Every precondition is the real one, checked now; none is relaxed for a
         bench. The pulse then runs on the agent's own tick, through the safety
         gate and the ESP32 link, and stops on its own.
+
+        Normally a pulse refuses while any backend commitment is held. In the
+        bench wheel-test demonstration it is the reverse: `task_id` is required
+        and must be an offer this process accepted whose commitment is still
+        held, over a connected backend link. The pulse is bound to it and ends
+        when that stops being true (`_check_bench_binding`, `end_bench_task`).
         """
 
         def refuse(code: str, detail: str) -> None:
@@ -846,8 +903,25 @@ class RobotAgent:
         if self.missions.has_active_mission:
             refuse("MISSION_HELD", "a mission is held")
         commitments = getattr(self.backend, "commitments", None)
-        if commitments is not None and commitments.held() is not None:
-            refuse("COMMITMENT_HELD", "a backend commitment is held")
+        held = commitments.held() if commitments is not None else None
+        commitment_id: Optional[str] = None
+        if self.settings.bench_wheel_demo:
+            if not task_id:
+                refuse("TASK_REQUIRED", "the bench wheel test runs only for an accepted task: give its task_id")
+            if task_id not in self._bench_wheel_tasks:
+                refuse("TASK_NOT_ACCEPTED", f"task {task_id!r} was not accepted by this agent since it started")
+            if held is None or held.task_id != task_id:
+                refuse("TASK_NOT_HELD", f"the commitment for task {task_id!r} is no longer held "
+                                        "(recalled, withdrawn or ended)")
+            if not getattr(self.backend, "connected", False):
+                refuse("BACKEND_NOT_CONNECTED", "the backend link is not connected and authenticated")
+            assert held is not None
+            commitment_id = held.commitment_id
+        else:
+            if task_id is not None:
+                refuse("TASK_BINDING_UNAVAILABLE", "a bench pulse is bound to a task only with ROBOTX_BENCH_WHEEL_DEMO=1")
+            if held is not None:
+                refuse("COMMITMENT_HELD", "a backend commitment is held")
         if self.esp32 is None:
             refuse("NO_ESP32_LINK", "no ESP32 link is running")
         assert self.esp32 is not None
@@ -873,7 +947,59 @@ class RobotAgent:
                    f"forward_blocked={None if tel is None else tel.forward_blocked})")
         if not snapshot.perception.is_usable:
             refuse("PERCEPTION_UNUSABLE", f"perception is {snapshot.perception.status.value}")
-        return self.bench.start(speed=speed, duration_s=duration_s, source=source)
+        return self.bench.start(speed=speed, duration_s=duration_s, source=source,
+                                task_id=task_id, commitment_id=commitment_id)
+
+    def bench_wheel_status(self) -> Dict[str, Any]:
+        """The bench wheel-test demonstration as the bench route reports it."""
+
+        commitments = getattr(self.backend, "commitments", None)
+        held = commitments.held() if commitments is not None else None
+        return {
+            "enabled": bool(self.settings.bench_wheel_demo),
+            "backend_connected": bool(getattr(self.backend, "connected", False)),
+            "accepted_tasks": sorted(t for t in self._bench_wheel_tasks if t),
+            "held_task_id": held.task_id if held is not None else None,
+            "held_commitment_id": held.commitment_id if held is not None else None,
+        }
+
+    def end_bench_task(self, commitment_id: Optional[str], reason: str) -> bool:
+        """The backend ended a commitment (RECALL / WITHDRAW / ABORT_MISSION): stop its bench pulse.
+
+        Called by the backend link before it tombstones the commitment, whether
+        or not a mission is held. Returns whether a running pulse was ended. The
+        task also stops being eligible for another pulse.
+        """
+
+        if commitment_id is None:
+            return False
+        commitments = getattr(self.backend, "commitments", None)
+        record = commitments.get(commitment_id) if commitments is not None else None
+        if record is not None and record.task_id:
+            self._bench_wheel_tasks.discard(record.task_id)
+        if self.bench.driving and self.bench.bound_commitment == commitment_id:
+            self.bench.abort("TASK_CANCELLED", f"task cancelled: {reason}")
+            return True
+        return False
+
+    def _check_bench_binding(self) -> None:
+        """End a task-bound pulse whose task is no longer held, or whose backend link dropped.
+
+        The per-tick backstop for `end_bench_task`: a cancellation that never
+        arrives as a terminating envelope still ends the pulse, here or at its
+        own deadline -- and the ESP32 watchdog stops the wheels if the Pi
+        itself goes silent.
+        """
+
+        bound = self.bench.bound_commitment
+        if not self.bench.driving or bound is None:
+            return
+        commitments = getattr(self.backend, "commitments", None)
+        held = commitments.held() if commitments is not None else None
+        if held is None or held.commitment_id != bound:
+            self.bench.abort("TASK_RELEASED", "the accepted task's commitment is no longer held")
+        elif not getattr(self.backend, "connected", False):
+            self.bench.abort("BACKEND_LINK_LOST", "the backend link dropped during the pulse")
 
     def custody_sensing_available(self) -> bool:
         """Whether a parcel handover on this Rover can be truthfully reported.
@@ -976,6 +1102,7 @@ class RobotAgent:
         rover, and a link that cannot carry motion pauses the mission again.
         """
 
+        self._refuse_route_in_bench_wheel_demo("a resumed route")
         if self.safety.estop_engaged:
             # Never AUTO under a latch: clearing it is a separate operator act.
             raise MissionRefused("emergency stop is latched; clear it before resuming")
@@ -1011,6 +1138,7 @@ class RobotAgent:
         could do.
         """
 
+        self._refuse_route_in_bench_wheel_demo("a return to base")
         if self.safety.estop_engaged:
             raise MissionRefused("emergency stop is latched; clear it before returning to base")
         home = self._home_position()
@@ -1309,6 +1437,7 @@ class RobotAgent:
         #     pauses produces the hold on this same tick.
         if self.backend is not None:
             self.backend.apply_loss_policy()
+        self._check_bench_binding()
 
         # 3. Navigation
         navigation = self.navigator.update(position)

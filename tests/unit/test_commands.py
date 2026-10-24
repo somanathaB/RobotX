@@ -263,8 +263,11 @@ class TestSafetyBoundary(unittest.TestCase):
         # `assess_offer` answers "can I execute this?" and returns a verdict;
         # it moves nothing. `accept_offer` takes the same validated `Mission`
         # as `assign_mission` and at most hands it to `assign_mission`.
+        # `end_bench_task` can only end a bench pulse; nothing on this surface
+        # can start one.
         allowed = {"mode", "stop_mission", "pause_mission", "resume_mission",
-                   "return_to_base", "assign_mission", "assess_offer", "accept_offer"}
+                   "return_to_base", "assign_mission", "assess_offer", "accept_offer",
+                   "end_bench_task"}
         public = {name for name in vars(CommandTarget) if not name.startswith("_")}
         self.assertEqual(public, allowed)
 
