@@ -50,5 +50,22 @@ behaviour is exactly as before; nothing persists from the mode.
 ## What it is not evidence of
 
 Navigation, obstacle handling, custody or delivery. The backend still sees a
-Rover that accepted a Leg and then did not progress; cancel the task after the
-demonstration, or let the lease lapse.
+Rover that accepted a Leg and then did not progress.
+
+## After the demonstration: what ends the Leg
+
+The dashboard's **task cancel does not**. For an engine task whose Leg is
+accepted, `POST /api/tasks/:taskId/cancel` answers `409
+ENGINE_CANCELLATION_UNAVAILABLE` and changes and sends nothing
+(`Backend/src/services/taskCancellation.service.js`: only a task whose open Legs
+are all QUEUED, or an exhausted REASSIGNING chain, is cancellable, and neither
+path sends the robot a STOP).
+
+What does end it: the lease. No mission is held, so no HEARTBEAT renews it;
+about `lease.duration` (60 s) after ACCEPT the engine sends RECALL, the Rover
+acknowledges it and tombstones the commitment, and the Leg goes REASSIGNING
+(the engine may re-offer it to another robot). Only once the chain is exhausted
+can the task be cancelled from the dashboard. The dashboard's robot **STOP**
+(`POST /api/robots/:robotId/command` `{"type":"STOP"}`) is a separate path: it
+reaches the Rover at once and places a server-side PAUSED hold (cleared with
+`clear-fault`), but it does not end the Leg.

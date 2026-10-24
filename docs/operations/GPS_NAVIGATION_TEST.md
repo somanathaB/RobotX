@@ -94,6 +94,10 @@ Mission lifecycle at the agent and backend level is covered by
 `tests/integration/test_simulated_delivery.py`: genuine signed OFFER,
 PAUSE/RESUME, WITHDRAW, task cancellation, backend loss and the lease,
 e-stop, and ESP32 reboot. The same holds for `scripts.simulated_mission`.
+"Task cancellation" there is the bare `STOP` event (`reason: TASK_CANCELLED`),
+which today only the backend's legacy, Leg-less cancel path sends; a dashboard
+cancel of an accepted engine Leg is refused and sends nothing
+(`OFFER_ACCEPTANCE_DEMO.md`).
 
 ## 4. Three different things, never to be confused
 
