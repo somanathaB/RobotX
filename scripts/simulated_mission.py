@@ -130,6 +130,44 @@ class Run:
     def mode_is(self, mode: OperatingMode) -> Callable[[], bool]:
         return lambda: self.rover.agent.mode is mode
 
+    async def obstacle_stop(self, seconds: float) -> None:
+        """An obstacle appears dead ahead and stays for `seconds`.
+
+        The safety invariant: once any agent tick has had the obstacle in view,
+        no DRIVE is written for as long as it stays. Before that tick the agent
+        cannot know: the one DRIVE slot a clear-scene tick already submitted may
+        still go out on the next link poll -- once, and never older than the
+        link's `max_command_age_s` -- and the tick that sees the obstacle
+        replaces any slot still unsent with a STOP. So: no DRIVE after the first
+        perceiving tick; at most that one in-flight DRIVE before it; and a tick
+        that sees the obstacle, and a STOP, within one agent period plus the
+        command-age limit (the latest an in-flight DRIVE could still be sent).
+        """
+
+        rover = self.rover
+        rover.obstacle = True
+        self.note("SIMULATED obstacle in the camera corridor")
+        await self.run(seconds)
+        shown = rover.obstacle_shown_at
+        bound = 1.0 / float(rover.agent.settings.agent_hz) + rover.link.cfg.max_command_age_s
+        seen = next((t for t in rover.perceiving_ticks if shown is not None and t >= shown), None)
+        writes = [(t, cmd) for t, cmd in rover.port.motion_writes if shown is not None and t >= shown]
+        drives = [t for t, cmd in writes if cmd == "DRIVE"]
+        stop = next((t for t, cmd in writes if cmd == "STOP"), None)
+
+        def ms(t: Optional[float]) -> str:
+            return "never" if t is None or shown is None else f"+{(t - shown) * 1000:.0f} ms"
+
+        self.expect(f"an agent tick saw the obstacle within {bound:g}s", seen is not None and seen - shown <= bound,
+                    f"first perceiving tick {ms(seen)}")
+        self.expect(f"no DRIVE for {seconds:g}s once an agent tick had the obstacle in view",
+                    seen is not None and all(t < seen for t in drives),
+                    f"DRIVE at {', '.join(ms(t) for t in drives) or 'none'}; first perceiving tick {ms(seen)}")
+        self.expect("at most the one DRIVE already in flight from a clear-scene tick", len(drives) <= 1,
+                    f"{len(drives)} DRIVE frames after the obstacle appeared")
+        self.expect(f"STOP written within {bound:g}s of the obstacle appearing", stop is not None and stop - shown <= bound,
+                    f"first STOP {ms(stop)}")
+
     async def no_drive_for(self, seconds: float, why: str) -> None:
         mark = self.rover.mark()
         await self.run(seconds)
@@ -187,9 +225,7 @@ async def scenario(name: str, run: Run) -> None:
 
     if name == "obstacle":
         await run.run(1.0)
-        rover.obstacle = True
-        run.note("SIMULATED obstacle in the camera corridor")
-        await run.no_drive_for(3.0, "while the obstacle is in view")
+        await run.obstacle_stop(3.0)
         rover.obstacle = False
         run.note("obstacle cleared")
 

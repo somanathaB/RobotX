@@ -31,7 +31,7 @@ from __future__ import annotations
 import asyncio
 import math
 import time
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from robotx.application.agent import RobotAgent
 from robotx.config.settings import Settings
@@ -73,13 +73,42 @@ def settings_env(robot_id: str, **extra: str) -> Dict[str, str]:
     return env
 
 
+class _TimedPort(fx.FakePort):
+    """The in-memory port, also recording when each STOP/DRIVE frame was written."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.motion_writes: List[Tuple[float, str]] = []
+
+    def write(self, data: bytes) -> int:
+        written = super().write(data)
+        for cmd in ("DRIVE", "STOP"):
+            if b'"cmd":"%s"' % cmd.encode() in data:
+                self.motion_writes.append((time.monotonic(), cmd))
+        return written
+
+
 class SimulatedRover:
     def __init__(self, start: LatLon, *, robot_id: str = "robotx-pi", env: Optional[Dict[str, str]] = None) -> None:
         self.agent = RobotAgent(Settings.from_env({**settings_env(robot_id), **(env or {})}))
         self.gps = FakeGPS()
         self.perception = FakePerception()
         self.agent.gps, self.agent.perception = self.gps, self.perception
-        self.port = fx.FakePort()
+        self.port = _TimedPort()
+        # When the simulated camera first showed the current obstacle (None while
+        # clear), and when each agent tick ran that had a detection in view: what
+        # an obstacle check needs to tell a DRIVE decided before the agent could
+        # see the obstacle from one decided after.
+        self.obstacle_shown_at: Optional[float] = None
+        self.perceiving_ticks: List[float] = []
+        tick = self.agent.tick
+
+        def recorded_tick() -> Any:
+            if self.agent.perception is not None and self.agent.perception.latest().detections:
+                self.perceiving_ticks.append(time.monotonic())
+            return tick()
+
+        self.agent.tick = recorded_tick  # type: ignore[method-assign]
         self.firmware = FirmwareModel()
         self.link = Esp32Link(Esp32Config(motion_enabled=True), port_factory=lambda: self.port,
                               clock=time.monotonic, wall=time.time)
@@ -155,8 +184,11 @@ class SimulatedRover:
         if self.blind:
             self.perception.result = PerceptionResult.unavailable(PerceptionStatus.NO_FRAME)
         elif self.obstacle:
+            if self.obstacle_shown_at is None:
+                self.obstacle_shown_at = now
             self.perception.set_detection(area=40000, cx=320)
         else:
+            self.obstacle_shown_at = None
             self.perception.set_clear()
         self._esp32(now)
 
